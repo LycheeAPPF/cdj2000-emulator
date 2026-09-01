@@ -1,0 +1,129 @@
+# Building
+
+Two emulators, built separately, from sources that live outside this repository.
+Neither build needs firmware.
+
+## What you need
+
+* **Python 3.10 or newer**, with `tkinter`. On Debian and Ubuntu that is a
+  separate package, `python3-tk`.
+* **A C toolchain**, `make`, `patch`, `tar`.
+* For the MAIN board: **meson**, **ninja**, **pkg-config**, **glib2**,
+  **pixman** -- QEMU's own dependencies.
+
+On Windows this is developed and tested in an **MSYS2 MINGW64 shell**:
+
+```sh
+pacman -S --needed base-devel mingw-w64-x86_64-toolchain \
+    mingw-w64-x86_64-{glib2,pixman,meson,ninja,pkgconf,python}
+```
+
+Use the MINGW64 shell, not Git Bash. Git Bash's `make` resolves `/bin/sh` to a
+path containing a space, and GDB's build system does not quote it -- the build
+then fails with `C:/Program: No such file or directory`, which looks like a
+broken toolchain and is not one.
+
+Python packages:
+
+```sh
+pip install -r requirements.txt        # Pillow, numpy
+pip install -r requirements-dev.txt    # ... plus pytest
+```
+
+## The GUI board -- Blackfin, from GNU sim
+
+```sh
+sh scripts/build-bfin-sim.sh
+```
+
+The script downloads `gdb-17.2.tar.xz` if it is not already beside the
+repository or in `build/`, unpacks it, applies `patches/0*-gdb-*.patch`,
+configures the simulator only, builds it, and installs it as `bin/cdj-run`.
+Re-running it is a no-op on an already-patched tree.
+
+Point it at a tarball or an unpacked tree if you have one:
+
+```sh
+sh scripts/build-bfin-sim.sh /path/to/gdb-17.2.tar.xz
+sh scripts/build-bfin-sim.sh /path/to/gdb-17.2
+```
+
+The script builds `libbfd`, `libiberty` and `libopcodes` first, because
+`bfin/run` links against them and only GDB's top-level makefile knows to build
+them. It passes `MAKEINFO=true` throughout -- `makeinfo` builds the manuals and
+nothing else, is often not installed, and without this the build stops on
+`doc/bfd.info` with an error that says nothing about the simulator. A failure in
+`po/` (translation catalogues, which want `msgfmt`) is likewise ignored, and the
+three libraries are then checked for directly, so a real failure still stops the
+script.
+
+The result is around 17 MB. If you end up with something near 50 KB you have
+libtool's wrapper script rather than the simulator; the script checks for
+exactly this and refuses, because the wrapper exits 127 with no output and is a
+confusing way to spend an afternoon.
+
+## The MAIN board -- SH-4, from QEMU
+
+QEMU is not vendored here. Clone it wherever you like:
+
+```sh
+git clone --depth 1 https://gitlab.com/qemu-project/qemu.git /c/qemu-src
+sh scripts/build-qemu-sh4.sh /c/qemu-src
+```
+
+The script applies `patches/qemu-sh-intc-priority-imask.patch`, copies
+`emulator/qemu/*` into `hw/sh4/`, adds the meson and Kconfig lines if they are
+not there, configures for `sh4-softmmu` only, and builds. All of it is
+idempotent, so re-run it after every change to `emulator/qemu/`.
+
+QEMU **11.x or newer** is required.
+
+Put the result on `PATH`, or point `CDJ_QEMU` at it:
+
+```sh
+export CDJ_QEMU=/c/qemu-src/build/qemu-system-sh4
+```
+
+Check the board is there:
+
+```sh
+qemu-system-sh4 -M help | grep cdj2000
+```
+
+### Rebuild immediately, and check the timestamp
+
+If a build of the board fails, the **old** `qemu-system-sh4` is still on disk
+and every later run keeps measuring the old behaviour, while looking exactly as
+though your change did nothing. This is the most expensive silent error in the
+project. After each build, check the binary is newer than the source you
+changed.
+
+## Tests
+
+```sh
+pytest -q                 # or: python -m pytest -q
+```
+
+Without firmware, roughly two dozen tests skip and the rest run. The skips are
+the ones that read a real firmware image; see FIRMWARE.md. `tests/cstub/`
+compiles `emulator/qemu/cdj2000_input.c` on the host against stub QEMU headers,
+so the panel input protocol is tested without QEMU at all.
+
+## Where things land
+
+| directory | holds | in git? |
+|---|---|---|
+| `bin/` | the Blackfin simulator you built | no |
+| `build/` | the unpacked GDB tree and its object tree | no |
+| `firmware/` | boot images built from your own firmware | no |
+| `packets/` | stimulus the tools generate | no |
+| `runs/` | frames, logs and captures from runs | no |
+
+All five are in `.gitignore` and all five can be moved: `CDJ_BIN_DIR`,
+`CDJ_BUILD_DIR`, `CDJ_FIRMWARE_DIR`, `CDJ_PACKETS_DIR`, `CDJ_RUNS_DIR`.
+
+With one exception. The board files in `emulator/` name their flash image as
+`firmware/gui-flash-image.bin`, and the simulator resolves that itself, against
+the working directory the launchers set -- the repository root. So
+`CDJ_FIRMWARE_DIR` moves everything the Python side reads but not that one file.
+Copy the board file and pass `--board` if you need it elsewhere.

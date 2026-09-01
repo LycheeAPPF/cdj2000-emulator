@@ -1,0 +1,149 @@
+diff --git a/hw/intc/sh_intc.c b/hw/intc/sh_intc.c
+index 0da82f9..5ddfe2d 100644
+--- a/hw/intc/sh_intc.c
++++ b/hw/intc/sh_intc.c
+@@ -91,12 +91,20 @@ int sh_intc_get_pending_vector(struct intc_desc *desc, int imask)
+     for (i = 0; i < desc->nr_sources; i++) {
+         struct intc_source *source = &desc->sources[i];
+ 
+-        if (source->pending) {
++        /*
++         * An SH-4 interrupt is accepted only while its priority level is
++         * strictly greater than SR.IMASK.  Sources left at the default level
++         * of 15 behave as before.  Without this, a guest that masks its own
++         * timer by raising IMASK inside the interrupt prologue re-enters the
++         * handler immediately and nests until the stack is gone.
++         */
++        if (source->pending && source->prio > imask) {
+             trace_sh_intc_pending(desc->pending, source->vect);
++            desc->pending_prio = source->prio;
+             return source->vect;
+         }
+     }
+-    g_assert_not_reached();
++    return -1;
+ }
+ 
+ typedef enum {
+@@ -242,6 +250,21 @@ static void sh_intc_write(void *opaque, hwaddr offset,
+         mask = (1 << width) - 1;
+         mask <<= (first - k) * width;
+ 
++        /*
++         * A priority register carries a numeric level per field, and on SH-4
++         * that level is what SR.IMASK is compared against when the interrupt
++         * is offered.  Upstream only ever asked whether the field was
++         * non-zero, which leaves every source at the default level and makes
++         * IMASK meaningless.  Record the level as well.  Levels above 15
++         * cannot exist on this architecture, so a wider field is clamped.
++         */
++        if ((mode & INTC_MODE_IS_PRIO) && enum_ids[k]) {
++            unsigned int level = (value & mask) >> ((first - k) * width);
++
++            desc->sources[enum_ids[k]].prio = MIN(level, 15);
++            trace_sh_intc_prio(enum_ids[k], level);
++        }
++
+         if ((*valuep & mask) != (value & mask)) {
+             sh_intc_toggle_mask(desc, enum_ids[k], value & mask, 0);
+         }
+@@ -401,6 +424,7 @@ int sh_intc_init(MemoryRegion *sysmem,
+     desc->sources = g_new0(struct intc_source, nr_sources);
+     for (i = 0; i < nr_sources; i++) {
+         desc->sources[i].parent = desc;
++        desc->sources[i].prio = 0x0f;
+     }
+     desc->irqs = qemu_allocate_irqs(sh_intc_set_irq, desc, nr_sources);
+     memory_region_init_io(&desc->iomem, NULL, &sh_intc_ops, desc, "intc",
+diff --git a/hw/intc/trace-events b/hw/intc/trace-events
+index e7d6c30..deaff50 100644
+--- a/hw/intc/trace-events
++++ b/hw/intc/trace-events
+@@ -337,6 +337,7 @@ sh_intc_register(const char *s, int id, unsigned short v, int c, int m) "%s %u -
+ sh_intc_read(unsigned size, uint64_t offset, unsigned long val) "size %u 0x%" PRIx64 " -> 0x%lx"
+ sh_intc_write(unsigned size, uint64_t offset, unsigned long val) "size %u 0x%" PRIx64 " <- 0x%lx"
+ sh_intc_set(int id, int enable) "setting interrupt group %d to %d"
++sh_intc_prio(int id, unsigned int level) "interrupt source %d priority level %u"
+ 
+ # loongson_ipi.c
+ loongson_ipi_read(unsigned size, uint64_t addr, uint64_t val) "size: %u addr: 0x%"PRIx64 "val: 0x%"PRIx64
+diff --git a/include/hw/sh4/sh_intc.h b/include/hw/sh4/sh_intc.h
+index 94f1831..6ec46e0 100644
+--- a/include/hw/sh4/sh_intc.h
++++ b/include/hw/sh4/sh_intc.h
+@@ -37,6 +37,14 @@ struct intc_source {
+     unsigned short vect;
+     intc_enum next_enum_id;
+ 
++    /*
++     * SH-4 interrupt priority level, 0..15.  An interrupt is only accepted
++     * while its level is greater than SR.IMASK.  Defaults to 15, so a
++     * controller that does not set it keeps the previous behaviour of
++     * ignoring IMASK.
++     */
++    unsigned char prio;
++
+     int asserted; /* emulates the interrupt signal line from device to intc */
+     int enable_count;
+     int enable_max;
+@@ -55,6 +63,8 @@ struct intc_desc {
+     struct intc_prio_reg *prio_regs;
+     int nr_prio_regs;
+     int pending; /* number of interrupt sources that has pending set */
++    /* Priority level of the source last returned by get_pending_vector. */
++    unsigned char pending_prio;
+ };
+ 
+ int sh_intc_get_pending_vector(struct intc_desc *desc, int imask);
+diff --git a/target/sh4/helper.c b/target/sh4/helper.c
+index b6b057f..e2a1e8a 100644
+--- a/target/sh4/helper.c
++++ b/target/sh4/helper.c
+@@ -151,6 +151,23 @@ void superh_cpu_do_interrupt(CPUState *cs)
+     env->sr |= (1u << SR_BL) | (1u << SR_MD) | (1u << SR_RB);
+     env->lock_addr = -1;
+ 
++    if (do_irq) {
++        /*
++         * Accepting an interrupt raises SR.IMASK to that interrupt's priority
++         * level, so a handler which saves SR on entry and restores it on exit
++         * stays masked against its own source until it has acknowledged the
++         * device.  Without this an RTOS whose prologue does exactly that
++         * re-enters on the instruction after restoring SR and never reaches
++         * the code that clears the device flag.
++         */
++        struct intc_desc *desc = env->intc_handle;
++
++        if (desc) {
++            env->sr &= ~(0xfu << 4);
++            env->sr |= (uint32_t)desc->pending_prio << 4;
++        }
++    }
++
+     if (env->flags & TB_FLAG_DELAY_SLOT_MASK) {
+         /* Branch instruction should be executed again before delay slot. */
+         env->spc -= 2;
+diff --git a/target/sh4/translate.c b/target/sh4/translate.c
+index 373950f..c79ea07 100644
+--- a/target/sh4/translate.c
++++ b/target/sh4/translate.c
+@@ -220,7 +220,18 @@ static inline void gen_save_cpu_state(DisasContext *ctx, bool save_pc)
+ 
+ static inline bool use_exit_tb(DisasContext *ctx)
+ {
+-    return (ctx->tbflags & TB_FLAG_GUSA_EXCLUSIVE) != 0;
++    /*
++     * An rte writes SSR back into SR, which can unmask an interrupt that was
++     * declined a moment earlier because the delay slot is indivisible.  The
++     * block holding that delay slot otherwise chains straight into the resumed
++     * code through lookup_and_goto_ptr, so the CPU never returns to the
++     * interrupt check, and a source that stays asserted -- a periodic timer
++     * whose handler did not run -- is never offered again: cpu_interrupt() is
++     * only called on the 0->1 edge, so nothing kicks the CPU out of the chain.
++     * Leave the loop after an rte delay slot instead.
++     */
++    return (ctx->tbflags &
++            (TB_FLAG_GUSA_EXCLUSIVE | TB_FLAG_DELAY_SLOT_RTE)) != 0;
+ }
+ 
+ static bool use_goto_tb(DisasContext *ctx, vaddr dest)

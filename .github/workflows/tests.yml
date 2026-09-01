@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    # The suite needs no firmware and no emulator: what runs here is the host
+    # side -- the panel protocol, the window's layout and coverage, the packet
+    # builders, and a C harness that compiles the board's input channel against
+    # stub QEMU headers.  The tests that read a real firmware image skip.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install system packages
+        # tkinter: Pillow's ImageTk and the viewer both import it, and Debian
+        # packages it separately from Python itself.
+        # glib + pkg-config: tests/cstub compiles the board's input channel,
+        # and the stub headers pull in glib.  Without them that one test errors
+        # instead of skipping.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk pkg-config libglib2.0-dev
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run the tests
+        run: python -m pytest tests/ -q

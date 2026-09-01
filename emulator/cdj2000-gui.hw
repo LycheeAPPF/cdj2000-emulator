@@ -1,0 +1,18 @@
+# CDJ-2000 GUI board additions for GNU sim's BF531 model.
+#
+# The flash image is not shipped with this repository.  Build it from your own
+# copy of the GUI firmware update first -- see FIRMWARE.md -- which writes
+# gui-flash-image.bin and gui-boot-memory.elf into firmware/.
+#
+# The 2 MiB parallel flash spans EBIU asynchronous banks 0 and 1.
+/core/bfin_ebiu_amc/cfi@0/reg 0 2
+/core/bfin_ebiu_amc/cfi@0/cmdset 2
+/core/bfin_ebiu_amc/cfi@0/size 0x200000
+/core/bfin_ebiu_amc/cfi@0/width 16
+/core/bfin_ebiu_amc/cfi@0/erase_regions 32 0x10000
+/core/bfin_ebiu_amc/cfi@0/file "firmware/gui-flash-image.bin" "ro"
+
+# The panel receives 480 little-endian RGB555 pixels per PPI scanline.  The
+# display DMA includes its vertical blanking rows, so the simulator emits 255
+# lines and the viewer crops to the 480 x 234 active area.
+/core/bfin_ppi@0/color "rgb555le"

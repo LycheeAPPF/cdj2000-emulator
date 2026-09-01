@@ -1,0 +1,19 @@
+# Everything in this repository is text and everything is LF.
+#
+# This is not a style preference.  A .patch file checked out with CRLF does not
+# apply, and a .sh checked out with CRLF does not run on Linux -- and a Windows
+# clone with core.autocrlf=true does exactly that unless this file says
+# otherwise.  The build depends on both, so pin it.
+* text=auto eol=lf
+
+*.patch  text eol=lf
+*.sh     text eol=lf
+*.py     text eol=lf
+*.c      text eol=lf
+*.h      text eol=lf
+*.md     text eol=lf
+*.hw     text eol=lf
+*.yml    text eol=lf
+*.txt    text eol=lf
+*.ini    text eol=lf
+LICENSE  text eol=lf

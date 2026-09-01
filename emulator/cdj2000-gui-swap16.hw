@@ -1,0 +1,11 @@
+# Diagnostic board variant: treat the GUI update body as if its 16-bit flash
+# byte lanes were reversed by the on-device programmer.  Kept because ruling
+# this out is a question that comes up whenever the panel shows noise.
+/core/bfin_ebiu_amc/cfi@0/reg 0 2
+/core/bfin_ebiu_amc/cfi@0/cmdset 1
+/core/bfin_ebiu_amc/cfi@0/size 0x200000
+/core/bfin_ebiu_amc/cfi@0/width 16
+/core/bfin_ebiu_amc/cfi@0/erase_regions 32 0x10000
+/core/bfin_ebiu_amc/cfi@0/file "firmware/gui-flash-image-swap16.bin" "ro"
+
+/core/bfin_ppi@0/color "rgb565"

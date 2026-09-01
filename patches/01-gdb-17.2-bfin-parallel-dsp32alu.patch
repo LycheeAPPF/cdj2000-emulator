@@ -1,0 +1,35 @@
+Blackfin sim: commit a packed 16-bit ALU result through the store queue
+
+decode_dsp32alu_0 writes one packed 16-bit ALU result straight into its
+destination data register.  That is wrong when the DSP32 ALU operation sits in
+slot 0 of a 64-bit multi-issue packet: the later slots must read the register
+values from before the packet, and every register write commits only after all
+three slots have executed.
+
+CDJ-2000 GUI firmware relies on this:
+
+    R0 = R0 -|- R0 || [P5] = R0 || NOP
+
+With R0 = 7, real packet semantics store 7 through P5 and only then commit the
+ALU result R0 = 0.  Committing early makes the parallel store write zero, and
+the firmware falls into a fatal loop.
+
+The fix uses the simulator's existing deferred STORE queue, matching every
+other DSP32 ALU case in the same decoder.
+
+Applies to: GDB 17.2, sim/bfin.
+
+--- a/sim/bfin/bfin-sim.c
++++ b/sim/bfin/bfin-sim.c
+@@ -4624,9 +4624,9 @@
+       t0 &= 0xFFFF;
+       t1 &= 0xFFFF;
+       if (x)
+-	SET_DREG (dst0, (t1 << 16) | t0);
++	STORE (DREG (dst0), (t1 << 16) | t0);
+       else
+-	SET_DREG (dst0, (t0 << 16) | t1);
++	STORE (DREG (dst0), (t0 << 16) | t1);
+     }
+   else if (aop == 1 && aopcde == 12 && x == 0 && s == 0 && HL == 0)
+     {

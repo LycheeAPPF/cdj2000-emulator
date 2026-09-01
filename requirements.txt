@@ -1,0 +1,6 @@
+# Runtime dependencies of the host-side tools.
+#
+# tkinter is also required by the viewers but is part of the standard library;
+# on Debian and Ubuntu it is packaged separately as python3-tk.
+Pillow>=9.0
+numpy>=1.21

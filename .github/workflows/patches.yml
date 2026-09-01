@@ -1,0 +1,36 @@
+name: patches apply
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  apply:
+    # The two GDB patches are the whole Blackfin board.  If they stop applying
+    # cleanly to a pristine gdb-17.2 the repository is broken, and it is worth
+    # knowing that without waiting for someone to run a 20-minute build.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch gdb-17.2
+        run: |
+          curl -fL -o gdb.tar.xz https://ftp.gnu.org/gnu/gdb/gdb-17.2.tar.xz
+          tar -xJf gdb.tar.xz gdb-17.2/sim/bfin
+
+      - name: Apply the patch series
+        run: |
+          set -e
+          for p in patches/0*-gdb-*.patch; do
+            echo "== $p"
+            patch -d gdb-17.2 -p1 --forward --no-backup-if-mismatch < "$p"
+          done
+
+      - name: Refuse a fuzzed or rejected hunk
+        run: |
+          if find gdb-17.2 -name '*.rej' -o -name '*.orig' | grep -q .; then
+            echo "a hunk did not apply cleanly"
+            find gdb-17.2 -name '*.rej' -o -name '*.orig'
+            exit 1
+          fi

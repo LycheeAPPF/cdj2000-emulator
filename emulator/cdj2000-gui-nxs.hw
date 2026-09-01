@@ -1,0 +1,25 @@
+# CDJ-2000NXS GUI board additions for GNU sim's BF531 model.
+#
+# The same board as cdj2000-gui.hw, but the CFI flash carries the NXS GUI flash
+# image rather than the CDJ-2000 one.
+#
+# The GUI ELF and the CFI flash image are a matched pair, and mismatching them
+# is a trap worth knowing about.  The firmware's own LZSS decompressor reads its
+# packed resource bytes straight out of this memory-mapped CFI device at run
+# time, while the 480x234 geometry comes from code already resident in the boot
+# image and does not depend on this file.  So booting the NXS GUI ELF against
+# cdj2000-gui.hw still boots and still paints the right rectangles -- only the
+# resource *content* comes out wrong.  "Geometry correct, content is noise" is
+# the signature of a mismatched pair, not of a broken decompressor.
+#
+# Use this board file whenever the loaded ELF was built from NXS firmware.
+#
+# The 2 MiB parallel flash spans EBIU asynchronous banks 0 and 1.
+/core/bfin_ebiu_amc/cfi@0/reg 0 2
+/core/bfin_ebiu_amc/cfi@0/cmdset 2
+/core/bfin_ebiu_amc/cfi@0/size 0x200000
+/core/bfin_ebiu_amc/cfi@0/width 16
+/core/bfin_ebiu_amc/cfi@0/erase_regions 32 0x10000
+/core/bfin_ebiu_amc/cfi@0/file "firmware/nxs/gui-flash-image.bin"
+
+/core/bfin_ppi@0/color "rgb555le"

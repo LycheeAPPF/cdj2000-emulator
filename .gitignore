@@ -1,0 +1,33 @@
+# Nothing derived from firmware belongs in this repository.  See FIRMWARE.md:
+# you supply your own update file and everything below is built from it.
+/firmware/
+/packets/
+/runs/
+/bin/
+/build/
+
+# Belt and braces: the same files by name, wherever they land.
+*.UPD
+*.upd
+*.LDR
+*.ldr
+*.bin
+*.elf
+*.dis
+*.ppm
+*.img
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
