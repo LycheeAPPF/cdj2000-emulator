@@ -15,16 +15,23 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Fetch gdb-17.2
+        # Both directories: the board lives in sim/bfin, but the CFI flash model
+        # the board file needs is sim/common/dv-cfi.c, and 02 patches four files
+        # there.  Unpacking only sim/bfin makes those hunks fail to apply for a
+        # reason that reads like a broken patch and is a missing directory.
         run: |
           curl -fL -o gdb.tar.xz https://ftp.gnu.org/gnu/gdb/gdb-17.2.tar.xz
-          tar -xJf gdb.tar.xz gdb-17.2/sim/bfin
+          tar -xJf gdb.tar.xz gdb-17.2/sim/bfin gdb-17.2/sim/common
 
       - name: Apply the patch series
         run: |
           set -e
           for p in patches/0*-gdb-*.patch; do
             echo "== $p"
-            patch -d gdb-17.2 -p1 --forward --no-backup-if-mismatch < "$p"
+            # --batch: never stop to ask "File to patch:".  With no tty it
+            # reads EOF, answers itself, and skips every remaining hunk while
+            # still looking like it ran.
+            patch -d gdb-17.2 -p1 --forward --batch --no-backup-if-mismatch < "$p"
           done
 
       - name: Refuse a fuzzed or rejected hunk
