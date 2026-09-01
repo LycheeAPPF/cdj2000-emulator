@@ -11,7 +11,7 @@ QEMU is started with `CDJ_INPUT_PORT`, so `emulator/qemu/cdj2000_input.c` opens
 a control channel and the window's buttons reach the running panel.  The
 buttons sit **beside** the picture, because `BROWSE`/`TAG LIST`/`INFO`/`MENU`
 and `LINK`/`USB`/`SD`/`DISC` are backlit plastic on the real unit and appear in
-no frame dump (`GOAL.md`).  `--no-control` leaves the port unset, which is what
+no frame dump.  `--no-control` leaves the port unset, which is what
 makes a run a control run: nothing binds and nothing is merged into the panel
 payload.
 

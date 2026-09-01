@@ -355,13 +355,13 @@ first pass counted it in file timestamps:
 | 21.2 | — | 0 | — | no-op, but the screen had stopped † |
 
 One attribution, two unattributed, three measured pairs with no movement, nine
-proven no-ops, seven holes. `GOAL.md` wants six attributions.
+proven no-ops, seven holes. The target is six attributions.
 
 **† and this dagger is the important part.** The frame content was byte-for-byte
 identical from **t317.8 to the end of the run**, 611 `same` ticks, while MAIN
 kept taking 14 112 requests. Every row marked † lies after that, so what is
 proven there is that *the screen was frozen*, not that the key does nothing.
-`GOAL.md` allows an expected no-op but a no-op is only a statement about the key
+An expected no-op is allowed, but a no-op is only a statement about the key
 if the display could still have moved. **Those nine rows are recorded, not
 counted.** The control run `r095`, same settings and no input at all, froze at
 t236.0 — so the freeze is not the input's doing.
@@ -473,7 +473,7 @@ counts completed frames where the sampler can only compare file contents, and
 its control run `r112` — same switches, same 745 s, channel open and no
 session — completed **34 595 frames by t740, about 46 a second, with the picture
 unchanged after t121.3**. So the seventeen no-ops below are statements about
-their keys and not about a dead task, which is the condition `GOAL.md` attaches
+their keys and not about a dead task, which is the condition attached
 to accepting a no-op. Every dagger in the r096 table above is retired by that
 same measurement.
 
@@ -513,7 +513,7 @@ line that decides whether a change can be placed after its input at all.
 | 21.2 | — | — | — | NOT MEASURED — never pressed, the run was cut short |
 
 One attribution, three withdrawn, seventeen proven no-ops, one never driven.
-`GOAL.md` wants six attributions.
+The target is six attributions.
 
 ### The three guards this cost, now in `frame_delta windows`
 
@@ -550,7 +550,7 @@ reads `source LINK 0x04c084dc = 1` at the end, which only `19.3` can have done.
 reproduce `r113`'s `18.7`: here that bit is a proven no-op over ten ticks and the
 `444,203..478,223` corner still reads `±10` after 820 s. Two runs paired that box
 with `18.7`; a third of the same binary contradicts them. **The pairing is
-unconfirmed, and `GOAL.md` point 3 therefore stands at zero attributed changes,
+unconfirmed, and the coverage target therefore stands at zero attributed changes,
 not one.** The r113 table above keeps its row because that is what r113 measured;
 this is what happened when it was asked again.
 
@@ -765,8 +765,8 @@ one refused by a guard, zero attributed. The encoder arrived — the monitor rea
 `0x04fe2a44 = 0xff` at the end of `r117` — so this is a statement about the
 encoder and not about the channel.
 
-`GOAL.md` asks for "alle CDJ-Tasten **und den Drehregler (links, rechts,
-Druck)**". Left and right are the same field walked in either direction and the
+The target is **every CDJ key and the rotary -- left, right and press**.
+Left and right are the same field walked in either direction and the
 field answers nothing; the press is one of the 38 bits, all of which are now
 proven no-ops. **The rotary is no longer the place the missing attributions can
 hide** — that reading was correct while seventeen inputs had never been sent,
@@ -868,7 +868,7 @@ The sampler writes a file only when the bytes changed — right for disk, fatal
 for evidence. A window over a stretch where the screen stood still contains no
 file at all, and `no frame on one side` used to be printed for **two opposite
 findings**: *this input changed nothing* and *this input was never measured*.
-`GOAL.md` allows an expected no-op but requires it to be **proven**, and a no-op
+An expected no-op is allowed but must be **proven**, and a no-op
 is only provable if a hole can be told from it.
 
 `boot_vm` now writes `index.tsv`, one row per sampler tick with a status, and
@@ -1015,7 +1015,7 @@ its own run.
 | `rotary --field N` | 2 | 395 s | left and right of one field |
 
 The three below `coverage` are its parts and stay for diagnosis; each prints
-an `INCOMPLETE for GOAL.md point 3` line saying how much of the board it leaves
+an `INCOMPLETE` line saying how much of the board it leaves
 out. The numbers moved twice: 22 → 38 inputs when bytes 15..17 were found in
 the decoder, and t210 → t300 when four traced runs showed no press had ever
 reached the key dispatcher before t150.
@@ -1087,7 +1087,7 @@ these runs rather than an input to them.
 `BROWSE`/`TAG LIST`/`INFO`/`MENU` above it, `LINK`/`USB`/`SD`/`DISC` to its
 left, all 38 decoded bits to its right, and the eight analogue fields below it —
 one row each, with a detent pair, a slider and an exact value, plus a `touch`
-box on field 6. Per `GOAL.md` none of them is drawn *into* the 480x234 panel —
+box on field 6. None of them is drawn *into* the 480x234 panel —
 that rectangle is the LCD and nothing else, and `tests/test_panel_layout.py`
 asserts the displayed frame is the capture's top-left 480x234 pixels byte for
 byte.

@@ -1,7 +1,7 @@
 """Launch the CDJ-2000 GUI simulator, display its framebuffer, and drive it.
 
 The window is laid out like the front of the player, and that layout is the
-point rather than decoration.  `GOAL.md`:
+point rather than decoration:
 
     Only the inner rectangle is the 480x234 panel.  BROWSE / TAG LIST / INFO /
     MENU across the top and LINK / USB / SD / DISC down the left are hardware
@@ -90,7 +90,7 @@ PANEL_CROP = (0, 0, PANEL_WIDTH, PANEL_HEIGHT)
 # was read, "BROWSE is probably the top-left key" was a guess about a photo and
 # stayed unbound, correctly.
 #
-# `INFO` keeps GOAL.md's spelling on the key because that is what the front
+# `INFO` is the spelling on the key, because that is what the front
 # panel says; the firmware calls the same bit `INFORMATION`, and the test that
 # compares the two knows it.
 #
@@ -116,7 +116,7 @@ LEFT_BUTTONS: list[tuple[str, str | None]] = [
 
 # Where each block sits in the outer grid, as (row, column).  Written down
 # rather than left implicit in the build code so that a test can assert what
-# GOAL.md requires: the picture has a cell of its own, and every button is in a
+# The rule: the picture has a cell of its own, and every button is in a
 # different one.  Nothing is ever drawn onto the frame.
 LAYOUT: dict[str, tuple[int, int]] = {
     "top": (0, 1),      # BROWSE / TAG LIST / INFO / MENU, above the panel

@@ -9,6 +9,29 @@ two talk to each other over the same serial link they use on real hardware.
 Every pixel on the screen is drawn by Pioneer's code, and every button press
 travels the path a real press travels.
 
+## Read this first
+
+**This is a developer tool, and it is barebones.** It exists as a foundation for
+firmware modding and reverse engineering — somewhere to run a change and see
+what the machine does with it, without risking a real player. It is not a way to
+use a CDJ-2000 on your desktop, and it will not become one by itself.
+
+Three things to expect before you build anything:
+
+- **It is very slow.** A boot takes minutes of wall clock — plan for around
+  five, sometimes more — to reach a state a real player reaches in seconds.
+  Two emulated CPUs, one of them an interpreting instruction-set simulator.
+  Leave it running; it is not hung.
+- **It is unreliable.** The GUI board double-faults intermittently, at
+  `0x00b99196`, usually somewhere between one and three minutes in. When it
+  does, the panel freezes wherever it got to and the launcher reports
+  `simulator exited with code 1`. Roughly one run in three or four survives past
+  it. This is long-standing behaviour, not a broken checkout.
+- **Almost nothing is finished past booting.** See "What does not" below. If you
+  need a working player, this is the wrong repository.
+
+If you are here to build on it, that is exactly what it is for.
+
 ```
     ┌─────────────────────┐  serial link   ┌────────────────────────┐
     │  MAIN board  SH-4   │◄──────────────►│  GUI board  BF531      │
@@ -29,12 +52,13 @@ travels the path a real press travels.
   MAIN's panel handshake publishes an operating mode, the GUI link comes up, and
   the record stream runs.
 * The panel is drawn: 480x234, RGB555, cropped out of the 255 lines the display
-  DMA actually emits.
-* All **48 inputs** the board decodes are reachable from the host -- 40 button
+  DMA actually emits. The boot splash animates, and a run that gets far enough
+  reaches the player screen with `PLAYER`, `TRACK`, `REMAIN`, `TEMPO` and `BPM`.
+* All **48 inputs** the board decodes are reachable from the host — 40 button
   bits and 8 analogue fields, including the rotary encoder. A press travels the
-  real path: it is merged into the panel payload before the checksum, as an
-  edge, and MAIN's own service-mode name table is what says which bit is which
-  key. The window refuses to start if any input has no control.
+  real path: merged into the panel payload before the checksum, as an edge, and
+  MAIN's own service-mode name table is what says which bit is which key. The
+  window refuses to start if any input has no control.
 * Devices are modelled far enough to clear the caution banners: the disc drive
   (`E-7001`), the audio DSP (`E-7010`) and the USB device (`E-7020`) all report
   up.
@@ -48,18 +72,21 @@ travels the path a real press travels.
 
 Be clear about this: **the player is not usable as a player.**
 
+* **The GUI board double-faults.** Intermittent, at `0x00b99196`, typically
+  after one to three minutes. The panel stops updating and the launcher says
+  `simulator exited with code 1`. Run it again; roughly one attempt in three or
+  four gets past it.
+* **Speed.** Minutes, not seconds. Every measurement you take costs a run.
 * **The browse list does not come from the card.** MAIN answers every browse
   request as `DISC` even with a card present, and the panel shows `NO CARD`.
   Browse screens can be reached, but only by feeding the GUI canned MAIN
-  answers -- which proves the GUI renders them, not that the machine produced
+  answers — which proves the GUI renders them, not that the machine produced
   them.
 * **No track loading**, for the same reason.
 * **No audio at all.** The DSP is a register model with a position counter and
   no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
 * No link between players.
-* Timing is not real time. Runs take minutes of wall clock to reach states a
-  real player reaches in seconds.
 
 Most inputs, measured properly against a control run, are proven no-ops on the
 screens reached so far. `INPUT_MANIFEST.md` says which, in which run, and how it
@@ -67,11 +94,11 @@ was measured.
 
 ## Firmware is not included
 
-**This repository contains no Pioneer firmware and never will.** You supply
-your own copy of the firmware update -- the manufacturer distributes it free to
-owners -- and the extractors here turn it into the boot images the two
-emulators load. See [FIRMWARE.md](FIRMWARE.md). Nothing in this tree is derived
-from Pioneer's code: no images, no disassembly, no screenshots.
+**This repository contains no Pioneer firmware and never will.** You supply your
+own copy of the firmware update — the manufacturer distributes it free to
+owners — and the extractors here turn it into the boot images the two emulators
+load. See [FIRMWARE.md](FIRMWARE.md). Nothing in this tree is derived from
+Pioneer's code: no images, no disassembly, no screenshots.
 
 ## Getting started
 
@@ -86,8 +113,26 @@ python -m tools.cdj_gui.main_unpack firmware/C2KMAIN.UPD firmware
 python -m tools.cdj_main.view_vm
 ```
 
+Then wait. See the note on speed above.
+
 [BUILD.md](BUILD.md) has the details and the platform notes.
 [RUNNING.md](RUNNING.md) has everything you can do once it boots.
+
+## One rule worth knowing before you touch the UI
+
+Only the inner rectangle is the 480x234 panel. `BROWSE` / `TAG LIST` / `INFO` /
+`MENU` across the top and `LINK` / `USB` / `SD` / `DISC` down the left are
+**hardware buttons** — backlit plastic on the real player, appearing in no frame
+the firmware draws. They are not list rows; a browse list containing them is
+invented content.
+
+So the virtual buttons belong **beside** the panel image, never drawn into it. A
+control painted onto the LCD is a claim about what the firmware rendered, and it
+is a false one. `tests/test_panel_layout.py` enforces both halves: that the
+captured frame is passed through untouched apart from cutting the blanking rows,
+and that the picture occupies a grid cell no button block shares.
+
+This is the commonest mistake in the project and it has cost real work twice.
 
 ## Layout
 
@@ -99,7 +144,6 @@ python -m tools.cdj_main.view_vm
 | `tools/cdj_main/` | launchers, panel control, the service monitor, card images |
 | `tools/cdj_gui/` | the viewer, the firmware extractors, stimulus generators |
 | `tests/` | the host-side test suite; most of it needs no emulator |
-| `GOAL.md` | the design contract, and the measurement rules |
 | `INPUT_MANIFEST.md` | all 48 inputs, what was done with each, what was measured |
 
 ## The patches are the interesting part
@@ -109,7 +153,9 @@ interrupt handling are invisible to Linux and fatal to a uITRON RTOS that masks
 with `SR.IMASK`; without them this firmware never survives its first timer tick.
 On the Blackfin side, one packed-ALU instruction committed its result a cycle
 early, which made a parallel store write the wrong value and sent the firmware
-into a fatal loop. Each patch says what was measured before and after.
+into a fatal loop — and GNU sim's CFI flash model has no AMD command set, which
+is the part the CDJ's flash actually speaks. Each patch says what was measured
+before and after.
 
 ## Licence
 

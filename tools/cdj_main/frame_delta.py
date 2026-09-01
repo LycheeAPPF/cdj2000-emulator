@@ -42,8 +42,8 @@ wiped out exactly the fields that display state.  `--from` is therefore
 required, and the report says what fraction was excluded so a repeat of that
 mistake is visible in the first line of output rather than in a conclusion.
 
-**A number is not a look.**  `GOAL.md`: "Counting is no substitute for
-looking: enlarge the region before you judge it."  A count says something
+**A number is not a look.**  Counting is no substitute for looking: enlarge
+the region before you judge it.  A count says something
 moved; which
 screen it became is only visible in the picture.  `--look` writes the changed
 region out magnified, next to a full frame with the region ringed.
@@ -76,7 +76,7 @@ from PIL import Image
 # contribute to a delta -- but they do belong to the coordinates.
 CAPTURE_WIDTH = 480
 CAPTURE_HEIGHT = 255
-PANEL_HEIGHT = 234          # what is actually the LCD; see GOAL.md
+PANEL_HEIGHT = 234          # what is actually the LCD, see the README
 CAPTURE_BYTES = CAPTURE_WIDTH * CAPTURE_HEIGHT * 3
 
 # The frame sampler names files by elapsed wall clock: "t%06.1f.ppm".
@@ -313,7 +313,7 @@ def parse_windows(entries: list[str]) -> list[tuple[float, str]]:
 # opposite findings -- *this input changed nothing* and *this input was never
 # measured*.
 #
-# GOAL.md allows an expected no-op but requires it to be **proven**, and a no-op
+# An expected no-op is allowed but must be **proven**, and a no-op
 # can only be proven if a gap can be told from it.  boot_vm now writes
 # `index.tsv`, one row per tick with a status, and that is the distinction.
 INDEX_NAME = "index.tsv"
@@ -1329,7 +1329,7 @@ def command_windows(args: argparse.Namespace) -> int:
         if observed and not changed:
             # The screen was watched across the whole window and never once
             # changed.  That is stronger evidence than any byte compare, and it
-            # is what GOAL.md means by a no-op that is proven rather than
+            # is what is meant by a no-op that is proven rather than
             # assumed -- *provided the key arrived*.  Without a dispatch the
             # zero is a fact about the event path, not about the key, and
             # recording it as "this key does nothing" is the same conflation

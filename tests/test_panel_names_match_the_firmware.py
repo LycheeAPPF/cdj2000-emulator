@@ -55,7 +55,7 @@ import test_service_mode_key_names as firmware          # noqa: E402
 MANIFEST = ROOT / "INPUT_MANIFEST.md"
 
 # The one place where a key on the front panel and MAIN's name for it are
-# allowed to differ, and why.  GOAL.md lists the top row as `INFO` because that
+# allowed to differ, and why.  The top row is labelled `INFO` because that
 # is what is printed on the plastic; MAIN's table spells the same bit
 # `INFORMATION`.  Written down as data so that the exception is one line in a
 # table instead of a special case hidden in an assertion.

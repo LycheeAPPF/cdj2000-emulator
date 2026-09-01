@@ -909,7 +909,7 @@ def run_session(panel: PanelControl, schedule: list[tuple[float, str]],
 
 # ------------------------------------------------------- the canonical plan --
 #
-# GOAL.md point 3 wants a versioned input manifest listing **every** CDJ key and
+# The coverage target is a versioned input manifest listing **every** CDJ key and
 # the rotary (left, right, press), each with whether it was driven and what
 # happened, and at least six display changes proven.  What exists today is
 # stitched together from several runs under the 16-entry ceiling of
@@ -1121,7 +1121,7 @@ def plan_entries(name: str, start: float = PLAN_START,
         # `keys` drives 40 of the 48 inputs INPUT_MANIFEST.md enumerates.  The
         # eight analogue fields are in `rotary-sweep` and the encoder's second
         # direction is in `rotary --field N`, so covering the board meant three
-        # runs -- and GOAL.md's provenance rule says an acceptance run counts
+        # runs -- and the provenance rule says a coverage run counts
         # only on the same HEAD and the same QEMU binary as the others.  Three
         # runs can satisfy that only if nothing is rebuilt between them, which
         # is precisely the condition the last day cannot assume: r026's numbers
@@ -1387,7 +1387,7 @@ def plan_timing_notes(spacing: float = PLAN_SPACING,
 
 
 def plan_coverage(name: str = "keys") -> list[str]:
-    """What GOAL.md point 3 asks for, and whether this plan drives all of it.
+    """What full coverage asks for, and whether this plan drives all of it.
 
     The last line is the one that matters and it used to be missing: `keys`
     covers 40 of the 48 inputs INPUT_MANIFEST.md enumerates, so a run of it
@@ -1412,7 +1412,7 @@ def plan_coverage(name: str = "keys") -> list[str]:
     ]
     if not whole:
         lines.append(
-            "INCOMPLETE for GOAL.md point 3: it asks for every key AND the "
+            "INCOMPLETE: full coverage asks for every key AND the "
             "rotary, each with a result.  This plan drives %d of the %d "
             "inputs on the board.  `plan coverage` drives all of them in one "
             "run, which is also the only way they share one HEAD and one "
@@ -1493,7 +1493,7 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = sub.add_parser(
         "plan",
-        help="the canonical input plan for GOAL.md point 3, and the two "
+        help="the canonical input plan for full coverage, and the two "
              "commands that drive and judge it")
     plan.add_argument("name",
                       choices=("coverage", "keys", "rotary-sweep", "rotary"),
@@ -1555,7 +1555,7 @@ def main(argv: list[str] | None = None) -> int:
               "probe '%s' at t%g"
               % (args.name, len(plan_windows(entries)), args.spacing,
                  args.start, PLAN_PROBE, PLAN_PROBE_AT))
-        print("# what GOAL.md point 3 asks for:")
+        print("# what full coverage asks for:")
         for line in plan_coverage(args.name):
             print("#   " + line)
         print("# mask %s -- %s" % (args.mask or "none", PLAN_MASK_NOTE))

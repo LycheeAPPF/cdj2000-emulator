@@ -1,6 +1,6 @@
-"""The operator window's geometry, checked against GOAL.md and a stored frame.
+"""The operator window's geometry, checked against a stored frame.
 
-`GOAL.md` calls this the commonest mistake in the project:
+The commonest mistake in this project:
 
     Only the inner rectangle is the 480x234 panel.  BROWSE / TAG LIST / INFO /
     MENU across the top and LINK / USB / SD / DISC down the left are hardware
@@ -27,7 +27,6 @@ from tools.cdj_gui import view_ui
 from tools.cdj_main import panel_control
 
 ROOT = Path(__file__).resolve().parents[1]
-GOAL = ROOT / "GOAL.md"
 
 
 # ------------------------------------------------------------------ crop ---
@@ -126,14 +125,17 @@ def test_the_top_row_is_above_and_the_left_column_is_left():
     assert view_ui.LAYOUT["side"][1] > panel[1]
 
 
-def test_the_hardware_buttons_are_the_ones_goal_md_names():
-    text = GOAL.read_text(encoding="utf-8")
+def test_the_hardware_buttons_are_the_eight_on_the_front_panel():
+    """The eight keys that are plastic, not LCD, in the order they sit.
+
+    Pinned here because a control that drifts into the panel image is the
+    mistake this whole module exists to catch, and a renamed or reordered
+    key is how that drift starts.
+    """
     top = [label for label, _ in view_ui.TOP_BUTTONS]
     left = [label for label, _ in view_ui.LEFT_BUTTONS]
     assert top == ["BROWSE", "TAG LIST", "INFO", "MENU"]
     assert left == ["LINK", "USB", "SD", "DISC"]
-    for label in top + left:
-        assert label in text, f"GOAL.md no longer mentions {label}"
 
 
 def test_the_source_keys_are_bound_to_their_measured_bits():
@@ -165,7 +167,7 @@ def test_the_top_row_is_bound_to_the_firmwares_own_names():
     the same table, and the same reading, that settled the four SOURCE keys
     whose host-side labels turned out to be backwards.
 
-    `INFO` keeps GOAL.md's spelling on the key; the alias is data in
+    `INFO` is the spelling on the key; the alias is data in
     `test_panel_names_match_the_firmware.LABEL_ALIASES`.
     """
     assert [key for _, key in view_ui.TOP_BUTTONS] == ["20.0", "20.1", "20.2",

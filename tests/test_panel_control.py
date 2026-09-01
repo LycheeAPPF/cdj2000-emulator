@@ -525,7 +525,7 @@ def test_a_file_without_a_connect_epoch_is_not_a_transcript(tmp_path):
 
 # ---------------------------------------------------- the canonical plan ---
 def test_the_keys_plan_drives_every_decoded_bit_exactly_once():
-    """GOAL.md point 3 wants *all* the keys.  One missing row fails it."""
+    """Full coverage wants *all* the keys.  One missing row fails it."""
     entries = panel_control.plan_entries("keys")
     driven = {panel_control.button_mask(window)
               for _, window in panel_control.plan_windows(entries)}
@@ -560,7 +560,7 @@ def test_the_coverage_plan_is_the_union_of_the_other_three():
     in the plan output used to say so: the budget table called `plan keys`
     "38 bits plus the encoder", and it has no rotary in it.
     Covering the board from three runs is possible, but then the manifest table
-    carries three provenances, and GOAL.md's rule is that an acceptance run
+    carries three provenances, and the rule is that a coverage run
     counts only on the same HEAD and the same binary as the others.
     """
     windows = [window for _, window in panel_control.plan_windows(

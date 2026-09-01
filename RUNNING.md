@@ -14,9 +14,24 @@ MAIN boots on QEMU, the GUI board boots on the Blackfin simulator, the two are
 linked, and the GUI's framebuffer appears in a window with the player's controls
 drawn around it.
 
-**It takes a while to become interesting.** The GUI paints its chrome within a
-few seconds, but MAIN only publishes its operating mode once the panel handshake
-completes, and the record stream starts after that. Give it a minute or two.
+**It takes a while to become interesting.** Expect around five minutes of wall
+clock, sometimes more: the boot splash fades in after a minute or so, MAIN only
+publishes its operating mode once the panel handshake completes, and the record
+stream starts after that. Leave it running; it is not hung.
+
+**And it may not get there.** The GUI board double-faults intermittently at
+`0x00b99196`, usually one to three minutes in. The panel then freezes wherever
+it had got to and the window reports `simulator exited with code 1`. Roughly one
+run in three or four survives it, so the answer is to start it again. The
+simulator writes the fault line to its log:
+
+```sh
+tail "$TEMP/vm-ui-sim.log"      # or vm-gui.log for a headless run
+```
+
+A frozen panel with no fault line in the log is a different thing: that is the
+firmware simply not having drawn anything new, which is normal for long
+stretches.
 
 Closing the window stops both boards. QEMU is asked to quit through its monitor
 rather than killed, so its log is flushed instead of truncated.
@@ -42,7 +57,7 @@ The virtual buttons sit **beside** the picture, never on it. `BROWSE`,
 `TAG LIST`, `INFO`, `MENU` across the top and `LINK`, `USB`, `SD`, `DISC` down
 the left are backlit plastic on the real player and appear in no frame the
 firmware draws -- so drawing them onto the panel would be inventing content.
-See GOAL.md.
+See the README.
 
 The window refuses to start unless it can reach every input the board decodes.
 `view_ui --coverage` prints `48 of 48` and exits non-zero on a gap.
