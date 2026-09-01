@@ -401,9 +401,29 @@ def main() -> int:
     gui_log = TEMP / "vm-gui.log"
     console_log = TEMP / "vm-console.txt"
     frame = TEMP / "vm-frame.ppm"
+    # A previous run that was killed rather than closed leaves its QEMU behind,
+    # and that orphan still holds this log open.  Windows then refuses the
+    # unlink with WinError 32, and an unhandled PermissionError names the file
+    # but not the cause -- which is a confusing way to discover that the last
+    # run never went away.  Say what is holding it and what to do about it.
+    held = []
     for path in (main_log, gui_log, console_log, frame):
-        if path.exists():
+        if not path.exists():
+            continue
+        try:
             path.unlink()
+        except PermissionError:
+            held.append(path)
+    if held:
+        names = ", ".join(path.name for path in held)
+        print(f"# {names} is still open: a previous run is still alive.",
+              file=sys.stderr)
+        print("#   tasklist | findstr /i \"qemu-system-sh4 cdj-run\"",
+              file=sys.stderr)
+        print("#   taskkill /F /T /IM qemu-system-sh4.exe",
+              file=sys.stderr)
+        print("#   taskkill /F /T /IM cdj-run.exe", file=sys.stderr)
+        return 2
 
     source_key = args.source_key or ("sd" if args.sd else None)
     keys = os.environ.get("CDJ_PANEL_KEYS", "")

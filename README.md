@@ -22,11 +22,13 @@ Three things to expect before you build anything:
   five, sometimes more — to reach a state a real player reaches in seconds.
   Two emulated CPUs, one of them an interpreting instruction-set simulator.
   Leave it running; it is not hung.
-- **It is unreliable.** The GUI board double-faults intermittently, at
-  `0x00b99196`, usually somewhere between one and three minutes in. When it
-  does, the panel freezes wherever it got to and the launcher reports
-  `simulator exited with code 1`. Roughly one run in three or four survives past
-  it. This is long-standing behaviour, not a broken checkout.
+- **It is unreliable, and it gets worse when the host is busy.** The GUI board
+  double-faults intermittently at `0x00b99196`, usually one to three minutes
+  in; the panel then freezes wherever it got to and the launcher reports
+  `simulator exited with code 1`. Measured here: about one run in three faults
+  on an idle machine, and five of six while a compile was running alongside.
+  So do not build something else in another window and expect a clean run.
+  This is long-standing behaviour, not a broken checkout.
 - **Almost nothing is finished past booting.** See "What does not" below. If you
   need a working player, this is the wrong repository.
 
@@ -74,8 +76,8 @@ Be clear about this: **the player is not usable as a player.**
 
 * **The GUI board double-faults.** Intermittent, at `0x00b99196`, typically
   after one to three minutes. The panel stops updating and the launcher says
-  `simulator exited with code 1`. Run it again; roughly one attempt in three or
-  four gets past it.
+  `simulator exited with code 1`. Run it again, and keep the machine quiet
+  while you do -- see the note above.
 * **Speed.** Minutes, not seconds. Every measurement you take costs a run.
 * **The browse list does not come from the card.** MAIN answers every browse
   request as `DISC` even with a card present, and the panel shows `NO CARD`.

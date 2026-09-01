@@ -21,9 +21,15 @@ stream starts after that. Leave it running; it is not hung.
 
 **And it may not get there.** The GUI board double-faults intermittently at
 `0x00b99196`, usually one to three minutes in. The panel then freezes wherever
-it had got to and the window reports `simulator exited with code 1`. Roughly one
-run in three or four survives it, so the answer is to start it again. The
-simulator writes the fault line to its log:
+it had got to and the window reports `simulator exited with code 1`. The answer
+is to start it again -- and to leave the machine alone while it runs. About one
+run in three faults when nothing else is happening; five of six faulted here
+while a compile was running alongside.
+
+It is a race, not a constant, and it is not the simulator's link hold cap:
+`BFIN_LINK_HOLD_MAX=1000000` and `BFIN_LINK_ANNOUNCE_STICKY=1` were each
+measured over three runs against a three-run control and neither made a
+difference. The simulator writes the fault line to its log:
 
 ```sh
 tail "$TEMP/vm-ui-sim.log"      # or vm-gui.log for a headless run
