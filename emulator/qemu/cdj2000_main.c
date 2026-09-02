@@ -3062,11 +3062,60 @@ static void cdj_sdhi_data_ready(void *opaque)
     }
 }
 
+/*
+ * The media state the GUI routes on.
+ *
+ * Status halfword 26 carries one 3-bit state per source, built by 0x218afe
+ * from the four words at 0x0489bd68 (DISC, SD, USB, LINK).  The GUI's
+ * screen router (0xb9b706) takes 0 to the Wait platter, 1 to the library,
+ * and only from the library does the GUI ask MAIN for the card's lists.
+ * MAIN writes those words through one accessor, 0x14e0be, from its browse
+ * answer builder -- and only on the media branch, which needs the database
+ * context open ([ctx+0x2d5c]) -- so a card that is mounted is never reported
+ * as such until the GUI browses it, and the GUI never browses it while the
+ * state says 0.  Measured, SD key on the test card: state 0 at the key ->
+ * platter for ever (sd1, sd2, w2); state 1 at the key -> the GUI asks for
+ * the card's lists at once and draws PLAYLIST / SEARCH / ARTIST / ALBUM /
+ * TRACK / KEY from it (e4, e5).
+ *
+ * So the board reports the card: from CDJ_SD_MOUNT_S (5) seconds after the
+ * insertion it holds the SD state word at 1, ten times a second, because
+ * the accessor republishes the context's own copy on every answer.  This
+ * is a stand-in for the media manager's report, not a model of it; it is
+ * what the real machine's word 26 shows for a mounted medium (the
+ * harvested capture carries USB state 1 for a stick).  CDJ_SD_MEDIA_STATE=0
+ * switches it off; a machine without a card never sees it.
+ */
+#define CDJ_SD_STATE_WORD 0x0489bd6cULL
+
+static void cdj_sd_media_state_report(CdjSdhiState *s)
+{
+    const char *enable = getenv("CDJ_SD_MEDIA_STATE");
+    const char *mount = getenv("CDJ_SD_MOUNT_S");
+    uint64_t seconds = mount ? strtoull(mount, NULL, 0) : 5;
+    CdjMainPoke *poke;
+
+    if ((enable && *enable == '0') || !sdbus_get_inserted(&s->sdbus)) {
+        return;
+    }
+    poke = g_new0(CdjMainPoke, 1);
+    poke->address[0] = CDJ_SD_STATE_WORD;
+    poke->value[0] = 1;
+    poke->count = 1;
+    poke->period_ns = 100 * SCALE_MS;
+    poke->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_main_poke_fire, poke);
+    timer_mod(poke->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                           seconds * NANOSECONDS_PER_SECOND);
+    qemu_log_mask(LOG_UNIMP, "cdj2000-sd: card inserted; reporting it mounted "
+                  "(media state 1) from %" PRIu64 " s on\n", seconds);
+}
+
 static void cdj_sdhi_insert(void *opaque)
 {
     CdjSdhiState *s = opaque;
 
     s->inserted = true;
+    cdj_sd_media_state_report(s);
 }
 
 static void cdj_sdhi_reset(DeviceState *dev)

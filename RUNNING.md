@@ -240,6 +240,25 @@ runs. The last per-instruction cost the profiler found was the
 instruction text itself: every decoder formatted its immediate operands
 with `sprintf` for a trace line nothing printed; that is gated now.
 
+**Switching to a medium (work in progress, 2026-09-02 evening).** With a
+card image (`--sd card.img`, a rekordbox export on it) the whole chain has
+been seen to work: SD key at 45 s, and at 46.3 s the screen shows the `SD`
+header, the six categories and the card's folders and playlists (run sw1).
+What made it possible is one report the board now gives on MAIN's behalf:
+status halfword 26 carries a 3-bit media state per source, the GUI's screen
+router takes 0 to the `Wait` platter and 1 to the library, and only from the
+library does it ask MAIN for the card's lists; MAIN itself never publishes 1
+for a mounted card, because it writes that state only from its browse answer
+builder with the card's database already open, which it opens only when
+asked. From `CDJ_SD_MOUNT_S` (5) seconds after the card goes in the board
+holds the SD state word at 1 (`CDJ_SD_MEDIA_STATE=0` switches it off). It is
+not yet reliable: one run of six reached the library in 1.3 s; in the others
+the GUI was in its LINK browse loop (type-1 cursor-3 polls at 30-40 a second,
+started at ~30 s) when the key came, and never moved its requests to the SD
+source. In the run that worked that loop had ended before the key. Where the
+loop's exit comes from is the open question; holding all four states at 1
+(r133's poke) made it worse, 0 of 3.
+
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold
 reaches MAIN -- `0x04c084d4` goes to 1 -- but the GUI never learns of it): the

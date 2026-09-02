@@ -428,6 +428,13 @@ def main() -> int:
                              "and the CDJ_LINK_CENSUS lines -- lives only "
                              "there, so a run without this keeps no record of "
                              "whether MAIN was still transmitting")
+    parser.add_argument("--poll-words", default="",
+                        help="extra MAIN words to read on every --poll-every "
+                             "round and print after the milestones, as "
+                             "comma-separated physical addresses, e.g. "
+                             "0x4c084d8,0x489bdbc -- the source flag and a "
+                             "status-record halfword pair, for timing a key "
+                             "against the record that carries it")
     parser.add_argument("--poll-every", type=float, default=0.0,
                         metavar="SECONDS",
                         help="while the boards run, read the milestone words "
@@ -641,6 +648,9 @@ def main() -> int:
             encoding="utf-8", errors="replace",
         )
         poll_rows: list[tuple] = []
+        poll_extra = [("0x%x" % int(text, 0), int(text, 0),
+                       "xp /1wx 0x%08x" % int(text, 0))
+                      for text in args.poll_words.split(",") if text.strip()]
         if args.poll_every > 0:
             # Elapsed is counted from the GUI launch; QEMU started ~3 s before.
             started = time.monotonic()
@@ -656,7 +666,7 @@ def main() -> int:
                 elapsed = now - started
                 mon.settimeout(0.3)
                 try:
-                    words = monitor(mon, POLL_WATCH, settle=0.02)
+                    words = monitor(mon, POLL_WATCH + poll_extra, settle=0.02)
                 except OSError:
                     words = {}
                 mon.settimeout(1.0)
@@ -672,9 +682,13 @@ def main() -> int:
                        round(cpu.get("cdj-run", -1.0), 1))
                 poll_rows.append(row)
                 print("# t=%6.1f panel=%d GuiCom=%d ready=%d/%d rtos=%d "
-                      "(%+.0f/s) cpu qemu=%.1fs sim=%.1fs" % (
+                      "(%+.0f/s) cpu qemu=%.1fs sim=%.1fs%s" % (
                           row[0], row[1], row[2], row[3], row[4], row[5],
-                          row[6], row[7], row[8]), flush=True)
+                          row[6], row[7], row[8],
+                          "".join(" %s=%08x" % (name, words.get(address, -1)
+                                                & 0xffffffff)
+                                  for name, address, _ in poll_extra)),
+                      flush=True)
                 previous = (elapsed, rtos)
             if gui.poll() is None:
                 stop_tree(gui)
