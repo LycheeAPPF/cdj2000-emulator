@@ -274,6 +274,16 @@ a default: the two protocol tasks are balanced against each other by timing
 on both sides, and every switch is off unless set. The launchers keep the
 configuration that boots six times of seven.
 
+The same cadence decides every key. A click in the `view_vm` window holds
+the key 3.3 s, long enough to span one of MAIN's records, and the screen
+follows about five seconds after the click; the UTILITY menu (hold `MENU`
+on the real player) opens that way, with its list empty because the entries
+are payloads MAIN does not deliver. A second click on the same key while the
+first is still down is refused with the time left: the board queues presses
+one behind the other, and a queued MENU closes the menu the first one
+opened, which is what repeated clicking looked like. Right-click holds a key
+down until the next right-click.
+
 MAIN's RTOS tick, read back through the monitor: 120-880 a second with the
 old interrupt patch depending on host load, ~830 of the programmed 1000 with
 the decline fix, the real 54 MHz timer clock and the Windows timer resolution

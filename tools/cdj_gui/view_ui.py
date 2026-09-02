@@ -235,13 +235,27 @@ def firmware_name(byte: int, bit: int) -> str:
     return panel_control.FIRMWARE_KEY_NAMES.get((byte, bit), "")
 
 
+# How long a click holds a key down.  MAIN copies the key level into the
+# status record it builds next, and it builds one every 3.05 s when nothing
+# else changes (measured on the link, menu2: 42.59, 45.61, 48.66 ...), so a
+# press lands only if it spans one of those.  The plan hold of 2 800 ms
+# (panel_control.PLAN_HOLD_MS) was chosen against a measurement plan's 10 s
+# attribution window and covers a 3.05 s cadence 92 times in 100; a click
+# has no such constraint, and 3 300 ms covers it every time.  The screen
+# follows the record: measured, the UTILITY menu (hold MENU) is drawn about
+# five seconds after the click, the Wait platter after a SOURCE key about
+# four.  Every press is therefore a long press as far as MAIN can tell; a
+# short one cannot be delivered on this link at all.
+WINDOW_HOLD_MS = 3300
+
+
 def hardware_button(label: str, key: str, group: str, note: str) -> Control:
     """One front-panel key, resolved through the one naming table there is."""
     byte, mask = panel_control.button_mask(key)
     bit = mask.bit_length() - 1
     name = firmware_name(byte, bit)
     return Control(label, "%d.%d" % (byte, bit), "button", group,
-                   (panel_control.encode_press(byte, mask),),
+                   (panel_control.encode_press(byte, mask, WINDOW_HOLD_MS),),
                    "%s; MAIN calls it %s" % (note, name) if name else note)
 
 
@@ -274,7 +288,7 @@ def button_controls() -> list[Control]:
         name = firmware_name(byte, bit)
         controls.append(Control(
             "%d.%d" % (byte, bit), "%d.%d" % (byte, bit), "button", "bits",
-            (panel_control.encode_press(byte, 1 << bit),),
+            (panel_control.encode_press(byte, 1 << bit, WINDOW_HOLD_MS),),
             "decoded by 0x28e1ae" + ("; %s" % name if name else
                                      "; no name in MAIN's table")))
     return controls
@@ -442,6 +456,16 @@ class UiViewer:
         self.control_note = tk.StringVar(value="")
         self.status = tk.StringVar(value="Starting Blackfin firmware…")
         self.held: dict[tuple[int, int], Control] = {}
+        # Key -> the time its click's press is over (hold plus the board's
+        # gap).  The board queues presses one behind the other, so a click
+        # repeated while the first is still down does not land sooner: it
+        # lands 3.6 s later and, for a key that toggles something (MENU
+        # opens the UTILITY menu and closes it again), undoes the first.
+        # That is what made the menu "close again after a few seconds"
+        # under repeated clicking.  A click inside the window is refused
+        # with the time left, and the screen is expected a few seconds
+        # after that.
+        self.in_flight: dict[str, float] = {}
         self.analog_value: dict[int, tk.StringVar] = {}
         self.analog_position: dict[int, tk.DoubleVar] = {}
         self.analog_touch: dict[int, tk.BooleanVar] = {}
@@ -792,6 +816,23 @@ class UiViewer:
         return reply
 
     def click(self, control: Control) -> None:
+        if control.kind == "button" and control.input_id is not None:
+            now = time.monotonic()
+            over = self.in_flight.get(control.input_id, 0.0)
+            if now < over:
+                self.control_note.set(
+                    "%s: press still down for %.1f s -- MAIN samples it "
+                    "into its next status record and the screen follows "
+                    "a few seconds later; a second press would undo a "
+                    "toggle like MENU" % (control.label, over - now))
+                return
+            if self.send(control, control.lines[0]) is not None:
+                self.in_flight[control.input_id] = (
+                    now + panel_control.press_period_s(WINDOW_HOLD_MS))
+                self.control_note.set(
+                    "%s: held %.1f s; the screen follows about 5 s after "
+                    "the click" % (control.label, WINDOW_HOLD_MS / 1000.0))
+            return
         if control.lines:
             self.send(control, control.lines[0])
         else:
