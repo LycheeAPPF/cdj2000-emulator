@@ -924,7 +924,6 @@ class UiViewer:
             {
                 "BFIN_GUI_OUTPUT": str(output),
                 "BFIN_GUI_HEIGHT": str(self.args.height),
-                "BFIN_PPI_DMA_DELAY": str(self.args.ppi_delay),
                 "BFIN_FAST_LZSS": str(
                     (FIRMWARE / "gui-flash-image.bin").resolve()
                 ),
@@ -952,11 +951,17 @@ class UiViewer:
             board_path(self.args.board),
             simulator_path(self.args.elf),
         ]
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        creationflags = ((subprocess.CREATE_NO_WINDOW
+                          | subprocess.ABOVE_NORMAL_PRIORITY_CLASS)
+                         if sys.platform == "win32" else 0)
         self.process = subprocess.Popen(
             command,
             cwd=REPO_ROOT,
             env=env,
+            # No console for the simulator: the UART model polls stdin
+            # (bfin_uart_get_status -> sim_io_poll_read), and on MinGW that
+            # read blocks inside the run loop if a console is attached.
+            stdin=subprocess.DEVNULL,
             stdout=self.log_stream,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
@@ -1080,7 +1085,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "costs ~8 ms and the board publishes ~32 fps "
                              "under the live link, so the old 100 ms dropped "
                              "roughly three frames in four")
-    parser.add_argument("--ppi-delay", type=int, default=50000)
+    parser.add_argument("--ppi-delay", type=int, default=0,
+                        help="ticks per display scanline (BFIN_PPI_DMA_DELAY); "
+                             "0, the default, lets the simulator pace the "
+                             "display per frame on its wall-clock time base")
     parser.add_argument("--control-port", type=int, default=0,
                         help="port of MAIN's CDJ_INPUT_PORT control channel; "
                              "0 leaves the controls refusing rather than inert")
@@ -1102,8 +1110,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         path = getattr(args, name)
         if not path.exists():
             parser.error(f"{name} does not exist: {path}")
-    if args.height <= 0 or args.scale <= 0 or args.ppi_delay <= 0:
-        parser.error("height, scale, and ppi-delay must be positive")
+    if args.height <= 0 or args.scale <= 0 or args.ppi_delay < 0:
+        parser.error("height and scale must be positive, ppi-delay 0 or more")
     if args.refresh_ms < 5:
         parser.error("refresh-ms below 5 spends the whole Tk main loop looking "
                      "for frames; one pass costs about 8 ms")

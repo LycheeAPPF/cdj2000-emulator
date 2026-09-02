@@ -62,6 +62,14 @@ libtool's wrapper script rather than the simulator; the script checks for
 exactly this and refuses, because the wrapper exits 127 with no output and is a
 confusing way to spend an afternoon.
 
+The simulator is compiled `-O3 -march=native -g` with `--enable-sim-inline`
+and `--disable-sim-assert`, because the interpreter's inner loop is the whole
+cost of a run. `--march=nocona` gives a binary that runs on any x86-64,
+`--opt=-O2` the upstream level, `--profile` a `-pg` build installed as
+`bin/cdj-run-pg` for gprof, and `--reconfigure` throws the object tree away
+first -- configure only runs when there is no `config.status`, so a change of
+flags does nothing without it. `CDJ_SIM_CFLAGS` replaces the flags outright.
+
 ## The MAIN board -- SH-4, from QEMU
 
 QEMU is not vendored here. Clone it wherever you like:

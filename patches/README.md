@@ -55,6 +55,36 @@ that masks with `SR.IMASK`.
    The patch makes `use_exit_tb` true for `TB_FLAG_DELAY_SLOT_RTE`, so an `rte`
    delay slot leaves the CPU loop and the restored `SR` is re-tested.
 
+5. **A declined interrupt was reported as taken.** `superh_cpu_exec_interrupt`
+   called `superh_cpu_do_interrupt` and returned `true` whenever
+   `CPU_INTERRUPT_HARD` was set, even when the interrupt was then declined
+   inside -- masked by `SR.BL`, or, with (1), by `IMASK`. TCG treats `true` as
+   "state changed": it drops the block it was about to chain from
+   (`*last_tb = NULL`) and takes the big lock at the next block boundary. The
+   controller is level sensitive, so a pending-but-masked timer keeps the flag
+   up for the whole run and every basic block of the guest went back through
+   the slow loop. The patch tests the delay slot, `SR.BL` and the pending
+   vector first and returns `false` for a decline; the line is re-tested at the
+   next exit to the loop, which every `SR` write and every `rte` forces (4).
+
+6. **The main loop could not wait for less than a millisecond.** On Windows
+   QEMU waits in `g_poll`, which takes whole milliseconds and rounds up, and
+   the scheduler adds its own slack. The RTOS tick is a 1 ms TMU period; a
+   tick that fires late enough to overlap the next is coalesced by the level
+   sensitive line and the guest loses it. Measured ~820 of 1000 a second with
+   the board raising the process timer resolution to 0.5 ms, 720 without. The
+   patch arms a high-resolution waitable timer for any wait under 4 ms and
+   hands its handle to `g_poll` alongside the other wait objects, so the wait
+   ends when the timer fires or when anything else becomes ready. Measured
+   with it: 1000 a second, alone and with the GUI board attached.
+   `CDJ_MAIN_LOOP_HIRES=0` switches it off. At the full rate the GUI board,
+   whose interpreter is thirty times slower than the real chip on real work,
+   overflowed its exception stack -- the long-standing double fault at
+   `0x00b99196`, a push with `SP` already in MMR space -- in three runs of
+   three, until its simulator started carrying link announcements over
+   (`BFIN_LINK_ANNOUNCE_STICKY`, set by the launchers); with that, three of
+   three boots at the full rate were clean.
+
 ### What each one costs
 
 Without (3) the CDJ's RTOS never survives its first timer tick. Its interrupt
@@ -149,6 +179,76 @@ services the SIC, leaving a receive task asleep for good.
 `BFIN_PPI_DMA_DELAY` paces the display DMA. A value of `5000` approximates
 scanline time well enough to stop the LCD consuming one hardware event per
 simulated cycle.
+
+### `sim/bfin/interp.c` — guest time on the wall clock
+
+Upstream ticks the event queue once per instruction (plus a few for slow
+ones), so guest time is whatever speed the interpreter happens to run at. Here
+that was 8 MIPS against a 400 MHz core: every firmware delay, time-out and
+animation stretched elevenfold and a boot took five minutes. The patch delivers
+ticks at the rate the wall clock advances, `BFIN_CCLK_HZ` per second, and puts
+a parked CPU -- the firmware idles `main()` in a one-instruction loop that
+jumps to itself, or executes `IDLE` -- to sleep until the next event is due or
+a record arrives from MAIN. Guest time never runs ahead of the wall clock, so
+the two boards, QEMU having always been on the wall clock, see the same time.
+
+The comment this replaces said the idle loop must not be skipped because two
+attempts made boot slower. Both attempts let guest time run *faster* than the
+wall clock while parked, so the display DMA and the link retries fired at
+whatever rate the host could manage and MAIN, on real time, fell behind. The
+cap is what was missing, not the idea.
+
+What goes with it: the event queue's poll event is silenced
+(`SIM_EVENTS_POLL_RATE` in `sim-main.h`; at 400 MHz it would wake a sleeping
+run every ten microseconds), the display DMA is paced per frame at
+`BFIN_PPI_FPS` instead of one scanline per simulated cycle, and a receive with
+nothing to hand over retries after `BFIN_SPORT_RETRY_US` of guest time rather
+than after 5000 ticks. Measured on the GUI board alone: guest ticks track the
+wall clock at exactly 400 M/s, the display scans at 57-60 fps, and the
+simulator sleeps two thirds of the time. The full boot reaches the player
+screen with `NO DISC` in about 35 s where the old time base still showed the
+`Wait` spinner at 150 s.
+
+`BFIN_TIME_BASE=insn` restores the upstream behaviour for reproducing a run
+instruction for instruction, and `BFIN_EXIT_AFTER_TICKS=<n>` halts at a guest
+time so two builds can be compared picture for picture.
+
+### The interpreter's own speed
+
+Three changes to the per-instruction path, each measured on the GUI board
+alone (`run_headless --packet packets/status.bin --seconds 60`, MIPS and the
+wall clock to reach 1e9 guest ticks, i7-13700H):
+
+* The ~2000 lines of environment-gated probes that ran before and after every
+  instruction, and the three trace hooks on every memory access, sit behind
+  one flag decided once from the environment (`bfin_probes_active`). A probe
+  run is unchanged; a plain run pays one predicted branch.
+* Guest loads, stores and fetches use a direct-mapped cache of host pointers,
+  one entry per 4 KiB page and per map, for pages that are plain memory --
+  no device, wholly inside one mapping, not straddling a modulo alias. The
+  core's own path was one linked-list walk of ~40 mappings *per byte*. The
+  cache is stamped with `sim_core_generation` and flushed when a mapping is
+  attached or detached, which the EBIU model does on every AMGCTL write.
+  Together with the probe gate: 8.4 → 18.7 MIPS, 32.7 s → 10.9 s.
+* The CPLB walk -- sixteen entries per access -- keeps a memo of the last
+  single hit per table; the same page with a granted permission skips the
+  walk, anything else takes it, any MMU register write empties the memo.
+  `getenv()` left the DMA, PPI, SPORT and CFI hot paths. 18.7 → 31.7 MIPS,
+  10.9 s → 6.6 s.
+
+* The display path converted every scanline of every 60 Hz scan to RGB and
+  scored every pixel for the best/detail outputs whether or not those were
+  in use -- 27 % of the simulator's wall clock while the firmware idled, as
+  the built-in sampling profiler (`BFIN_SAMPLE_PROFILE`, interp.c) showed.
+  A line is converted only when its raw pixels changed, and scored only
+  while a best/detail output is set. The instruction-counted regression run
+  to 2e9 ticks dropped from 15.0 s to 7.1 s.
+
+The regression test for all of this is `BFIN_TIME_BASE=insn
+BFIN_EXIT_AFTER_TICKS=2000000000` from `packets/status.bin`: every build must
+halt with a byte-identical frame (409 927 680 instructions before the poll
+event was silenced, 191 758 336 after, because `IDLE` now warps to the next
+real event).
 
 ### Two diagnostics that are there because they found something
 

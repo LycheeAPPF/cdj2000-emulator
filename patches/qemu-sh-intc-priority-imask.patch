@@ -96,7 +96,7 @@ index 94f1831..6ec46e0 100644
  
  int sh_intc_get_pending_vector(struct intc_desc *desc, int imask);
 diff --git a/target/sh4/helper.c b/target/sh4/helper.c
-index b6b057f..e2a1e8a 100644
+index b6b057f..bf813ed 100644
 --- a/target/sh4/helper.c
 +++ b/target/sh4/helper.c
 @@ -151,6 +151,23 @@ void superh_cpu_do_interrupt(CPUState *cs)
@@ -123,6 +123,43 @@ index b6b057f..e2a1e8a 100644
      if (env->flags & TB_FLAG_DELAY_SLOT_MASK) {
          /* Branch instruction should be executed again before delay slot. */
          env->spc -= 2;
+@@ -787,13 +804,32 @@ int cpu_sh4_is_cached(CPUSH4State *env, uint32_t addr)
+ bool superh_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+ {
+     if (interrupt_request & CPU_INTERRUPT_HARD) {
++        CPUSH4State *env = cpu_env(cs);
++
+         /* Delay slots are indivisible, ignore interrupts */
+-        if (cpu_env(cs)->flags & TB_FLAG_DELAY_SLOT_MASK) {
++        if (env->flags & TB_FLAG_DELAY_SLOT_MASK) {
+             return false;
+-        } else {
+-            superh_cpu_do_interrupt(cs);
+-            return true;
+         }
++        /*
++         * An interrupt that is pending but masked -- by SR.BL, or because
++         * its priority does not exceed SR.IMASK -- is declined, not taken.
++         * superh_cpu_do_interrupt() returns early in both cases, and
++         * reporting that as "taken" makes the TCG loop drop block
++         * chaining (*last_tb = NULL) and take the BQL at every block
++         * boundary for as long as the source stays pending.  With a level
++         * sensitive controller that is the whole run.  Say "declined"
++         * instead; the pending line is re-tested at the next exit to the
++         * loop, which every SR write and every rte forces.
++         */
++        if ((env->sr & (1u << SR_BL)) && !env->in_sleep) {
++            return false;
++        }
++        if (sh_intc_get_pending_vector(env->intc_handle,
++                                       (env->sr >> 4) & 0xf) == -1) {
++            return false;
++        }
++        superh_cpu_do_interrupt(cs);
++        return true;
+     }
+     return false;
+ }
 diff --git a/target/sh4/translate.c b/target/sh4/translate.c
 index 373950f..c79ea07 100644
 --- a/target/sh4/translate.c
@@ -147,3 +184,100 @@ index 373950f..c79ea07 100644
  }
  
  static bool use_goto_tb(DisasContext *ctx, vaddr dest)
+diff --git a/util/main-loop.c b/util/main-loop.c
+index 65e5dbc..1d0b71b 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -461,10 +461,73 @@ static void pollfds_poll(GArray *pollfds, int nfds, fd_set *rfds,
+     }
+ }
+ 
++/*
++ * A wait shorter than a few milliseconds cannot be expressed to g_poll,
++ * which takes whole milliseconds and rounds up, and the Windows scheduler
++ * then adds its own slack on top.  A guest whose tick is a 1 ms timer
++ * (the CDJ-2000's RTOS) loses every tick that fires late enough to overlap
++ * the next: measured ~820 of 1000 a second.  For a short timeout, arm a
++ * high-resolution waitable timer for the exact interval and hand its handle
++ * to g_poll alongside the other wait objects, so the wait ends when the
++ * timer fires or when anything else becomes ready, whichever is first.
++ *
++ * With it the RTOS tick is served at the programmed 1000 a second, without
++ * it ~830.  CDJ_MAIN_LOOP_HIRES=0 switches it off: the GUI board, whose
++ * interpreter is thirty times slower than the real chip on real work, used
++ * to overflow its exception stack (the double fault at 0x00b99196) within a
++ * minute once MAIN ran at full rate, until its simulator carried link
++ * announcements over (BFIN_LINK_ANNOUNCE_STICKY); with that, three of three
++ * boots at the full rate were clean.
++ */
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++
++static bool arm_short_wait(GPollFD *poll_fds, int *nfds, int64_t timeout_ns)
++{
++    static HANDLE timer;
++    static bool tried;
++    static int enabled = -1;
++    LARGE_INTEGER due;
++
++    if (enabled < 0) {
++        const char *env = getenv("CDJ_MAIN_LOOP_HIRES");
++        enabled = !(env && *env == '0');
++    }
++    if (!enabled || timeout_ns <= 0 || timeout_ns >= 4 * SCALE_MS) {
++        return false;
++    }
++    if (!tried) {
++        tried = true;
++        timer = CreateWaitableTimerExW(NULL, NULL,
++                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                       TIMER_ALL_ACCESS);
++        if (!timer) {
++            timer = CreateWaitableTimerW(NULL, TRUE, NULL);
++        }
++    }
++    if (!timer) {
++        return false;
++    }
++    due.QuadPart = -(timeout_ns / 100);
++    if (due.QuadPart == 0) {
++        due.QuadPart = -1;
++    }
++    if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
++        return false;
++    }
++    poll_fds[*nfds].fd = (DWORD_PTR)timer;
++    poll_fds[*nfds].events = G_IO_IN;
++    poll_fds[*nfds].revents = 0;
++    (*nfds)++;
++    return true;
++}
++
+ static int os_host_main_loop_wait(int64_t timeout)
+ {
+     GMainContext *context = g_main_context_default();
+     GPollFD poll_fds[1024 * 2]; /* this is probably overkill */
++    int total_fds;
+     int select_ret = 0;
+     int g_poll_ret, ret, i, n_poll_fds;
+     PollingEntry *pe;
+@@ -519,11 +582,17 @@ static int os_host_main_loop_wait(int64_t timeout)
+ 
+     poll_timeout_ns = qemu_soonest_timeout(poll_timeout_ns, timeout);
+ 
++    total_fds = n_poll_fds + w->num;
++    if (arm_short_wait(poll_fds, &total_fds, poll_timeout_ns)) {
++        /* The timer handle ends the wait; this is only a backstop. */
++        poll_timeout_ns = 20 * SCALE_MS;
++    }
++
+     bql_unlock();
+ 
+     replay_mutex_unlock();
+ 
+-    g_poll_ret = qemu_poll_ns(poll_fds, n_poll_fds + w->num, poll_timeout_ns);
++    g_poll_ret = qemu_poll_ns(poll_fds, total_fds, poll_timeout_ns);
+ 
+     replay_mutex_lock();
+ 

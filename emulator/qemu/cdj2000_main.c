@@ -408,6 +408,33 @@ enum {
 /* Reading the same register this many times running means a stuck poll. */
 #define SPIN_REPORT     4096
 
+/*
+ * CDJ_LINK_TRACE: log every link arm and acknowledge.  Off by default: at
+ * ~300 exchanges a second those two lines were 43 000 log writes per five
+ * minutes and said nothing the "sent"/"delivered" lines do not.
+ */
+static bool cdj_sdhi_trace(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *env = getenv("CDJ_SDHI_TRACE");
+        enabled = env && *env;
+    }
+    return enabled;
+}
+
+static bool cdj_link_trace(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *env = getenv("CDJ_LINK_TRACE");
+        enabled = env && *env;
+    }
+    return enabled;
+}
+
 typedef struct {
     MemoryRegion trap;
     MemoryRegion trap_p4;
@@ -416,6 +443,17 @@ typedef struct {
     hwaddr last_read;
     uint64_t repeats;
     bool reported;
+
+    /*
+     * The same for writes.  INT2MSKCR (0xffd4003c) is written on every ISR
+     * exit, and logging each one cost 150 000 lines -- three quarters of the
+     * -D log -- in a five-minute run, each line a mutex, a vfprintf and an
+     * fflush.  The first write to an address is logged, a run of repeats is
+     * reported once with its count when the address changes.
+     */
+    hwaddr last_write;
+    uint64_t last_write_value;
+    uint64_t write_repeats;
 
     uint64_t default_value;
 } CdjPeriphState;
@@ -568,11 +606,16 @@ static void cdj_panel_keys_parse(void)
  */
 static void cdj_panel_frame(uint8_t *frame)
 {
-    const char *spec = getenv("CDJ_PANEL_FRAME");
+    static const char *spec;
+    static bool spec_read;
     unsigned sum = 0;
     int64_t now;
     int i;
 
+    if (!spec_read) {
+        spec = getenv("CDJ_PANEL_FRAME");
+        spec_read = true;
+    }
     memset(frame, 0, PANEL_FRAME_LEN);
     for (i = 0; spec && i < PANEL_FRAME_LEN - 2; i++) {
         char digits[3] = { spec[2 * i], spec[2 * i + 1], 0 };
@@ -1029,8 +1072,23 @@ static uint64_t cdj_periph_read(void *opaque, hwaddr offset, unsigned size)
 static void cdj_periph_write(void *opaque, hwaddr offset, uint64_t value,
                              unsigned size)
 {
+    CdjPeriphState *periph = opaque;
     hwaddr address = PERIPH_P4_BASE + offset;
 
+    if (address == periph->last_write && value == periph->last_write_value) {
+        periph->write_repeats++;
+        return;
+    }
+    if (periph->write_repeats > 1) {
+        qemu_log_mask(LOG_UNIMP,
+                      "cdj2000-main: write 0x%" HWADDR_PRIx " = 0x%" PRIx64
+                      " repeated %" PRIu64 " times\n",
+                      periph->last_write, periph->last_write_value,
+                      periph->write_repeats);
+    }
+    periph->last_write = address;
+    periph->last_write_value = value;
+    periph->write_repeats = 1;
     qemu_log_mask(LOG_UNIMP,
                   "cdj2000-main: write 0x%" HWADDR_PRIx " (%u bytes) = 0x%"
                   PRIx64 "\n", address, size, value);
@@ -1476,9 +1534,10 @@ static void cdj_link_transmit(CdjLinkState *link)
         link->n_short++;
     }
     qemu_log_mask(LOG_UNIMP, "%s: sent %u bytes from 0x%08x (connected=%d "
-                  "written=%d, first words %02x%02x %02x%02x)\n",
+                  "written=%d, first words %02x%02x %02x%02x) t=%.4f\n",
                   link->name, frame, link->buffer, owner->connected, written,
-                  buffer[9], buffer[8], buffer[11], buffer[10]);
+                  buffer[9], buffer[8], buffer[11], buffer[10],
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
     cdj_link_census(link);
 
     link->control &= ~LINK_CTRL_START;
@@ -1547,8 +1606,11 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
 
     case LINK_CONTROL:
         if ((value & LINK_CTRL_START) && !(link->control & LINK_CTRL_START)) {
-            qemu_log_mask(LOG_UNIMP, "%s: armed buffer=0x%08x len=%u\n",
-                          link->name, link->buffer, cdj_link_frame_len(link));
+            if (cdj_link_trace()) {
+                qemu_log_mask(LOG_UNIMP, "%s: armed buffer=0x%08x len=%u\n",
+                              link->name, link->buffer,
+                              cdj_link_frame_len(link));
+            }
             link->n_armed++;
             link->control = value;
             /*
@@ -1573,8 +1635,10 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
 
     case LINK_STATUS:
         /* Written back as (value & 31) to acknowledge. */
-        qemu_log_mask(LOG_UNIMP, "%s: ack status 0x%02x (was 0x%02x)\n",
-                      link->name, (unsigned)(value & 0x1f), link->status);
+        if (cdj_link_trace()) {
+            qemu_log_mask(LOG_UNIMP, "%s: ack status 0x%02x (was 0x%02x)\n",
+                          link->name, (unsigned)(value & 0x1f), link->status);
+        }
         link->n_ack++;
         cdj_link_census(link);
         link->status &= ~(value & 0x1f);
@@ -1889,8 +1953,10 @@ static void cdj_link_receive(void *opaque, const uint8_t *data, int size)
     if (link->flag) {
         cdj_link_flag_rx(link->flag, cdj_link_flag_pending());
     }
-    qemu_log_mask(LOG_UNIMP, "%s: delivered %u bytes to 0x%08x, status 0x%02x\n",
-                  link->name, frame, link->buffer, link->status);
+    qemu_log_mask(LOG_UNIMP, "%s: delivered %u bytes to 0x%08x, status 0x%02x"
+                  " t=%.4f\n",
+                  link->name, frame, link->buffer, link->status,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
     link->n_rx++;
     cdj_link_census(link);
     cdj_intc2_set(link, true);
@@ -2792,7 +2858,7 @@ static uint64_t cdj_sdhi_read(void *opaque, hwaddr offset, unsigned size)
      * so a cap of 24 hides the insertion it was added to observe.
      */
     ++reads;
-    if (getenv("CDJ_SDHI_TRACE")
+    if (cdj_sdhi_trace()
         && (offset != last_offset || value != last_value)) {
         fprintf(stderr, "cdj2000-sdhi: read %u @ +%#04x -> %#06x (#%lu) pc %#010x\n",
                 size, (unsigned)offset, (unsigned)value, reads,
@@ -2820,7 +2886,7 @@ static void cdj_sdhi_write(void *opaque, hwaddr offset, uint64_t value,
 {
     CdjSdhiState *s = opaque;
 
-    if (getenv("CDJ_SDHI_TRACE") && (offset & ~1ULL) != SDHI_INFO1
+    if (cdj_sdhi_trace() && (offset & ~1ULL) != SDHI_INFO1
         && (offset & ~1ULL) != SDHI_INFO2) {
         fprintf(stderr, "cdj2000-sdhi: write %u @ +%#04x = %#06x  pc %#010x\n",
                 size, (unsigned)offset, (unsigned)value,
@@ -3366,6 +3432,49 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
                 freq, NULL, NULL, NULL, NULL);
 }
 
+#ifdef _WIN32
+/*
+ * The RTOS tick is a 1 ms TMU period, and QEMU's main loop waits for it
+ * with a millisecond g_poll on the Windows scheduler, whose default
+ * resolution is 15.6 ms and which Windows 11 additionally coarsens for
+ * processes without a foreground window.  A tick that fires late enough to
+ * overlap the next one is coalesced by the level-sensitive TMU line, and the
+ * guest loses it: measured 720 ticks a second of the 1000 programmed.  Ask
+ * for a 0.5 ms resolution and opt out of the background throttling.  Both
+ * calls are looked up at run time so the build needs no extra library.
+ */
+static void cdj_host_timer_resolution(void)
+{
+    typedef LONG (WINAPI *set_resolution_t)(ULONG, BOOLEAN, PULONG);
+    typedef BOOL (WINAPI *set_information_t)(HANDLE, int, LPVOID, DWORD);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    set_resolution_t set_resolution = ntdll
+        ? (set_resolution_t)(void *)GetProcAddress(ntdll, "NtSetTimerResolution")
+        : NULL;
+    set_information_t set_information = kernel32
+        ? (set_information_t)(void *)GetProcAddress(kernel32,
+                                                    "SetProcessInformation")
+        : NULL;
+    ULONG actual = 0;
+
+    if (set_information) {
+        /* PROCESS_POWER_THROTTLING_STATE, version 1; control bit 4 is
+         * PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, state 0 means
+         * "do not throttle".  ProcessPowerThrottling is class 4. */
+        struct {
+            ULONG version, control_mask, state_mask;
+        } throttling = { 1, 4, 0 };
+        set_information(GetCurrentProcess(), 4, &throttling, sizeof(throttling));
+    }
+    if (set_resolution) {
+        set_resolution(5000, TRUE, &actual);
+    }
+    info_report("cdj2000-main: host timer resolution %.2f ms",
+                actual / 10000.0);
+}
+#endif
+
 static void cdj2000_main_init(MachineState *machine)
 {
     MemoryRegion *system = get_system_memory();
@@ -3373,6 +3482,10 @@ static void cdj2000_main_init(MachineState *machine)
     CdjResetState *reset;
     SuperHCPU *cpu;
     const char *firmware = machine->firmware;
+
+#ifdef _WIN32
+    cdj_host_timer_resolution();
+#endif
     ssize_t loaded;
 
     cpu = SUPERH_CPU(cpu_create(machine->cpu_type));

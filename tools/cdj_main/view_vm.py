@@ -199,7 +199,7 @@ def main() -> int:
                 "-monitor", f"telnet:127.0.0.1:{PORT + 1},server,nowait",
                 *(["-drive", f"if=sd,format=raw,file={args.sd}"] if args.sd else []),
             ],
-            env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "270000000"),
+            env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "54000000"),
                      CDJ_SD_INSERT=os.environ.get("CDJ_SD_INSERT", "25"),
                      CDJ_PANEL_KEYS=keys,
                      # Unset means no socket, no poll, no merge: cdj2000_input.c
@@ -250,13 +250,11 @@ def main() -> int:
     if control_port and not args.no_main:
         command += ["--control-port", str(control_port)]
     if not args.no_main:
-        # The DMAC's retry interval after a receive with nothing to hand over.
-        # The live link genuinely waits for MAIN, so the 50000 default throttles
-        # the whole machine: 69 requests in 150 s against 2238 at 2000.
-        command += ["--ppi-delay", "2000"]
-    if not args.no_main:
         command += [
             "--env", f"BFIN_MAIN_LINK=127.0.0.1:{PORT}",
+            # See boot_vm.py: without this the GUI double-faults at
+            # 0x00b99196 in most boots on the wall-clock time base.
+            "--env", "BFIN_LINK_ANNOUNCE_STICKY=1",
             # A real MAIN is already transmitting when the GUI boots, so the
             # peer answers until the link takes over.
             "--env", "BFIN_MAIN_PEER=1",

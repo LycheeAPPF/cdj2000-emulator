@@ -169,7 +169,18 @@ WATCH = [
     ("ready word+4", 0x0489BCF8, None),
     ("bAnsReceive", 0x0489B368, "xp /1wx 0x0489b368"),
     ("link flag", 0xFFF10048, "xp /1wx 0xfff10048"),
+    # The RTOS system time, one count per tick interrupt (patches/README.md).
+    # Its rate against the wall clock is the one number that says whether
+    # MAIN's guest time is keeping up with the host.
+    ("rtos ticks", 0x04FC45EC, "xp /1wx 0x04fc45ec"),
 ]
+
+# What --poll-every reads on each round: the boot milestones and the tick.
+POLL_WATCH = [entry for entry in WATCH
+              if entry[0] in ("panel state", "GuiCom mode", "ready word",
+                              "bAnsReceive", "rtos ticks")]
+POLL_HEADER = ("elapsed", "panel", "guicom", "ready", "ready4", "rtos",
+               "rtos_per_s", "cpu_qemu_s", "cpu_sim_s")
 
 
 # Writing a word into the running guest.
@@ -244,11 +255,43 @@ def looks_like_ram(value: int) -> bool:
     return (value & 3) == 0 and CHAIN_LOW <= value < CHAIN_HIGH
 
 
-def monitor(sock: socket.socket, watch=None) -> dict[int, int]:
+def cpu_seconds(names=("qemu-system-sh4", "cdj-run")) -> dict[str, float]:
+    """CPU seconds consumed so far by qemu-system-sh4 and cdj-run, by name.
+
+    Read through wmic on Windows (user + kernel time, 100 ns units) so a poll
+    costs one short process rather than a PowerShell start-up.  Anywhere else,
+    or if wmic is missing, the dict is empty and the caller prints -1.  Names
+    are prefixes, so an A/B binary such as qemu-system-sh4-legacy.exe is
+    counted under "qemu-system-sh4".
+    """
+    if os.name != "nt":
+        return {}
+    try:
+        text = subprocess.run(
+            ["wmic", "process", "where",
+             " or ".join("name like '%s%%'" % name for name in names),
+             "get", "Name,UserModeTime,KernelModeTime", "/format:csv"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    totals: dict[str, float] = {}
+    for line in text.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) != 4 or not parts[1].isdigit():
+            continue
+        _, kernel, name, user = parts
+        key = next((prefix for prefix in names
+                    if name.lower().startswith(prefix.lower())), name)
+        totals[key] = totals.get(key, 0.0) + (int(user) + int(kernel)) / 1e7
+    return totals
+
+
+def monitor(sock: socket.socket, watch=None, settle: float = 0.1) -> dict[int, int]:
     for _, _, command in (watch if watch is not None else WATCH):
         if command:
             sock.sendall((command + "\n").encode())
-            time.sleep(0.1)
+            time.sleep(settle)
     text = ""
     try:
         while True:
@@ -293,10 +336,11 @@ def main() -> int:
                              "through the gdb stub; repeatable")
     parser.add_argument("--poke-at", type=float, default=60.0,
                         help="wall-clock seconds into the run at which to poke")
-    parser.add_argument("--ppi-delay", type=int, default=2000,
-                        help="the simulator's DMA retry interval; the GUI waits "
-                             "only 3 ticks for its receive event (0xb6c44e) and "
-                             "resets the whole protocol state when it times out")
+    parser.add_argument("--ppi-delay", type=int, default=0,
+                        help="ticks per display scanline for the simulator "
+                             "(BFIN_PPI_DMA_DELAY).  0, the default, lets it "
+                             "pace the display per frame on its wall-clock "
+                             "time base; the link retry is BFIN_SPORT_RETRY_US")
     parser.add_argument("--no-peer", action="store_true",
                         help="serve the GUI from the live MAIN board alone, "
                              "without the canned bootstrap records")
@@ -384,6 +428,19 @@ def main() -> int:
                              "and the CDJ_LINK_CENSUS lines -- lives only "
                              "there, so a run without this keeps no record of "
                              "whether MAIN was still transmitting")
+    parser.add_argument("--poll-every", type=float, default=0.0,
+                        metavar="SECONDS",
+                        help="while the boards run, read the milestone words "
+                             "and the RTOS tick back every SECONDS and print a "
+                             "line per round with the wall clock and the CPU "
+                             "time of both emulators.  This is the boot "
+                             "timeline; 0 (the default) reads only at the end")
+    parser.add_argument("--poll-output", metavar="FILE",
+                        help="write the --poll-every rounds as TSV")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="run MAIN alone for --seconds: no simulator, no "
+                             "link client.  With --poll-every this measures "
+                             "the RTOS tick rate of the board by itself")
     parser.add_argument("--stderr", metavar="FILE",
                         help="keep MAIN's stderr here.  Without it the stream "
                              "goes to DEVNULL and CDJ_WATCH reports nothing -- "
@@ -456,7 +513,7 @@ def main() -> int:
             # slot switch, so the frame below is what "a card is in" means.
             *(["-drive", f"if=sd,format=raw,file={args.sd}"] if args.sd else []),
         ],
-        env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "270000000"),
+        env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "54000000"),
                  CDJ_SD_INSERT=os.environ.get("CDJ_SD_INSERT", "25"),
                  CDJ_PANEL_KEYS=keys,
                  CDJ_PANEL_FRAME=os.environ.get(
@@ -464,6 +521,11 @@ def main() -> int:
                      "00000000000000000000000000000000000400000000"
                      if args.sd else "")),
         stdout=subprocess.DEVNULL, stderr=board_stderr,
+        # The vCPU thread runs flat out and the main-loop thread has to get
+        # the 1 ms tick out on time; above normal keeps a busy host from
+        # delaying either.
+        creationflags=(subprocess.ABOVE_NORMAL_PRIORITY_CLASS
+                       if os.name == "nt" else 0),
     )
     gui = mon = None
     stop_pokes = threading.Event()
@@ -507,7 +569,15 @@ def main() -> int:
                   + f" at {args.poke_at:g} s"
                   + (", held" if args.poke_hold > 0 else ", once"))
 
-        print(f"# GUI:  Blackfin simulator, link client on {PORT}")
+        if args.no_gui:
+            print("# GUI:  none (--no-gui); MAIN runs alone")
+            gui = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import time, sys; time.sleep(float(sys.argv[1]))",
+                 str(args.seconds)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        else:
+            print(f"# GUI:  Blackfin simulator, link client on {PORT}")
         if args.gui_elf:
             # Which image ran belongs in the log, not in the invocation that
             # produced it: a run whose provenance has to be reconstructed from
@@ -516,7 +586,7 @@ def main() -> int:
             for value in args.gui_env:
                 if value.startswith("BFIN_FAST_LZSS"):
                     print(f"# GUI:  {value}")
-        gui = subprocess.Popen(
+        gui = gui if args.no_gui else subprocess.Popen(
             [
                 sys.executable, "-m", "tools.cdj_gui.run_headless",
                 "--seconds", str(args.seconds),
@@ -528,15 +598,23 @@ def main() -> int:
                 # inside the repository, and a cloud-sync client watching that
                 # directory will fight the writer.
                 "--tx-output", str(TEMP / "vm-sport-tx.bin"),
-                # 50000 is the DMAC's retry interval after a receive that had
-                # nothing to hand over.  That never happened while the link was
-                # a corrupt byte stream -- there were always bytes -- and it is
-                # the dominant cost now that the link genuinely waits for MAIN:
-                # 69 requests in 150 s at the default, 2238 at 2000.
-                "--ppi-delay", str(args.ppi_delay),
+                *(["--ppi-delay", str(args.ppi_delay)] if args.ppi_delay else []),
                 "--env", "BFIN_PARALLEL_WRITEBACK=1",
                 "--env", "BFIN_GUI_COLOR=rgb555le",
                 "--env", f"BFIN_MAIN_LINK=127.0.0.1:{PORT}",
+                # The GUI's interpreter is still thirty times slower than the
+                # real chip on real work, so an announcement-plus-payload
+                # transaction takes it longer than MAIN's status interval, and
+                # the next plain record then lands on the validated
+                # announcement: halfword 30 reads 0, (0-1)*2 underflows, the
+                # checksum loop walks off the CPLB map and the board
+                # double-faults at 0x00b99196.  Carrying the announcement onto
+                # fresh records until the payload has gone over is what the
+                # wire guarantees the firmware anyway.  Measured on the
+                # wall-clock time base: without it four of six 90 s boots
+                # faulted, with it none of three.  BFIN_LINK_ANNOUNCE_STICKY=
+                # (empty) via --gui-env switches it off for an A/B.
+                "--env", "BFIN_LINK_ANNOUNCE_STICKY=1",
                 # The file-based peer is a bootstrap, not a second MAIN: it
                 # answers only until the live link has a record.  Its records
                 # are a capture of a real player with a USB stick, so while it
@@ -553,12 +631,62 @@ def main() -> int:
             ],
             cwd=str(ROOT), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            # The simulator's stderr rides on this pipe when --log is not
+            # given, and it is not cp1252; decode leniently or the reader
+            # thread dies mid-run with a UnicodeDecodeError.
+            encoding="utf-8", errors="replace",
         )
-        try:
-            output = gui.communicate(timeout=args.seconds + 180)[0]
-        except subprocess.TimeoutExpired:
-            stop_tree(gui)
+        poll_rows: list[tuple] = []
+        if args.poll_every > 0:
+            # Elapsed is counted from the GUI launch; QEMU started ~3 s before.
+            started = time.monotonic()
+            next_poll = started
+            previous = None
+            deadline = started + args.seconds + 180
+            while gui.poll() is None and time.monotonic() < deadline:
+                now = time.monotonic()
+                if now < next_poll:
+                    time.sleep(min(0.2, next_poll - now))
+                    continue
+                next_poll += args.poll_every
+                elapsed = now - started
+                mon.settimeout(0.3)
+                try:
+                    words = monitor(mon, POLL_WATCH, settle=0.02)
+                except OSError:
+                    words = {}
+                mon.settimeout(1.0)
+                cpu = cpu_seconds()
+                rtos = words.get(0x04FC45EC, -1)
+                rate = -1.0
+                if previous and rtos >= 0 and previous[1] >= 0:
+                    rate = (rtos - previous[1]) / max(elapsed - previous[0], 1e-6)
+                row = (round(elapsed, 1), words.get(0x04FE29F4, -1),
+                       words.get(0x04C06FB0, -1), words.get(0x0489BCF4, -1),
+                       words.get(0x0489BCF8, -1), rtos, round(rate, 1),
+                       round(cpu.get("qemu-system-sh4", -1.0), 1),
+                       round(cpu.get("cdj-run", -1.0), 1))
+                poll_rows.append(row)
+                print("# t=%6.1f panel=%d GuiCom=%d ready=%d/%d rtos=%d "
+                      "(%+.0f/s) cpu qemu=%.1fs sim=%.1fs" % (
+                          row[0], row[1], row[2], row[3], row[4], row[5],
+                          row[6], row[7], row[8]), flush=True)
+                previous = (elapsed, rtos)
+            if gui.poll() is None:
+                stop_tree(gui)
             output = gui.communicate()[0]
+            if args.poll_output:
+                with open(args.poll_output, "w", encoding="utf-8") as stream:
+                    stream.write("\t".join(POLL_HEADER) + "\n")
+                    for row in poll_rows:
+                        stream.write("\t".join(str(v) for v in row) + "\n")
+                print(f"# poll -> {args.poll_output} ({len(poll_rows)} rounds)")
+        else:
+            try:
+                output = gui.communicate(timeout=args.seconds + 180)[0]
+            except subprocess.TimeoutExpired:
+                stop_tree(gui)
+                output = gui.communicate()[0]
         # Only the tail is printed, because a healthy run ends in a few lines
         # of summary.  A traced run is the opposite: BFIN_ROUTER_TRACE and its
         # relatives write hundreds of lines to the simulator's stderr, and the

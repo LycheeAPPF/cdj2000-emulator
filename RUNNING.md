@@ -14,22 +14,24 @@ MAIN boots on QEMU, the GUI board boots on the Blackfin simulator, the two are
 linked, and the GUI's framebuffer appears in a window with the player's controls
 drawn around it.
 
-**It takes a while to become interesting.** Expect around five minutes of wall
-clock, sometimes more: the boot splash fades in after a minute or so, MAIN only
-publishes its operating mode once the panel handshake completes, and the record
-stream starts after that. Leave it running; it is not hung.
+**It takes half a minute to become interesting.** Measured with
+`boot_vm --poll-every 5 --frames`: black until about 15 s, the Pioneer logo at
+about 20 s, the rekordbox logo at 25 s, and the player screen showing `NO DISC`
+-- the handshake with MAIN complete, the record stream running -- at about
+35 s. MAIN's handshake words (`GuiCom mode`, the ready words) are set within
+the first three seconds; the rest is MAIN's own boot sequence.
 
-**And it may not get there.** The GUI board double-faults intermittently at
-`0x00b99196`, usually one to three minutes in. The panel then freezes wherever
-it had got to and the window reports `simulator exited with code 1`. The answer
-is to start it again -- and to leave the machine alone while it runs. About one
-run in three faults when nothing else is happening; five of six faulted here
-while a compile was running alongside.
-
-It is a race, not a constant, and it is not the simulator's link hold cap:
-`BFIN_LINK_HOLD_MAX=1000000` and `BFIN_LINK_ANNOUNCE_STICKY=1` were each
-measured over three runs against a three-run control and neither made a
-difference. The simulator writes the fault line to its log:
+**And it may still not get there.** The GUI board's double fault at
+`0x00b99196` is a link race (README, "Read this first"): a plain status record
+lands on an announcement the firmware is mid-transaction on, halfword 30 reads
+0 where it validated 112, and the checksum loop walks off the CPLB map. On the
+wall-clock time base it hit four of six 90 s boots with the simulator's
+defaults and none of three with `BFIN_LINK_ANNOUNCE_STICKY=1`, which the
+launchers therefore set; pass `--gui-env BFIN_LINK_ANNOUNCE_STICKY=` to
+`boot_vm` to switch it off for an A/B. The earlier note that the switch made no
+difference was measured on the instruction-counted time base, where the race
+was much less likely to be hit at all. The simulator writes the fault line to
+its log:
 
 ```sh
 tail "$TEMP/vm-ui-sim.log"      # or vm-gui.log for a headless run
@@ -164,6 +166,76 @@ show: `E-7010` is the audio DSP, `E-7020` the USB device, `E-7001` the disc
 drive. One caution per priority survives, so killing the loudest one usually
 reveals another that was pending all along.
 
+## Speed
+
+The GUI board's simulator interprets Blackfin instructions, and it used to
+count guest time in instructions: every firmware delay, time-out and animation
+stretched by however slow the interpreter was -- a factor of eleven, and a
+five-minute boot. It now runs on the **wall clock** (`BFIN_TIME_BASE=wall`, the
+default): guest ticks are delivered at `BFIN_CCLK_HZ` per second (400 MHz, the
+clock the firmware programs its core timer for), and when the firmware parks
+its main loop or executes `IDLE` the simulator sleeps until the next event or
+the next record from MAIN. Guest time never runs ahead of the wall clock, so
+this board and the QEMU board, which was always on the wall clock, see the same
+time. Bursts the interpreter cannot keep up with make guest time fall behind,
+up to `BFIN_WALL_LAG_MS` (50); the excess is dropped and reported.
+
+The display DMA is paced per frame at `BFIN_PPI_FPS` (60) instead of one
+scanline per simulated cycle, and a receive with nothing to hand over retries
+after `BFIN_SPORT_RETRY_US` (1000) of guest time. `--ppi-delay` on the
+launchers still forces a per-line tick count for a run that needs the old
+pacing.
+
+Give the simulator `BFIN_STATS=<seconds>` and it prints a line per interval to
+its log: instructions and MIPS, guest ticks, guest seconds against wall
+seconds, time spent parked, dropped lag, frames scanned and published, bytes
+from the link. `boot_vm --poll-every 5` prints MAIN's side on the same grid --
+the handshake words, the RTOS tick counter and its rate, the CPU time of both
+emulators -- and `--poll-output` keeps it as TSV.
+
+A sampling profiler is built into the simulator for Windows, because gprof
+on MinGW produces call counts but no samples: `BFIN_SAMPLE_PROFILE=<file>`
+records the run thread's instruction pointer about a thousand times a second
+(from `BFIN_SAMPLE_PROFILE_AT=<seconds>` on, if given), and `addr2line -f -e
+bin/cdj-run.exe` resolves the addresses after rebasing them to `0x140000000`;
+the first eight bytes of the file are the module base. This is what showed
+that the GUI board sleeps through most of a boot and that the display
+conversion, not the interpreter, was the largest consumer of the rest.
+
+Two switches exist for reproducing a run rather than timing it:
+`BFIN_TIME_BASE=insn` is the old instruction-counted time, and
+`BFIN_EXIT_AFTER_TICKS=<n>` halts at a guest time, so two builds run to the
+same tick count from the same packet file must produce the same picture and
+the same instruction count. `BFIN_EXIT_AFTER_WALL=<seconds>` halts after a
+wall time, which is what a `gprof` build needs to write its data.
+
+Measured on an i7-13700H, GUI board alone (`run_headless --packet
+packets/status.bin --seconds 60`):
+
+| simulator | MIPS | guest ticks/s | wall clock to 1e9 ticks |
+|---|---|---|---|
+| as shipped before September 2026 | 8.4 | 41 M | 32.7 s |
+| probes gated, page cache | 18.7 | 91 M | 10.9 s |
+| + CPLB memo, no `getenv` on hot paths | 31.7 | 150 M | 6.6 s |
+| + wall-clock time base | guest = wall, 400 M ticks/s | | |
+| + display converted only on change | 2e9 ticks in 7.1 s (was 15.0 s), instruction-counted | | |
+
+MAIN's RTOS tick, read back through the monitor: 120-880 a second with the
+old interrupt patch depending on host load, ~830 of the programmed 1000 with
+the decline fix, the real 54 MHz timer clock and the Windows timer resolution
+raised to 0.5 ms, and the full 1000 with QEMU's main loop waiting for less
+than a millisecond (a patched `util/main-loop.c`; `CDJ_MAIN_LOOP_HIRES=0`
+switches it off). At the full rate the GUI board double-faulted at
+`0x00b99196` in every run until the launchers set
+`BFIN_LINK_ANNOUNCE_STICKY=1`; with it, three of three 90 s boots at 1000
+ticks a second were clean. `CDJ_TMU_FREQ` still overrides the timer clock; the
+old default of 270 MHz asked for 5000 interrupts a second that the guest never
+serviced, and is gone from the launchers.
+
+Measurements are only worth anything on an idle host. A configure script or a
+compile running alongside halves the simulator's throughput, and it did so
+twice during this work before the rule was learnt.
+
 ## Environment
 
 | variable | does |
@@ -177,8 +249,18 @@ The board itself takes a long list of its own, all read with `getenv` in
 `emulator/qemu/`: `CDJ_INPUT_PORT`, `CDJ_PANEL_KEYS`, `CDJ_SD_INSERT`,
 `CDJ_DSP_ABSENT`, `CDJ_USB_ABSENT`, `CDJ_ATAPI_ABSENT`, `CDJ_BUS_TRACE` and
 more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
-`BFIN_GUI_COLOR`, `BFIN_PPI_DMA_DELAY`, `BFIN_SPORT_TX_OUTPUT`. Each is
+`BFIN_GUI_COLOR`, `BFIN_PPI_DMA_DELAY`, `BFIN_SPORT_TX_OUTPUT`, and the
+time-base knobs above: `BFIN_TIME_BASE`, `BFIN_CCLK_HZ`, `BFIN_PPI_FPS`,
+`BFIN_SPORT_RETRY_US`, `BFIN_WALL_LAG_MS`, `BFIN_STATS`,
+`BFIN_EXIT_AFTER_WALL`, `BFIN_EXIT_AFTER_TICKS`, `BFIN_MEM_FAST`. Each is
 documented where it is read.
+
+The simulator's diagnostic probes -- every `BFIN_*_TRACE`, `BFIN_PC_*`,
+`BFIN_*_DUMP`, watch, peek and poke variable -- are behind one gate. Setting
+any of them puts the whole per-instruction probe path back, which is what the
+probes need and costs about a third of the throughput; a plain run pays one
+branch per instruction for them. The simulator says `bfin: probes on (NAME is
+set)` on its log when that happens, so a slow run can be explained.
 
 ## One QEMU at a time
 

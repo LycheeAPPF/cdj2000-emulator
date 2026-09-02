@@ -37,7 +37,6 @@ def run(args: argparse.Namespace) -> int:
         {
             "BFIN_GUI_OUTPUT": str(output),
             "BFIN_GUI_HEIGHT": str(args.height),
-            "BFIN_PPI_DMA_DELAY": str(args.ppi_delay),
             "BFIN_FAST_LZSS": str((FIRMWARE / "gui-flash-image.bin").resolve()),
             # The CDJ panel is little-endian RGB555.  The board file says so, but
             # machs.c finishes bfin_ppi@0 before --hw-board-file is parsed, so the
@@ -51,6 +50,8 @@ def run(args: argparse.Namespace) -> int:
             "BFIN_SPORT_TX_OUTPUT": str(args.tx_output.resolve()),
         }
     )
+    if args.ppi_delay:
+        env["BFIN_PPI_DMA_DELAY"] = str(args.ppi_delay)
     if args.state_start is not None and args.state_end is not None:
         env["BFIN_GUI_STATE_READ_START"] = str(args.state_start)
         env["BFIN_GUI_STATE_READ_END"] = str(args.state_end)
@@ -89,10 +90,15 @@ def run(args: argparse.Namespace) -> int:
             command,
             cwd=REPO_ROOT,
             env=env,
+            # No console for the simulator: the UART model polls stdin, and on
+            # MinGW that read blocks inside the run loop with a console attached.
+            stdin=subprocess.DEVNULL,
             stdout=log_stream,
             stderr=subprocess.STDOUT,
             creationflags=(
-                subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                (subprocess.CREATE_NO_WINDOW
+                 | subprocess.ABOVE_NORMAL_PRIORITY_CLASS)
+                if sys.platform == "win32" else 0
             ),
         )
         deadline = time.monotonic() + args.seconds
@@ -132,7 +138,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tx-output", type=Path, default=RUNS / "headless-tx.bin")
     parser.add_argument("--log", type=Path, default=RUNS / "headless.log")
     parser.add_argument("--height", type=int, default=255)
-    parser.add_argument("--ppi-delay", type=int, default=50000)
+    parser.add_argument("--ppi-delay", type=int, default=0,
+                        help="ticks per display scanline (BFIN_PPI_DMA_DELAY); "
+                             "0, the default, lets the simulator pace the "
+                             "display per frame at BFIN_PPI_FPS on its "
+                             "wall-clock time base")
     parser.add_argument(
         "--seconds", type=float, default=60.0, help="wall-clock run budget"
     )

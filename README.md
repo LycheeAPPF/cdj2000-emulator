@@ -18,17 +18,25 @@ use a CDJ-2000 on your desktop, and it will not become one by itself.
 
 Three things to expect before you build anything:
 
-- **It is very slow.** A boot takes minutes of wall clock — plan for around
-  five, sometimes more — to reach a state a real player reaches in seconds.
-  Two emulated CPUs, one of them an interpreting instruction-set simulator.
-  Leave it running; it is not hung.
-- **It is unreliable, and it gets worse when the host is busy.** The GUI board
-  double-faults intermittently at `0x00b99196`, usually one to three minutes
-  in; the panel then freezes wherever it got to and the launcher reports
-  `simulator exited with code 1`. Measured here: about one run in three faults
-  on an idle machine, and five of six while a compile was running alongside.
-  So do not build something else in another window and expect a clean run.
-  This is long-standing behaviour, not a broken checkout.
+- **It is slower than the real thing, but not by much any more.** Measured
+  here on an i7-13700H: the Pioneer logo at about 20 s, the player screen with
+  `NO DISC` -- the handshake with MAIN complete -- at about 35 s of wall clock.
+  Before the speed work of September 2026 the same run showed the `Wait`
+  spinner still at 150 s. MAIN's RTOS tick now runs at its real 1000 Hz;
+  what remains is MAIN's own boot sequence and its device time-outs, which
+  are real firmware time-outs. See "Speed" in RUNNING.md for the numbers and
+  the knobs.
+- **It can still die at `0x00b99196`.** The GUI board's long-standing double
+  fault is a link race: the interpreter is still thirty times slower than the
+  real chip on real work, an announcement-plus-payload transaction takes it
+  longer than MAIN's status interval, and the next plain record lands on the
+  validated announcement. The launchers now run the simulator with
+  `BFIN_LINK_ANNOUNCE_STICKY=1`, which carries the announcement over until the
+  payload has gone through: measured on the wall-clock time base, four of six
+  90 s boots faulted without it and none of three with it. Three runs is a
+  small sample; if the panel freezes and the launcher reports `simulator
+  exited with code 1`, that is what happened, and the fault line is in the
+  simulator's log.
 - **Almost nothing is finished past booting.** See "What does not" below. If you
   need a working player, this is the wrong repository.
 
@@ -78,7 +86,9 @@ Be clear about this: **the player is not usable as a player.**
   after one to three minutes. The panel stops updating and the launcher says
   `simulator exited with code 1`. Run it again, and keep the machine quiet
   while you do -- see the note above.
-* **Speed.** Minutes, not seconds. Every measurement you take costs a run.
+* **Speed.** Tens of seconds, not seconds. A boot to the idle player screen
+  costs about 35 s; the GUI board now runs on the wall clock and sleeps when
+  the firmware idles, so the host is mostly free while it waits.
 * **The browse list does not come from the card.** MAIN answers every browse
   request as `DISC` even with a card present, and the panel shows `NO CARD`.
   Browse screens can be reached, but only by feeding the GUI canned MAIN
@@ -88,6 +98,13 @@ Be clear about this: **the player is not usable as a player.**
 * **No audio at all.** The DSP is a register model with a position counter and
   no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
+  **Selecting `USB` therefore takes over a minute**: MAIN accepts the key,
+  then waits for a USB host it does not have. Measured with the wall-clock
+  simulator: after the press MAIN touches no USB host registers at all and
+  answers the GUI's ~60 requests a second in bursts -- about 30 s of near
+  silence, then 20 s of answers -- while the panel shows the `Wait` platter,
+  which advances only on those answers. This is a device-model gap on MAIN,
+  not emulation speed: the GUI board sleeps 87 % of that minute.
 * No link between players.
 
 Most inputs, measured properly against a control run, are proven no-ops on the

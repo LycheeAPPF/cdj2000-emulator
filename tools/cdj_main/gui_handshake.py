@@ -149,7 +149,7 @@ def main() -> int:
             "-serial", f"tcp:127.0.0.1:{PORT + 4},server,nowait",
             "-monitor", f"telnet:127.0.0.1:{PORT + 1},server,nowait",
         ],
-        env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "270000000")),
+        env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "54000000")),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     gui = console = mon = None
