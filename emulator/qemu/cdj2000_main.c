@@ -1446,6 +1446,7 @@ typedef struct CdjLinkState {
 } CdjLinkState;
 
 static void cdj_link_rx_next(CdjLinkState *link);
+static bool cdj_link_link_rows(uint8_t *frame, unsigned len);
 
 static int64_t cdj_link_census_every(void)
 {
@@ -1605,8 +1606,10 @@ static void cdj_link_transmit(CdjLinkState *link)
     stl_le_p(buffer + 4, frame);
     address_space_read(&address_space_memory, cdj_dma_phys(link->buffer),
                        MEMTXATTRS_UNSPECIFIED, buffer + 8, frame);
-    int written = owner->connected
-        ? qemu_chr_fe_write_all(&owner->chr, buffer, frame + 8) : -1;
+    bool send = cdj_link_link_rows(buffer + 8, frame);
+    int written = owner->connected && send
+        ? qemu_chr_fe_write_all(&owner->chr, buffer, frame + 8)
+        : (send ? -1 : (int)(frame + 8));
 
     link->n_sent++;
     if (written > 0) {
@@ -2097,6 +2100,111 @@ static bool cdj_link_rx_queue_enabled(void)
     return enabled;
 }
 
+/* The last request handed to the guest: type, cursor, KIND (type-1 words). */
+static unsigned cdj_last_req_type = ~0u, cdj_last_req_cursor, cdj_last_req_kind;
+
+/*
+ * CDJ_LINK_LINK_ROWS=match|drop|empty|off -- MAIN's answer to the GUI's
+ * LINK browse.  Default: match.
+ *
+ * After the player screen the GUI browses the LINK source (type 1, cursor
+ * 3, KIND 0) in a loop, 30-40 requests a second.  MAIN -- with no network
+ * behind its LINK source -- answers each of those with the one-row list
+ * "NO DISC" (id 88) stamped as command 0x11, the answer to a cursor-1
+ * request; the GUI's consumer 0xb7eb48 compares the command's low nibble
+ * with the cursor of the request it has outstanding (3), sets an error
+ * bit on the mismatch and re-sends the request.  That is the loop, and
+ * while it runs a SOURCE key opens the library screen but the card's list
+ * request never goes out (f1-f3, v1-v4: 0 of 6).  The loop ended on its
+ * own only when the GUI was slowed down (three machines on the host, or
+ * probes on: e2, e4, e5), and the e4 dump shows why: under load MAIN's
+ * answers to the same polls came stamped 0x13.
+ *
+ * "match" stamps the low nibble of the command with the cursor of the
+ * request being answered and re-stamps the checksum -- the loop is over
+ * by 40 s in 3 of 3 (m1-m3) and the SD key then brings the card's library
+ * in 1.5 s (m3).  "empty" (count 0, row blanked) and "drop" (not sent)
+ * were tried first and change nothing (r1, r2): the loop is not about the
+ * row, it is about the nibble.  "off" sends MAIN's bytes untouched.
+ */
+static int cdj_link_link_rows_mode(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *env = getenv("CDJ_LINK_LINK_ROWS");
+
+        mode = 3;
+        if (env && !strcmp(env, "drop")) {
+            mode = 1;
+        } else if (env && !strcmp(env, "empty")) {
+            mode = 2;
+        } else if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) {
+            mode = 0;
+        }
+    }
+    return mode;
+}
+
+/* Returns false when the frame is not to be sent. */
+static bool cdj_link_link_rows(uint8_t *frame, unsigned len)
+{
+    static unsigned long rewrites;
+    int mode = cdj_link_link_rows_mode();
+    uint16_t crc;
+
+    if (!mode || len != 48 || cdj_last_req_type != 1) {
+        return true;
+    }
+    if (mode == 3) {
+        /*
+         * "match": the answer's command carries the cursor it answers in
+         * its low nibble (0x11 cursor 1, 0x13 cursor 3) and the GUI's
+         * consumer 0xb7eb48 compares that nibble with the cursor of the
+         * request it has outstanding -- a mismatch sets an error bit and
+         * the request is re-sent.  MAIN answers the LINK browse's cursor-3
+         * polls with 0x11 (e4 dump: 62 of them before the first 0x13),
+         * which is the loop.  Stamp the nibble the GUI is waiting for.
+         */
+        unsigned cmd = frame[0] | (frame[1] << 8);
+        unsigned want = (cmd & 0xfff0) | (cdj_last_req_cursor & 0xf);
+
+        if ((cmd & 0xff00) != 0 || cmd == want || cdj_last_req_cursor > 15) {
+            return true;
+        }
+        frame[0] = (uint8_t)want;
+        crc = cdj_link_crc(frame, 46);
+        frame[46] = (uint8_t)crc;
+        frame[47] = (uint8_t)(crc >> 8);
+        if (rewrites++ == 0) {
+            info_report("cdj2000: CDJ_LINK_LINK_ROWS=match: answer command "
+                        "0x%02x -> 0x%02x for the cursor-%u request",
+                        cmd, want, cdj_last_req_cursor);
+        }
+        return true;
+    }
+    if (cdj_last_req_cursor != 3 || cdj_last_req_kind != 0) {
+        return true;
+    }
+    if ((frame[0] | (frame[1] << 8)) != 0x0011) {
+        return true;
+    }
+    if (rewrites++ == 0) {
+        info_report("cdj2000: CDJ_LINK_LINK_ROWS=%s: MAIN's one-row answer "
+                    "to the LINK browse (type 1 cursor 3 KIND 0) is %s",
+                    mode == 1 ? "drop" : "empty",
+                    mode == 1 ? "not sent" : "sent with no rows");
+    }
+    if (mode == 1) {
+        return false;
+    }
+    memset(frame + 16, 0, 46 - 16);       /* count, id, length, text */
+    crc = cdj_link_crc(frame, 46);
+    frame[46] = (uint8_t)crc;
+    frame[47] = (uint8_t)(crc >> 8);
+    return true;
+}
+
 static void cdj_link_deliver(CdjLinkState *link, const uint8_t *frame,
                              unsigned len)
 {
@@ -2106,6 +2214,11 @@ static void cdj_link_deliver(CdjLinkState *link, const uint8_t *frame,
     cdj_link_force_req_kind(copy, len);
     cdj_link_clear_req_cancel(copy, len);
     cdj_link_status_fresh(copy, len);
+    if (len == 48) {
+        cdj_last_req_type = (copy[2] | (copy[3] << 8)) & 0x3fff;
+        cdj_last_req_cursor = copy[4] | (copy[5] << 8);
+        cdj_last_req_kind = copy[8] | (copy[9] << 8);
+    }
     address_space_write(&address_space_memory, cdj_dma_phys(link->buffer),
                         MEMTXATTRS_UNSPECIFIED, copy, len);
 
@@ -3272,9 +3385,21 @@ static void cdj_sdhi_data_ready(void *opaque)
  * The media state the GUI routes on.
  *
  * Status halfword 26 carries one 3-bit state per source, built by 0x218afe
- * from the four words at 0x0489bd68 (DISC, SD, USB, LINK).  The GUI's
- * screen router (0xb9b706) takes 0 to the Wait platter, 1 to the library,
- * and only from the library does the GUI ask MAIN for the card's lists.
+ * from the four words at 0x0489bd68, one per source in MAIN's own numbering
+ * (1 LINK 0x..68, 2 USB 0x..6c, 3 SD 0x..70, 4 DISC 0x..74).  The GUI's
+ * parser (0xb7dfe6) spreads halfword 26 into a table at 0x4b439c in the
+ * same order -- bits [11:9] first -- and its key dispatcher (0xb9b98c)
+ * routes a SOURCE key on the state at index (halfword 18 - 1), i.e. the
+ * source MAIN reports as current.  The screen router (0xb9b706) takes 0
+ * to the Wait platter, 1 to the library, and only from the library does
+ * the GUI ask MAIN for the card's lists.
+ *
+ * Measured with the GUI's own table watched (w4, v1): a 1 written to
+ * 0x0489bd6c lands in the table at index 1 (USB) and the SD key still
+ * routes on index 2 = 0, the platter; a 1 written to 0x0489bd70 lands at
+ * index 2 and the same key routes on state 1.  The earlier order
+ * "(DISC, SD, USB, LINK)" was a guess that put the card's state on the
+ * stick's word.
  * MAIN writes those words through one accessor, 0x14e0be, from its browse
  * answer builder -- and only on the media branch, which needs the database
  * context open ([ctx+0x2d5c]) -- so a card that is mounted is never reported
@@ -3284,15 +3409,19 @@ static void cdj_sdhi_data_ready(void *opaque)
  * the card's lists at once and draws PLAYLIST / SEARCH / ARTIST / ALBUM /
  * TRACK / KEY from it (e4, e5).
  *
- * So the board reports the card: from CDJ_SD_MOUNT_S (5) seconds after the
- * insertion it holds the SD state word at 1, ten times a second, because
- * the accessor republishes the context's own copy on every answer.  This
- * is a stand-in for the media manager's report, not a model of it; it is
- * what the real machine's word 26 shows for a mounted medium (the
- * harvested capture carries USB state 1 for a stick).  CDJ_SD_MEDIA_STATE=0
- * switches it off; a machine without a card never sees it.
+ * CDJ_SD_MEDIA_STATE=1 makes the board report the card itself: from
+ * CDJ_SD_MOUNT_S (5) seconds after the insertion it holds the SD state
+ * word at 1, ten times a second.  It is OFF by default, because holding
+ * the word is measurably harmful: with it held (e2) MAIN answered the
+ * GUI's list request for the card with one-row records for 20 s; without
+ * it (e5, f1-f3) MAIN answered the same request with the card's lists at
+ * once and the library was on screen 2.6 s after the SD key.  MAIN's own
+ * media manager sets the word when the GUI browses the card, and the key
+ * gets there without help as long as the GUI's browse loop for the empty
+ * boot source has ended (see BFIN_LINK_BUDGET_ANY / BFIN_LINK_DEPTH in the
+ * launchers).  The report stays as a diagnostic for the routing chain.
  */
-#define CDJ_SD_STATE_WORD 0x0489bd6cULL
+#define CDJ_SD_STATE_WORD 0x0489bd70ULL
 
 static void cdj_sd_media_state_report(CdjSdhiState *s)
 {
@@ -3301,7 +3430,8 @@ static void cdj_sd_media_state_report(CdjSdhiState *s)
     uint64_t seconds = mount ? strtoull(mount, NULL, 0) : 5;
     CdjMainPoke *poke;
 
-    if ((enable && *enable == '0') || !sdbus_get_inserted(&s->sdbus)) {
+    if (!(enable && *enable && *enable != '0')
+        || !sdbus_get_inserted(&s->sdbus)) {
         return;
     }
     poke = g_new0(CdjMainPoke, 1);
