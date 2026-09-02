@@ -240,24 +240,38 @@ runs. The last per-instruction cost the profiler found was the
 instruction text itself: every decoder formatted its immediate operands
 with `sprintf` for a trace line nothing printed; that is gated now.
 
-**Switching to a medium (work in progress, 2026-09-02 evening).** With a
-card image (`--sd card.img`, a rekordbox export on it) the whole chain has
-been seen to work: SD key at 45 s, and at 46.3 s the screen shows the `SD`
-header, the six categories and the card's folders and playlists (run sw1).
-What made it possible is one report the board now gives on MAIN's behalf:
-status halfword 26 carries a 3-bit media state per source, the GUI's screen
-router takes 0 to the `Wait` platter and 1 to the library, and only from the
-library does it ask MAIN for the card's lists; MAIN itself never publishes 1
-for a mounted card, because it writes that state only from its browse answer
-builder with the card's database already open, which it opens only when
-asked. From `CDJ_SD_MOUNT_S` (5) seconds after the card goes in the board
-holds the SD state word at 1 (`CDJ_SD_MEDIA_STATE=0` switches it off). It is
-not yet reliable: one run of six reached the library in 1.3 s; in the others
-the GUI was in its LINK browse loop (type-1 cursor-3 polls at 30-40 a second,
-started at ~30 s) when the key came, and never moved its requests to the SD
-source. In the run that worked that loop had ended before the key. Where the
-loop's exit comes from is the open question; holding all four states at 1
-(r133's poke) made it worse, 0 of 3.
+**Switching to a medium.** With a card image (`--sd card.img`, a rekordbox
+export on it) the launchers now put the card in at 10 s and press its key at
+12 s, before the GUI's first browse, and the card's library -- the `SD`
+header, the six categories, the card's folders and playlists -- is on the
+screen together with the player screen, at 33-35 s, five runs of five.
+Two things make that work. Status halfword 26 carries a 3-bit media state
+per source; the GUI's screen router takes 0 to the `Wait` platter and 1 to
+the library, and only from the library does it ask MAIN for the card's
+lists; MAIN never publishes 1 for a mounted card (it writes the state only
+from its browse answer builder, with the database already open, which it
+opens only when browsed), so from `CDJ_SD_MOUNT_S` (5) seconds after the
+card goes in the board holds the SD state word at 1 (`CDJ_SD_MEDIA_STATE=0`
+switches it off). And the key has to come before the GUI starts browsing
+the boot source: pressed after the player screen it meets the GUI's browse
+loop for that source (type-1 cursor-3 polls, 30-40 a second, answered
+one-row `NO DISC`) and the library then came in one run of six, at 1.3 s.
+
+Switching **away** from the card works: the USB key with no stick shows
+the platter 1.5-3.5 s after the key, three of three. Switching **back** to
+the card from there does not: the SD key at 60 s brought no library in the
+next 25 s, three of three -- the GUI is in the same kind of browse loop for
+the empty source. What was tried against that loop, each three runs, none
+of it enough: answering the GUI's repeated status polls at once
+(`CDJ_REQ_STATUS_FRESH`, off), a receive FIFO on the link so MAIN examines
+every request (`CDJ_LINK_RX_QUEUE`, on: it never held a frame, MAIN keeps
+up), the transmit completion after the frame's wire time with a flush on
+re-arm (`CDJ_LINK_TX_US`, off: boots cleanly now, changes nothing here),
+the GUI's yield budget granted on every arrival (`BFIN_LINK_BUDGET_ANY`),
+all four media states held at 1. The loop ends only when its cursor-3
+answers are handed to the GUI firmware, ~25 of them; they are, at the rate
+MAIN's status records refill the simulator's yield budget, and in the loop
+that is one every 3 s.
 
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold

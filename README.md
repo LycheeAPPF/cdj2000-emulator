@@ -77,7 +77,11 @@ If you are here to build on it, that is exactly what it is for.
   and its caution store can be read back and decoded, so the machine can be
   asked what it thinks rather than guessed at.
 * An SD card image is accepted by the card controller and the guest reads
-  sectors from it.
+  sectors from it, and with `--sd card.img` the card is the source from the
+  start: its library -- categories, folders, playlists from the rekordbox
+  export -- is on the screen with the player screen, at 33-35 s. Switching
+  to it later, from another source, mostly is not (see "Switching to a
+  medium" in RUNNING.md).
 
 ## What does not
 
@@ -88,14 +92,13 @@ Be clear about this: **the player is not usable as a player.**
   `simulator exited with code 1`. Run it again, and keep the machine quiet
   while you do -- see the note above.
 * **Speed.** Tens of seconds, not seconds. A boot to the idle player screen
-  costs about 35 s; the GUI board now runs on the wall clock and sleeps when
-  the firmware idles, so the host is mostly free while it waits.
-* **The browse list does not come from the card.** MAIN answers every browse
-  request as `DISC` even with a card present, and the panel shows `NO CARD`.
-  Browse screens can be reached, but only by feeding the GUI canned MAIN
-  answers — which proves the GUI renders them, not that the machine produced
-  them.
-* **No track loading**, for the same reason.
+  costs 28-36 s; the GUI board runs on the wall clock and sleeps when the
+  firmware idles, so the host is mostly free while it waits.
+* **Switching sources after boot.** A source with nothing in it shows the
+  `Wait` platter and stays there, and switching from there to the card does
+  not bring the card's library back. Give the card at launch instead.
+* **No track loading.** The library lists come from the card; selecting a
+  track in them has not been driven, and there is no audio path.
 * **No audio at all.** The DSP is a register model with a position counter and
   no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
