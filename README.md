@@ -96,10 +96,11 @@ Be clear about this: **the player is not usable as a player.**
   firmware idles, so the host is mostly free while it waits.
 * **Switching sources after boot.** A source with nothing in it shows the
   `Wait` platter and stays there. Switching to the card from a running
-  machine brings its library in 1.5-5.6 s in one run of three; in the others
-  MAIN's status records stop flowing at the key and the GUI never learns of
-  it (see "Switching to a medium" in RUNNING.md). Give the card at launch
-  instead: that is seven of seven.
+  machine brings its library in 0.6-2.6 s in six runs of eight; in the
+  others MAIN answers the GUI's polls with a stale browse answer and the GUI
+  never learns of the key (see "Switching to a medium" in RUNNING.md). Give
+  a freshly inserted card ~25 s before its key. The card at launch is seven
+  of seven.
 * **No track loading.** The library lists come from the card; selecting a
   track in them has not been driven, and there is no audio path.
 * **No audio at all.** The DSP is a register model with a position counter and

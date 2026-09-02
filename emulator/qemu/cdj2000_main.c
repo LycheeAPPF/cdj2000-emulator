@@ -2024,8 +2024,17 @@ static void cdj_link_clear_req_cancel(uint8_t *frame, unsigned len)
 }
 
 /*
- * CDJ_REQ_STATUS_FRESH=1 -- clear bit 15 of every type-0 (status) request
- * and re-stamp the checksum, so MAIN answers each one at once.
+ * CDJ_REQ_STATUS_FRESH -- turn every repeated type-0 (status) request into
+ * the GUI's own fresh one (word 0 = 1, bit 15 of word 1 clear), checksum
+ * re-stamped, so MAIN answers each one at once.  On by default; 0 sends
+ * the GUI's bytes untouched.
+ *
+ * Measured with the loop cure (CDJ_LINK_LINK_ROWS) in place, SD key at
+ * 55 s on a running machine: off, 3 of 9 (m1-m3, h1-h3, k1-k3 with only
+ * bit 15 cleared); on, 6 of 8 (n1-n3, t1-t2, p1-p3), the library 0.6-2.6 s
+ * after the key.  The two failures are the same picture as before: MAIN
+ * answering "0000 0000" polls with its last 48-byte browse answer instead
+ * of a status record, and the card's list request with that stale answer.
  *
  * Bit 15 is the repeat/cancel bit: MAIN answers a status request with it
  * clear immediately (measured: 50 a second, 1:1, usb7) and one with it set
@@ -2050,7 +2059,7 @@ static void cdj_link_status_fresh(uint8_t *frame, unsigned len)
     if (enabled < 0) {
         const char *env = getenv("CDJ_REQ_STATUS_FRESH");
 
-        enabled = env && *env && *env != '0';
+        enabled = !(env && *env == '0');
     }
     if (!enabled || len != 48) {
         return;
@@ -2059,7 +2068,16 @@ static void cdj_link_status_fresh(uint8_t *frame, unsigned len)
     if ((word1 & 0x3fff) != 0 || !(word1 & 0x8000)) {
         return;
     }
+    /*
+     * The GUI's own fresh status poll is "0001 0000 ...": word 0 at 1 as
+     * well.  Clearing bit 15 alone leaves an all-zero header, and MAIN
+     * answers that shape by re-sending its last browse answer (k1: every
+     * "0000 0000" poll got a 48-byte 0x11 frame, every "0001 0000" a
+     * status record).  So the repeat becomes the fresh poll, both words.
+     */
     word1 &= ~0x8000u;
+    frame[0] = 1;
+    frame[1] = 0;
     frame[2] = (uint8_t)word1;
     frame[3] = (uint8_t)(word1 >> 8);
     crc = cdj_link_crc(frame, 46);

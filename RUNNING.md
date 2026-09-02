@@ -276,21 +276,24 @@ checksum (`CDJ_LINK_LINK_ROWS=match`, the default; `off` sends MAIN's
 bytes untouched, `drop`/`empty` were tried and change nothing): the loop
 is over by 40 s in six runs of six.
 
-With both in place the SD key on a running machine brings the card's
-library in 1.5-5.6 s -- when it works, which is 3 runs of 9 (m3, h2, k3).
-In the other six the key reaches MAIN (`0x04c084d8` goes to 1) but the GUI
-never sees halfword 18 change, because MAIN's status records stop flowing
-at that moment: 1-11 records per 5 s against 200-400 in the runs that
-worked. In those runs MAIN is sending 48-byte frames nobody asked for --
-its last browse answer, re-sent -- and its send task, which builds the
-record that carries the key, is skipped while the receive task holds the
-link (the mechanism `BFIN_LINK_CENSUS` measured in the loop). That is the
-open end: what makes MAIN re-send, and how to keep its send task running.
-Clearing bit 15 of the GUI's status polls (`CDJ_REQ_STATUS_FRESH=1`) does
-not lift the rate (k1-k3: 1 of 3). Give a freshly inserted card ~25 s
-before pressing its key: MAIN's scan of the card takes that long at
-40 MIPS, and a key before it is done gets one-row answers the GUI gives up
-on after ~5 s (m1).
+With both in place the SD key on a running machine brought the card's
+library in 1.5-5.6 s in 3 runs of 9. In the others the key reached MAIN
+(`0x04c084d8` goes to 1) but the GUI never saw halfword 18 change, because
+MAIN's status records stopped flowing: 1-11 per 5 s against 200-400 in the
+runs that worked. The GUI polls status in two shapes -- `0001 0000 ...`
+when it opens a query and `0000 8000 ...` on every repeat -- and MAIN
+answers the first at once and the second on its 3 s timer; once one answer
+is late the GUI repeats and the rate collapses. `CDJ_REQ_STATUS_FRESH`
+(on by default now) rewrites the repeat into the fresh shape, both words
+(clearing bit 15 alone leaves an all-zero header, which MAIN answers by
+re-sending its last browse answer). With it the key brings the library in
+0.6-2.6 s in 6 runs of 8 (n1-n3, t1-t2, p1-p3). The two failures are the
+open end: MAIN answering `0000 0000` polls -- the GUI fetching a payload
+MAIN's record still announces -- with its last 48-byte browse answer, and
+the card's list request with that same stale answer (n1 at 55.66 s).
+Give a freshly inserted card ~25 s before pressing its key: MAIN's scan of
+the card takes that long at 40 MIPS, and a key before it is done gets
+one-row answers the GUI gives up on after ~5 s (m1).
 
 Switching **away** from the card works: the USB key with no stick shows
 the platter 1.5-3.5 s after the key, three of three.
