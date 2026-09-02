@@ -287,6 +287,16 @@ def button_controls() -> list[Control]:
                 label, key, "top",
                 "decoded by 0x28e59a/0x28e44a and named by MAIN's SERVICE MODE "
                 "table"))
+    # UTILITY is not a key of its own: on the player it is MENU held down, and
+    # on this link "held down" means held across two of MAIN's 3 s status
+    # records (WINDOW_LONG_HOLD_MS).  A key of its own beside MENU says so
+    # without asking anyone to remember a modifier.
+    byte, mask = panel_control.button_mask("20.3")
+    controls.append(Control(
+        "UTILITY", "20.3", "hold", "top",
+        (panel_control.encode_press(byte, mask, WINDOW_LONG_HOLD_MS),),
+        "MENU held down; the firmware calls it UTILITY when the key is still "
+        "down in the next status record"))
     for label, key in LEFT_BUTTONS:
         controls.append(hardware_button(
             label, key, "left",
@@ -831,6 +841,9 @@ class UiViewer:
         return reply
 
     def click(self, control: Control) -> None:
+        if control.kind == "hold" and control.input_id is not None:
+            self.long_press(control)
+            return
         if control.kind == "button" and control.input_id is not None:
             self.press(control, WINDOW_HOLD_MS,
                        "the screen follows about 5 s after the click")
@@ -841,8 +854,8 @@ class UiViewer:
             self.send(control, "")
 
     def long_press(self, control: Control) -> None:
-        """Shift-click: down across two of MAIN's status records."""
-        if control.kind != "button" or control.input_id is None:
+        """Shift-click, or the UTILITY key: down across two status records."""
+        if control.kind not in ("button", "hold") or control.input_id is None:
             self.click(control)
             return
         self.press(control, WINDOW_LONG_HOLD_MS,
