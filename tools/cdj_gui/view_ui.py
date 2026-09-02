@@ -293,7 +293,7 @@ def button_controls() -> list[Control]:
     # without asking anyone to remember a modifier.
     byte, mask = panel_control.button_mask("20.3")
     controls.append(Control(
-        "UTILITY", "20.3", "hold", "top",
+        "UTILITY", "20.3-hold", "hold", "top",
         (panel_control.encode_press(byte, mask, WINDOW_LONG_HOLD_MS),),
         "MENU held down; the firmware calls it UTILITY when the key is still "
         "down in the next status record"))
@@ -866,7 +866,10 @@ class UiViewer:
     def press(self, control: Control, hold_ms: int, then: str) -> None:
         """One press of `hold_ms`, refused while the previous one is down."""
         now = time.monotonic()
-        over = self.in_flight.get(control.input_id, 0.0)
+        # "20.3-hold" is the same key as "20.3"; a press of either is a press
+        # of the bit, and the other must wait for it too.
+        bit_id = control.input_id.split("-")[0]
+        over = self.in_flight.get(bit_id, 0.0)
         if now < over:
             self.control_note.set(
                 "%s: press still down for %.1f s -- MAIN samples it into "
@@ -874,10 +877,10 @@ class UiViewer:
                 "seconds later; a second press would undo a toggle like "
                 "MENU" % (control.label, over - now))
             return
-        byte, mask = panel_control.button_mask(control.input_id)
+        byte, mask = panel_control.button_mask(bit_id)
         if self.send(control, panel_control.encode_press(byte, mask,
                                                          hold_ms)) is not None:
-            self.in_flight[control.input_id] = (
+            self.in_flight[bit_id] = (
                 now + panel_control.press_period_s(hold_ms))
             self.control_note.set("%s: held %.1f s; %s"
                                   % (control.label, hold_ms / 1000.0, then))
