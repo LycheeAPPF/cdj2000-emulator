@@ -454,10 +454,14 @@ def main() -> int:
                      "in separate runs")
 
     env = qemu_environment()
-    main_log = TEMP / "vm-main.log"
-    gui_log = TEMP / "vm-gui.log"
-    console_log = TEMP / "vm-console.txt"
-    frame = TEMP / "vm-frame.ppm"
+    # The fixed names are what RUNNING.md and the notes refer to.  A run on a
+    # non-default CDJ_LINK_PORT is a second machine beside the first, and it
+    # must not delete or share the first one's logs.
+    suffix = "" if PORT == 5980 else f"-{PORT}"
+    main_log = TEMP / f"vm-main{suffix}.log"
+    gui_log = TEMP / f"vm-gui{suffix}.log"
+    console_log = TEMP / f"vm-console{suffix}.txt"
+    frame = TEMP / f"vm-frame{suffix}.ppm"
     # A previous run that was killed rather than closed leaves its QEMU behind,
     # and that orphan still holds this log open.  Windows then refuses the
     # unlink with WinError 32, and an unhandled PermissionError names the file
@@ -597,7 +601,7 @@ def main() -> int:
                 # The TX dump reopens its file per record; the default lands
                 # inside the repository, and a cloud-sync client watching that
                 # directory will fight the writer.
-                "--tx-output", str(TEMP / "vm-sport-tx.bin"),
+                "--tx-output", str(TEMP / f"vm-sport-tx{suffix}.bin"),
                 *(["--ppi-delay", str(args.ppi_delay)] if args.ppi_delay else []),
                 "--env", "BFIN_PARALLEL_WRITEBACK=1",
                 "--env", "BFIN_GUI_COLOR=rgb555le",
