@@ -220,6 +220,7 @@ packets/status.bin --seconds 60`):
 | + wall-clock time base | guest = wall, 400 M ticks/s | | |
 | + display converted only on change | 2e9 ticks in 7.1 s (was 15.0 s), instruction-counted | | |
 | + PLL lock event, MMU check without a call | 40 MIPS busy (was 28) on the same firmware timeline; 2.7 s off the top of every boot | | |
+| + no `sprintf` per instruction | 45.7 ns per instruction busy (was 48), wall-clock run | | |
 
 Two of those came out of the profiler after the time base was in. The first
 `IDLE` of a boot -- the PLL programming sequence, `SIC_IWR`, `PLL_CTL`,
@@ -231,7 +232,13 @@ shows the source. The MMU check's memo hit still made two calls per access; a
 window per table now answers an aligned, granted access inline. A deliberate
 wait is no longer charged as lag either: an event further away than the lag
 cap fires once, at its time, instead of being chased in 50 ms slices. The
-full boot now shows the player screen at 28-34 s (was 34-36).
+full boot now shows the player screen at 28-34 s (was 34-36). The LZSS
+accelerator was suspected for the same seconds and is innocent: with
+`BFIN_FAST_LZSS_TRACE=1` all ten resource banks go through it natively
+inside the first second of a boot, and the guest's own byte loop never
+runs. The last per-instruction cost the profiler found was the
+instruction text itself: every decoder formatted its immediate operands
+with `sprintf` for a trace line nothing printed; that is gated now.
 
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold

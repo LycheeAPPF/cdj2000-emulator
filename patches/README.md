@@ -271,6 +271,15 @@ wall clock to reach 1e9 guest ticks, i7-13700H):
   `bfin_mmu_fast_ok` in `bfin-sim.h` answers an aligned, granted access with
   a compare and a shift; the supervisor test reads the CEC's `IPEND` through
   a pointer. Same firmware timeline to 2e9 ticks: 28 → 40 MIPS.
+* Upstream's decoders build the operand strings of every instruction they
+  execute -- `val_str = imm16_str (hword)`, one `sprintf` each -- and the
+  only reader is `TRACE_INSN`, off in any run that is not a trace. Found
+  with gdb attached to a plain run: five breakpoints on `__mingw_pformat`,
+  five hits from `fmtconst_str` under a decoder; 8 % of the run thread in
+  the sampling profile. `fmtconst_str` returns an empty string unless
+  `TRACE_INSN_P` says the text is wanted. Wall-clock run, GUI alone: 48 →
+  45.7 ns of busy time per instruction; the instruction count to 2e9 ticks
+  is unchanged.
 
 * The display path converted every scanline of every 60 Hz scan to RGB and
   scored every pixel for the best/detail outputs whether or not those were
