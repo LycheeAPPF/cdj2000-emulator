@@ -112,7 +112,7 @@ PLACEMENTS: dict[str, Place] = {
     # records (view_ui.WINDOW_LONG_HOLD_MS).  The suffix keeps it out of the
     # bit count (coverage strips it, as it does field6-touch) and lets
     # view_ui resolve it to the long-press control.
-    "20.3-hold": Place(574, 18, 114, 30, "UTILITY", AMBER, font=11),
+    "20.3-hold": Place(574, 18, 100, 30, "UTILITY", AMBER, font=11),
     # ---- the SOURCE column, left of the panel ----
     "19.0": Place(8, 62, 70, 26, "LINK", BLUE, font=10),
     "19.1": Place(8, 96, 70, 26, "USB", AMBER, font=10),
