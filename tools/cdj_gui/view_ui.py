@@ -248,6 +248,14 @@ def firmware_name(byte: int, bit: int) -> str:
 # short one cannot be delivered on this link at all.
 WINDOW_HOLD_MS = 3300
 
+# A long press.  The firmware tells a short MENU from a held one by whether
+# the key is still down in the *next* status record, so on this link "held"
+# means held across two of MAIN's 3.05 s record builds.  Measured, MENU
+# alone: 1.5 s and 3.3 s open the CUE LINK box (the short-press function),
+# 7 s opens the UTILITY screen (its list empty: the entries are payloads
+# MAIN does not deliver).  6.5 s spans two builds wherever it starts.
+WINDOW_LONG_HOLD_MS = 6500
+
 
 def hardware_button(label: str, key: str, group: str, note: str) -> Control:
     """One front-panel key, resolved through the one naming table there is."""
@@ -649,6 +657,10 @@ class UiViewer:
         """
         button = ttk.Button(parent, text=button_text(control), width=11,
                             command=lambda: self.click(control))
+        # Shift-click holds the key long enough to count as held (UTILITY on
+        # MENU); "break" keeps the plain click from firing on top of it.
+        button.bind("<Shift-Button-1>",
+                    lambda _event, c=control: self.long_press(c) or "break")
         if control.input_id is None:
             button.configure(style="Unbound.TButton")
         return button
@@ -664,8 +676,9 @@ class UiViewer:
         """
         verdicts = manifest_verdicts()
         box = ttk.LabelFrame(parent, text="panel bits — MAIN's own names, then "
-                                          "INPUT_MANIFEST.md; right-click holds "
-                                          "a bit down",
+                                          "INPUT_MANIFEST.md; Shift-click is a "
+                                          "long press, right-click holds a bit "
+                                          "down",
                              padding=6)
         box.grid(row=0, column=0, sticky="ew")
         # Two columns since the inventory went from 22 bits to 40: one column of
@@ -683,6 +696,8 @@ class UiViewer:
             # them from here those two verbs existed and nobody could use them.
             button.bind("<Button-3>",
                         lambda _event, c=control: self.toggle_hold(c))
+            button.bind("<Shift-Button-1>",
+                        lambda _event, c=control: self.long_press(c) or "break")
             button.grid(row=row, column=column, pady=1)
             verdict, world = verdicts.get(control.input_id, ("", ""))
             # The run name is part of the finding, not decoration: 18.1 is
@@ -817,26 +832,42 @@ class UiViewer:
 
     def click(self, control: Control) -> None:
         if control.kind == "button" and control.input_id is not None:
-            now = time.monotonic()
-            over = self.in_flight.get(control.input_id, 0.0)
-            if now < over:
-                self.control_note.set(
-                    "%s: press still down for %.1f s -- MAIN samples it "
-                    "into its next status record and the screen follows "
-                    "a few seconds later; a second press would undo a "
-                    "toggle like MENU" % (control.label, over - now))
-                return
-            if self.send(control, control.lines[0]) is not None:
-                self.in_flight[control.input_id] = (
-                    now + panel_control.press_period_s(WINDOW_HOLD_MS))
-                self.control_note.set(
-                    "%s: held %.1f s; the screen follows about 5 s after "
-                    "the click" % (control.label, WINDOW_HOLD_MS / 1000.0))
+            self.press(control, WINDOW_HOLD_MS,
+                       "the screen follows about 5 s after the click")
             return
         if control.lines:
             self.send(control, control.lines[0])
         else:
             self.send(control, "")
+
+    def long_press(self, control: Control) -> None:
+        """Shift-click: down across two of MAIN's status records."""
+        if control.kind != "button" or control.input_id is None:
+            self.click(control)
+            return
+        self.press(control, WINDOW_LONG_HOLD_MS,
+                   "a long press, held across two of MAIN's 3 s status "
+                   "records; UTILITY on MENU follows a few seconds after "
+                   "release")
+
+    def press(self, control: Control, hold_ms: int, then: str) -> None:
+        """One press of `hold_ms`, refused while the previous one is down."""
+        now = time.monotonic()
+        over = self.in_flight.get(control.input_id, 0.0)
+        if now < over:
+            self.control_note.set(
+                "%s: press still down for %.1f s -- MAIN samples it into "
+                "its next status record and the screen follows a few "
+                "seconds later; a second press would undo a toggle like "
+                "MENU" % (control.label, over - now))
+            return
+        byte, mask = panel_control.button_mask(control.input_id)
+        if self.send(control, panel_control.encode_press(byte, mask,
+                                                         hold_ms)) is not None:
+            self.in_flight[control.input_id] = (
+                now + panel_control.press_period_s(hold_ms))
+            self.control_note.set("%s: held %.1f s; %s"
+                                  % (control.label, hold_ms / 1000.0, then))
 
     def toggle_hold(self, control: Control) -> None:
         """Right-click: hold the bit down, right-click again to release it."""

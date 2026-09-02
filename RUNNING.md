@@ -276,13 +276,16 @@ configuration that boots six times of seven.
 
 The same cadence decides every key. A click in the `view_vm` window holds
 the key 3.3 s, long enough to span one of MAIN's records, and the screen
-follows about five seconds after the click; the UTILITY menu (hold `MENU`
-on the real player) opens that way, with its list empty because the entries
-are payloads MAIN does not deliver. A second click on the same key while the
-first is still down is refused with the time left: the board queues presses
-one behind the other, and a queued MENU closes the menu the first one
-opened, which is what repeated clicking looked like. Right-click holds a key
-down until the next right-click.
+follows about five seconds after the click. The firmware tells a short
+press from a held one by whether the key is still down in the *next*
+record, so a held key on this link is one held across two record builds:
+Shift-click holds 6.5 s. Measured on `MENU`: 1.5 s and 3.3 s open the CUE
+LINK box, 7 s opens the UTILITY screen, with its list empty because the
+entries are payloads MAIN does not deliver. A second click on the same key
+while the first is still down is refused with the time left: the board
+queues presses one behind the other, and a queued MENU closes what the
+first one opened, which is what repeated clicking looked like. Right-click
+holds a key down until the next right-click.
 
 MAIN's RTOS tick, read back through the monitor: 120-880 a second with the
 old interrupt patch depending on host load, ~830 of the programmed 1000 with
