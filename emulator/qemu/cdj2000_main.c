@@ -1898,8 +1898,8 @@ static uint16_t cdj_link_crc(const uint8_t *data, size_t len)
  * rewrote every type-1 request and the GUI never left the left column: 1 779
  * cursor-3 requests, no cursor 11 at all, and an empty right pane.  `r157`,
  * which patched only the cursor-1 arm inside MAIN, saw the GUI ask **cursor 11
- * with word 4 = 2 on its own** 2 223 times and fill the pane with `Afrohouse`
- * and `AAA-Tracks`.  Cursor 1 is the only arm that writes `[ctx+4]`
+ * with word 4 = 2 on its own** 2 223 times and fill the pane with the card's
+ * folder and playlist.  Cursor 1 is the only arm that writes `[ctx+4]`
  * (`0x150492`); the other cursors read their own word 4 for their own pane, and
  * overwriting it takes the GUI's answer away from it.  `CDJ_REQ_CURSOR`
  * widens this again for anyone who wants to repeat r158.
@@ -1957,7 +1957,7 @@ static void cdj_link_force_req_kind(uint8_t *frame, unsigned len)
  * six saved TX dumps, MAIN's answers follow the cleared bit and nothing else:
  *
  *     run   type-1 total   bit 15 CLEAR   answers longer than 64 B
- *     r165        4 965             12         56  (Afrohouse / AAA-Tracks)
+ *     r165        4 965             12         56  (the card's two entries)
  *     r173        8 280              6         47
  *     r178        1 737              5         50
  *     r179        4 118              4          4
