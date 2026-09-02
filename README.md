@@ -105,6 +105,8 @@ Be clear about this: **the player is not usable as a player.**
   silence, then 20 s of answers -- while the panel shows the `Wait` platter,
   which advances only on those answers. This is a device-model gap on MAIN,
   not emulation speed: the GUI board sleeps 87 % of that minute.
+  `CDJ_USB_ABSENT=1` is not the answer -- it adds the `E-7020: USB-B DEVICE
+  ERROR` caution and the platter stays.
 * No link between players.
 
 Most inputs, measured properly against a control run, are proven no-ops on the
