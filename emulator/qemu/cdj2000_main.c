@@ -1429,6 +1429,7 @@ typedef struct CdjLinkState {
     unsigned long n_mode_reg;   /* guest wrote 0xff502000 itself */
     unsigned long n_wbytes;     /* bytes the chardev accepted, header included */
     int64_t census_next;
+    QEMUTimer *tx_timer;        /* the transmit completion, in flight */
 } CdjLinkState;
 
 static int64_t cdj_link_census_every(void)
@@ -1508,6 +1509,70 @@ static unsigned cdj_link_frame_len(CdjLinkState *link)
  * simulator falls back to raw bytes when the magic is absent), so it costs
  * nothing but makes the boundary explicit.
  */
+/*
+ * CDJ_LINK_TX_US: how long a transmitted frame is in flight before its
+ * completion is reported, in microseconds of guest time.  Off (0) by
+ * default: the completion is reported inside the arm write, as this model
+ * always did.
+ *
+ * Why it exists, and why it is off.  With the completion synchronous, MAIN
+ * answers the GUI's browse requests in one burst every 3.000 s -- hundreds
+ * of 48-byte answers 0.1 ms apart behind one 64-byte status record, then
+ * nothing for three seconds -- while the GUI asks sixty times a second
+ * (usb3, 130 s).  That looks like a completion landing before the sending
+ * task has reached its wait, which a frame's time on the wire (64 bytes at
+ * a megabit or so: a few hundred microseconds) would cure.  Measured at
+ * 500 us, same binaries otherwise: one boot without a key answered spread
+ * out instead of in bursts and reached the player screen at 34 s as before
+ * (m1); two boots with a SOURCE key at 40 s never showed the player screen
+ * at all -- one stayed black for 130 s (usb8), one sent only status
+ * requests and drew nothing (usb7) -- where the same configuration without
+ * it shows the player screen at 28 s and the Wait platter six seconds after
+ * the key (usb6).  The two boards' protocol tasks are balanced against each
+ * other by timing on both sides (dv-bfin_ppi.c's yield budget and holds),
+ * and moving this one edge upsets that balance.  Kept for the experiment
+ * that finds the matching change on the other side.
+ */
+static int64_t cdj_link_tx_ns(void)
+{
+    static int64_t ns = -1;
+
+    if (ns < 0) {
+        const char *env = getenv("CDJ_LINK_TX_US");
+
+        ns = (env && *env ? strtoll(env, NULL, 10) : 0) * 1000LL;
+        if (ns < 0) {
+            ns = 0;
+        }
+    }
+    return ns;
+}
+
+/*
+ * Two completions are reported, because the firmware waits for both: the
+ * channel's own one (handler 0x2a3db0 via INTC2 bit 5), and the separate
+ * transfer-done interrupt that handler 0x2a3eb4 services on INTC2 bit 6.
+ * Only the latter clears the transmit-in-progress flag 0x7db3541, and it
+ * insists on bit 25 being set in the status at 0xff502004 *and* in the
+ * control at 0xff502000 (0x2a3f00..0x2a3f14).
+ */
+static void cdj_link_tx_complete(void *opaque)
+{
+    CdjLinkState *link = opaque;
+
+    link->control &= ~LINK_CTRL_START;
+
+    link->status |= link->rx_status;
+    cdj_intc2_set(link, true);
+
+    link->mode_status |= MODE_DONE | MODE_GATE;
+    link->mode_reg |= MODE_GATE;
+    if (link->done_irq) {
+        link->intc2->status |= LINK_DONE_BIT;
+        qemu_set_irq(link->done_irq, 1);
+    }
+}
+
 static void cdj_link_transmit(CdjLinkState *link)
 {
     unsigned frame = cdj_link_frame_len(link);
@@ -1540,24 +1605,12 @@ static void cdj_link_transmit(CdjLinkState *link)
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
     cdj_link_census(link);
 
-    link->control &= ~LINK_CTRL_START;
-
-    /*
-     * Two completions are reported, because the firmware waits for both: the
-     * channel's own one (handler 0x2a3db0 via INTC2 bit 5), and the separate
-     * transfer-done interrupt that handler 0x2a3eb4 services on INTC2 bit 6.
-     * Only the latter clears the transmit-in-progress flag 0x7db3541, and it
-     * insists on bit 25 being set in the status at 0xff502004 *and* in the
-     * control at 0xff502000 (0x2a3f00..0x2a3f14).
-     */
-    link->status |= link->rx_status;
-    cdj_intc2_set(link, true);
-
-    link->mode_status |= MODE_DONE | MODE_GATE;
-    link->mode_reg |= MODE_GATE;
-    if (link->done_irq) {
-        link->intc2->status |= LINK_DONE_BIT;
-        qemu_set_irq(link->done_irq, 1);
+    if (cdj_link_tx_ns() > 0 && link->tx_timer) {
+        /* In flight: START stays set until the frame is out. */
+        timer_mod(link->tx_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + cdj_link_tx_ns());
+    } else {
+        cdj_link_tx_complete(link);
     }
 }
 
@@ -1607,9 +1660,11 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
     case LINK_CONTROL:
         if ((value & LINK_CTRL_START) && !(link->control & LINK_CTRL_START)) {
             if (cdj_link_trace()) {
-                qemu_log_mask(LOG_UNIMP, "%s: armed buffer=0x%08x len=%u\n",
+                qemu_log_mask(LOG_UNIMP, "%s: armed buffer=0x%08x len=%u"
+                              " t=%.4f\n",
                               link->name, link->buffer,
-                              cdj_link_frame_len(link));
+                              cdj_link_frame_len(link),
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
             }
             link->n_armed++;
             link->control = value;
@@ -1636,8 +1691,10 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
     case LINK_STATUS:
         /* Written back as (value & 31) to acknowledge. */
         if (cdj_link_trace()) {
-            qemu_log_mask(LOG_UNIMP, "%s: ack status 0x%02x (was 0x%02x)\n",
-                          link->name, (unsigned)(value & 0x1f), link->status);
+            qemu_log_mask(LOG_UNIMP, "%s: ack status 0x%02x (was 0x%02x)"
+                          " t=%.4f\n",
+                          link->name, (unsigned)(value & 0x1f), link->status,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
         }
         link->n_ack++;
         cdj_link_census(link);
@@ -1686,6 +1743,11 @@ static void cdj_link_mode_write(void *opaque, hwaddr offset, uint64_t value,
         link->mode_status = value;
         if (!(link->mode_status & MODE_GATE) && link->done_irq) {
             link->n_gate++;
+            if (cdj_link_trace()) {
+                qemu_log_mask(LOG_UNIMP, "%s: gate cleared t=%.4f\n",
+                              link->name,
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+            }
             cdj_link_census(link);
             qemu_set_irq(link->done_irq, 0);
             link->intc2->status &= ~LINK_DONE_BIT;
@@ -1953,9 +2015,15 @@ static void cdj_link_receive(void *opaque, const uint8_t *data, int size)
     if (link->flag) {
         cdj_link_flag_rx(link->flag, cdj_link_flag_pending());
     }
+    /* The request header, little-endian halfwords as the GUI lays them
+     * out: 0 tag, 1 type, 2 cursor, 3 word 3, 4 KIND, 5 word 5. */
     qemu_log_mask(LOG_UNIMP, "%s: delivered %u bytes to 0x%08x, status 0x%02x"
+                  " words %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x"
                   " t=%.4f\n",
                   link->name, frame, link->buffer, link->status,
+                  link->rx[1], link->rx[0], link->rx[3], link->rx[2],
+                  link->rx[5], link->rx[4], link->rx[7], link->rx[6],
+                  link->rx[9], link->rx[8], link->rx[11], link->rx[10],
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
     link->n_rx++;
     cdj_link_census(link);
@@ -2001,6 +2069,10 @@ static CdjLinkState *cdj_link_init(MemoryRegion *system, CdjIntc2State *intc2,
     link->owner = owner;
     link->intc2 = intc2;
     link->name = name;
+    if (transmit) {
+        link->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_link_tx_complete,
+                                      link);
+    }
     link->base = base;
     link->intc2_bit = intc2_bit;
     link->irq = irq;

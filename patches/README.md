@@ -180,6 +180,14 @@ services the SIC, leaving a receive task asleep for good.
 scanline time well enough to stop the LCD consuming one hardware event per
 simulated cycle.
 
+`BFIN_SPORT_RX_US` (off) lands a freshly armed SPORT receive's first record
+that many microseconds after the arm instead of on the next tick. It was
+built because the GUI arms thousands of 64-byte status receives and parses
+one in ninety, losing them between the arm and the handler -- the shape of a
+completion that lands before the task is waiting for it -- and measured at
+500 us it stopped the GUI sending any request for 45 s. The comment above the
+knob has the numbers; it stays for a narrower experiment.
+
 ### `sim/bfin/interp.c` — guest time on the wall clock
 
 Upstream ticks the event queue once per instruction (plus a few for slow
@@ -209,9 +217,25 @@ simulator sleeps two thirds of the time. The full boot reaches the player
 screen with `NO DISC` in about 35 s where the old time base still showed the
 `Wait` spinner at 150 s.
 
+Three corrections found with the profiler once the time base was in. The
+PLL model (`dv-bfin_pll.c`) had no lock event, so the `IDLE` the firmware
+executes for the PLL -- the first thing it does after reset -- slept until
+the simulator's next internal event, 2.68 s on the wall clock at the top of
+every boot; a `PLL_CTL` write now relocks after `PLL_LOCKCNT` system clocks.
+An `IDLE` whose wake-up has already happened (the lock, 8 us after the write,
+always has by the time the catch-up delivers it) returns at once, as the chip
+does when `SIC_IWR` already shows the source, and a parked sync returns as
+soon as any event fired during its catch-up. And a deliberate wait is not
+lag: its ticks are delivered in full on top of the cap, so an event further
+away than the cap fires once, at its time, instead of being chased in 50 ms
+slices -- before this the first `IDLE` slept 2.68 s and then had 2.63 s of it
+dropped.
+
 `BFIN_TIME_BASE=insn` restores the upstream behaviour for reproducing a run
 instruction for instruction, and `BFIN_EXIT_AFTER_TICKS=<n>` halts at a guest
-time so two builds can be compared picture for picture.
+time so two builds can be compared picture for picture: two runs of the same
+build to 2e9 ticks execute exactly the same number of instructions
+(410 517 504 with the fast MMU check below).
 
 ### The interpreter's own speed
 
@@ -235,6 +259,14 @@ wall clock to reach 1e9 guest ticks, i7-13700H):
   walk, anything else takes it, any MMU register write empties the memo.
   `getenv()` left the DMA, PPI, SPORT and CFI hot paths. 18.7 → 31.7 MIPS,
   10.9 s → 6.6 s.
+* A memo hit still made two calls per access, a quarter of the interpreter's
+  time in the profile. `dv-bfin_mmu.c` now publishes, per table, the page of
+  its last single hit with one bit per (supervisor, write) pair the entry
+  grants -- the implicit rules for MMR space and the L1 banks folded in at
+  publication, or all of memory below L1 while the CPLBs are off -- and
+  `bfin_mmu_fast_ok` in `bfin-sim.h` answers an aligned, granted access with
+  a compare and a shift; the supervisor test reads the CEC's `IPEND` through
+  a pointer. Same firmware timeline to 2e9 ticks: 28 → 40 MIPS.
 
 * The display path converted every scanline of every 60 Hz scan to RGB and
   scored every pixel for the best/detail outputs whether or not those were

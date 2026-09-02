@@ -22,7 +22,8 @@ Three things to expect before you build anything:
   here on an i7-13700H: the Pioneer logo at about 20 s, the player screen with
   `NO DISC` -- the handshake with MAIN complete -- at about 35 s of wall clock.
   Before the speed work of September 2026 the same run showed the `Wait`
-  spinner still at 150 s. MAIN's RTOS tick now runs at its real 1000 Hz;
+  spinner still at 150 s; the player screen now comes at 28-34 s. MAIN's
+  RTOS tick runs at its real 1000 Hz;
   what remains is MAIN's own boot sequence and its device time-outs, which
   are real firmware time-outs. See "Speed" in RUNNING.md for the numbers and
   the knobs.
@@ -98,15 +99,16 @@ Be clear about this: **the player is not usable as a player.**
 * **No audio at all.** The DSP is a register model with a position counter and
   no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
-  **Selecting `USB` therefore takes over a minute**: MAIN accepts the key,
-  then waits for a USB host it does not have. Measured with the wall-clock
-  simulator: after the press MAIN touches no USB host registers at all and
-  answers the GUI's ~60 requests a second in bursts -- about 30 s of near
-  silence, then 20 s of answers -- while the panel shows the `Wait` platter,
-  which advances only on those answers. This is a device-model gap on MAIN,
-  not emulation speed: the GUI board sleeps 87 % of that minute.
-  `CDJ_USB_ABSENT=1` is not the answer -- it adds the `E-7020: USB-B DEVICE
-  ERROR` caution and the platter stays.
+  **Selecting `USB` shows the `Wait` platter and leaves it there**: the GUI
+  routes a source whose media state MAIN reports as zero to the platter
+  screen, and without a USB host MAIN reports zero for ever. Measured: the
+  platter appears six seconds after the key and turns at about 2.4 frames a
+  second, and the GUI's browse requests switch to the USB source a minute
+  later; MAIN meanwhile answers the GUI's ~60 requests a second in one burst
+  every 3.000 s. This is the two boards' link protocol, not emulation speed:
+  the GUI board runs at 2-5 MIPS throughout. `CDJ_USB_ABSENT=1` is not the
+  answer -- it adds the `E-7020: USB-B DEVICE ERROR` caution and the platter
+  stays. See "What the SOURCE key costs" in RUNNING.md for what was tried.
 * No link between players.
 
 Most inputs, measured properly against a control run, are proven no-ops on the

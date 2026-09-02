@@ -219,6 +219,40 @@ packets/status.bin --seconds 60`):
 | + CPLB memo, no `getenv` on hot paths | 31.7 | 150 M | 6.6 s |
 | + wall-clock time base | guest = wall, 400 M ticks/s | | |
 | + display converted only on change | 2e9 ticks in 7.1 s (was 15.0 s), instruction-counted | | |
+| + PLL lock event, MMU check without a call | 40 MIPS busy (was 28) on the same firmware timeline; 2.7 s off the top of every boot | | |
+
+Two of those came out of the profiler after the time base was in. The first
+`IDLE` of a boot -- the PLL programming sequence, `SIC_IWR`, `PLL_CTL`,
+`PLL_DIV`, `IDLE` -- slept 2.68 s, because the PLL model had no lock event
+and the only event pending that early was the simulator's own poll event; the
+PLL now locks after `PLL_LOCKCNT` system clocks, and an `IDLE` whose wake-up
+has already happened returns at once, as the chip does when `SIC_IWR` already
+shows the source. The MMU check's memo hit still made two calls per access; a
+window per table now answers an aligned, granted access inline. A deliberate
+wait is no longer charged as lag either: an event further away than the lag
+cap fires once, at its time, instead of being chased in 50 ms slices. The
+full boot now shows the player screen at 28-34 s (was 34-36).
+
+**What the SOURCE key costs.** Measured with `boot_vm --source-key usb
+--source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold
+reaches MAIN -- `0x04c084d4` goes to 1 -- but the GUI never learns of it): the
+`Wait` platter appears six seconds after the key, animates at about 2.4 frames
+a second, and the GUI's browse requests switch to the USB source about a
+minute later. None of that is interpreter speed: the GUI board runs at
+2-5 MIPS the whole time. The platter is the router's answer to a source whose
+media state (status word 26) MAIN leaves at zero, which without a USB host it
+always does; the latency and the frame rate are the rate at which the GUI
+parses MAIN's status records, and MAIN's answers to the GUI's ~60 requests a
+second arrive in one burst every 3.000 s -- hundreds of them 0.1 ms apart
+behind one status record. Both smelled like a completion reported inside the
+arm write, before the task that waits for it is waiting, so each side got a
+switch that delays it by a frame's time on the wire: `CDJ_LINK_TX_US` on the
+board and `BFIN_SPORT_RX_US` on the simulator. Measured at 500 us, each one
+alone: the GUI-side delay stopped the GUI sending any request for 45 s, and
+the board-side delay left two boots of three without a player screen. The
+two protocol tasks are balanced against each other by timing on both sides,
+and moving one edge upsets it. Both switches are off by default and stay in
+for the experiment that moves both sides together.
 
 MAIN's RTOS tick, read back through the monitor: 120-880 a second with the
 old interrupt patch depending on host load, ~830 of the programmed 1000 with
@@ -247,13 +281,15 @@ twice during this work before the rule was learnt.
 
 The board itself takes a long list of its own, all read with `getenv` in
 `emulator/qemu/`: `CDJ_INPUT_PORT`, `CDJ_PANEL_KEYS`, `CDJ_SD_INSERT`,
-`CDJ_DSP_ABSENT`, `CDJ_USB_ABSENT`, `CDJ_ATAPI_ABSENT`, `CDJ_BUS_TRACE` and
+`CDJ_DSP_ABSENT`, `CDJ_USB_ABSENT`, `CDJ_ATAPI_ABSENT`, `CDJ_BUS_TRACE`,
+`CDJ_LINK_TRACE` (arm, acknowledge and gate lines with virtual-clock stamps,
+and the header words of every request delivered), `CDJ_LINK_TX_US` (off) and
 more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
-`BFIN_GUI_COLOR`, `BFIN_PPI_DMA_DELAY`, `BFIN_SPORT_TX_OUTPUT`, and the
-time-base knobs above: `BFIN_TIME_BASE`, `BFIN_CCLK_HZ`, `BFIN_PPI_FPS`,
-`BFIN_SPORT_RETRY_US`, `BFIN_WALL_LAG_MS`, `BFIN_STATS`,
-`BFIN_EXIT_AFTER_WALL`, `BFIN_EXIT_AFTER_TICKS`, `BFIN_MEM_FAST`. Each is
-documented where it is read.
+`BFIN_GUI_COLOR`, `BFIN_PPI_DMA_DELAY`, `BFIN_SPORT_TX_OUTPUT`,
+`BFIN_SPORT_RX_US` (off), and the time-base knobs above: `BFIN_TIME_BASE`,
+`BFIN_CCLK_HZ`, `BFIN_PPI_FPS`, `BFIN_SPORT_RETRY_US`, `BFIN_WALL_LAG_MS`,
+`BFIN_STATS`, `BFIN_EXIT_AFTER_WALL`, `BFIN_EXIT_AFTER_TICKS`,
+`BFIN_MEM_FAST`. Each is documented where it is read.
 
 The simulator's diagnostic probes -- every `BFIN_*_TRACE`, `BFIN_PC_*`,
 `BFIN_*_DUMP`, watch, peek and poke variable -- are behind one gate. Setting
