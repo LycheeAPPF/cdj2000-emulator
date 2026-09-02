@@ -244,15 +244,28 @@ media state (status word 26) MAIN leaves at zero, which without a USB host it
 always does; the latency and the frame rate are the rate at which the GUI
 parses MAIN's status records, and MAIN's answers to the GUI's ~60 requests a
 second arrive in one burst every 3.000 s -- hundreds of them 0.1 ms apart
-behind one status record. Both smelled like a completion reported inside the
-arm write, before the task that waits for it is waiting, so each side got a
-switch that delays it by a frame's time on the wire: `CDJ_LINK_TX_US` on the
-board and `BFIN_SPORT_RX_US` on the simulator. Measured at 500 us, each one
-alone: the GUI-side delay stopped the GUI sending any request for 45 s, and
-the board-side delay left two boots of three without a player screen. The
-two protocol tasks are balanced against each other by timing on both sides,
-and moving one edge upsets it. Both switches are off by default and stay in
-for the experiment that moves both sides together.
+behind one status record. MAIN builds a fresh status record on that same
+3 s cadence when nothing changes, and a key is copied into the record built
+while it is down, which is why `panel_control` holds a press for 2.8 s.
+
+Both smelled like a completion reported inside the arm write, before the
+task that waits for it is waiting, so each side got a switch that delays it
+by a frame's time on the wire (the SPORT transmits at SCLK/34, about
+2.9 Mbit/s, so a 64-byte record is ~180 us; the receive clock comes from
+MAIN): `CDJ_LINK_TX_US` on the board and `BFIN_SPORT_RX_US` on the
+simulator, the latter on the 64-byte record receives only. Measured, each
+alone at 500 us and 200 us: the GUI-side delay left the screen black until
+t94 in one run and the GUI silent for 45 s in another, the board-side delay
+left two boots of three without a player screen. Together with a deep
+receive ring on the GUI side (`BFIN_LINK_DEPTH=128`, so a plain record
+cannot land on an announcement before its payload is read) the board-side
+delay boots cleanly -- three of three -- and in one run of three the
+browse requests moved to the USB source within ten seconds of the key
+instead of a minute; the platter still came four seconds after the key at
+~2 fps, and MAIN's idle cadence stayed at 3 s. That is not enough to change
+a default: the two protocol tasks are balanced against each other by timing
+on both sides, and every switch is off unless set. The launchers keep the
+configuration that boots six times of seven.
 
 MAIN's RTOS tick, read back through the monitor: 120-880 a second with the
 old interrupt patch depending on host load, ~830 of the programmed 1000 with

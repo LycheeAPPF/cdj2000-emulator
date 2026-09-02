@@ -115,7 +115,7 @@ That line of work is not part of this emulator and is left out deliberately.
 Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 
 diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/bfin-sim.c gdb-17.2/sim/bfin/bfin-sim.c
---- a/sim/bfin/bfin-sim.c	2026-09-02 14:28:54.254872500 +0200
+--- a/sim/bfin/bfin-sim.c	2026-09-02 14:53:08.944526000 +0200
 +++ b/sim/bfin/bfin-sim.c	2026-09-02 13:19:03.152858700 +0200
 @@ -36,6 +36,662 @@
  
@@ -3031,8 +3031,8 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
    DIS_ALGN_EXPT &= ~1;
 diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/bfin-sim.h gdb-17.2/sim/bfin/bfin-sim.h
 --- a/sim/bfin/bfin-sim.h	2026-05-10 16:32:31.000000000 +0200
-+++ b/sim/bfin/bfin-sim.h	2026-09-02 13:19:03.151858800 +0200
-@@ -310,14 +310,147 @@
++++ b/sim/bfin/bfin-sim.h	2026-09-02 14:38:31.701735200 +0200
+@@ -310,14 +310,148 @@
  #define SYSCFG_CCEN	(1 << 1)
  #define SYSCFG_SNEN	(1 << 2)
  
@@ -3051,6 +3051,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +unsigned bfin_wall_ticks_us (unsigned us);
 +unsigned bfin_wall_frame_gap_ticks (unsigned lines_already);
 +int bfin_sport_link_wait_fd (void);
++void bfin_sport_clock_report (struct hw *sport);
 +void bfin_trace_framebuffer_store_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
 +					unsigned bytes);
 +void bfin_trace_gui_state_read_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
@@ -3183,7 +3184,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
    if (__cnt != __bytes) \
      mmu_process_fault (cpu, __taddr, true, false, false, true); \
    BFIN_TRACE_CORE (cpu, __taddr, __bytes, write_map, __v); \
-@@ -331,9 +464,20 @@
+@@ -331,9 +465,20 @@
    bu##size __ret; \
    bu32 __taddr = (taddr); \
    int __cnt, __bytes = size / 8; \
@@ -3207,7 +3208,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
    if (__cnt != __bytes) \
      mmu_process_fault (cpu, __taddr, false, inst, false, true); \
    BFIN_TRACE_CORE (cpu, __taddr, __bytes, map, __ret); \
-@@ -345,7 +489,12 @@
+@@ -345,7 +490,12 @@
  #define GET_LONG(taddr) _GET_MEM(taddr, 32)
  
  #define IFETCH(taddr) __GET_MEM(taddr, 16, true, exec_map)
@@ -3408,7 +3409,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
      case mmr_offset(tcount):
 diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_dma.c gdb-17.2/sim/bfin/dv-bfin_dma.c
 --- a/sim/bfin/dv-bfin_dma.c	2026-05-10 16:32:31.000000000 +0200
-+++ b/sim/bfin/dv-bfin_dma.c	2026-09-02 14:23:26.230756500 +0200
++++ b/sim/bfin/dv-bfin_dma.c	2026-09-02 14:38:31.702719200 +0200
 @@ -22,6 +22,7 @@
  #include "defs.h"
  
@@ -3593,7 +3594,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  
  static void
  bfin_dma_reschedule (struct hw *me, unsigned delay)
-@@ -249,11 +391,25 @@
+@@ -249,11 +391,30 @@
    struct hw *peer;
    struct dv_bfin *bfin_peer;
    bu8 buf[4096];
@@ -3606,10 +3607,15 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +  if (dma->cdj_fresh)
 +    {
 +      dma->cdj_fresh = 0;
-+      if ((dma->config & WNR) && strstr (hw_name (peer), "bfin_sport") != NULL)
++      /* The 64-byte arms are the status-record path (0xb7c1aa with 32
++	 words); the housekeeping loop's 200-byte polls stay on the next
++	 tick, so the latency lands only where the parse is lost.  */
++      if ((dma->config & WNR) && strstr (hw_name (peer), "bfin_sport") != NULL
++	  && dma->x_count * dma->ele_size == 64)
 +	{
 +	  unsigned latency = bfin_dma_sport_rx_ticks ();
 +
++	  bfin_sport_clock_report (peer);
 +	  if (latency)
 +	    {
 +	      bfin_dma_reschedule (me, latency);
@@ -3620,7 +3626,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
    ret = 0;
    if (dma->x_modify < 0)
      /* XXX: This sucks performance wise.  */
-@@ -261,6 +417,35 @@
+@@ -261,6 +422,35 @@
    else
      nr_bytes = min (sizeof (buf), dma->curr_x_count * dma->ele_size);
  
@@ -3656,7 +3662,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
    /* Pumping a chunk!  */
    bfin_peer->dma_master = me;
    bfin_peer->acked = false;
-@@ -302,7 +487,12 @@
+@@ -302,7 +492,12 @@
    if ((!dma->acked && dma->curr_x_count) || bfin_dma_finish_x (me, dma))
      /* Still got work to do, so schedule again.  */
   reschedule:
@@ -3670,7 +3676,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  
    return;
  
-@@ -384,7 +574,20 @@
+@@ -384,7 +579,20 @@
  
        if (bfin_dma_enabled (dma))
  	{
@@ -3691,7 +3697,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  	  bfin_dma_process_desc (me, dma);
  	  /* The writer is the master.  */
  	  if (!(dma->peripheral_map & CTYPE) || (dma->config & WNR))
-@@ -398,6 +601,12 @@
+@@ -398,6 +606,12 @@
        break;
      case mmr_offset(irq_status):
        dv_w1c_2 (value16p, value, DMA_DONE | DMA_ERR);
@@ -4149,7 +4155,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  
 diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_ppi.c gdb-17.2/sim/bfin/dv-bfin_ppi.c
 --- a/sim/bfin/dv-bfin_ppi.c	2026-05-10 16:32:31.000000000 +0200
-+++ b/sim/bfin/dv-bfin_ppi.c	2026-09-02 10:46:37.880640000 +0200
++++ b/sim/bfin/dv-bfin_ppi.c	2026-09-02 14:38:31.702719200 +0200
 @@ -25,10 +25,49 @@
  #include "sim-main.h"
  #include "devices.h"
@@ -4258,7 +4264,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
    return bfin_gui_update (ppi->gui_state, source, nr_bytes);
  }
  
-@@ -232,8 +287,2376 @@
+@@ -232,8 +287,2398 @@
    ppi->color = bfin_gui_color (color);
  }
  
@@ -6595,6 +6601,28 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +  { "rx",   2, 0, output_port, },
 +  { NULL, 0, 0, 0, },
 +};
++
++/* Once, on the first status-record receive: the SPORT's clock registers,
++   so the wire rate the firmware programmed is on the log next to any
++   latency experiment.  TCR1/RCR1 bit 1 (ITCLK/IRCLK) says whether the
++   clock is internal, in which case the bit rate is SCLK / (2 * (div + 1));
++   otherwise MAIN drives it and the registers say nothing about it.  */
++void
++bfin_sport_clock_report (struct hw *me)
++{
++  static int reported;
++  struct bfin_sport *sport = hw_data (me);
++
++  if (reported)
++    return;
++  reported = 1;
++  fprintf (stderr, "bfin sport: tcr1=%#x tcr2=%#x tclkdiv=%u rcr1=%#x"
++	   " rcr2=%#x rclkdiv=%u (%s clock)\n",
++	   sport->regs[0], sport->regs[1], sport->regs[2], sport->regs[8],
++	   sport->regs[9], sport->regs[10],
++	   (sport->regs[8] & 2) ? "internal receive" : "external receive");
++  fflush (stderr);
++}
 +
 +static void
 +bfin_sport_finish (struct hw *me)

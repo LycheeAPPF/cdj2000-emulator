@@ -180,13 +180,17 @@ services the SIC, leaving a receive task asleep for good.
 scanline time well enough to stop the LCD consuming one hardware event per
 simulated cycle.
 
-`BFIN_SPORT_RX_US` (off) lands a freshly armed SPORT receive's first record
-that many microseconds after the arm instead of on the next tick. It was
-built because the GUI arms thousands of 64-byte status receives and parses
-one in ninety, losing them between the arm and the handler -- the shape of a
-completion that lands before the task is waiting for it -- and measured at
-500 us it stopped the GUI sending any request for 45 s. The comment above the
-knob has the numbers; it stays for a narrower experiment.
+`BFIN_SPORT_RX_US` (off) lands a freshly armed 64-byte SPORT receive's
+record that many microseconds after the arm instead of on the next tick;
+the housekeeping loop's 200-byte polls are left alone. It was built because
+the GUI arms fifty 64-byte status receives a second and parses one in ten,
+losing them between the arm and the handler -- the shape of a completion
+that lands before the task is waiting for it. Measured: at 500 us on every
+receive the GUI sent no request for 45 s; at 200 us on the record receives
+alone the screen stayed black until t94. The comment above the knob has the
+numbers; the first such arm also logs the SPORT's clock registers
+(`bfin sport: ...`), which say the transmit clock is internal at SCLK/34 and
+the receive clock is MAIN's.
 
 ### `sim/bfin/interp.c` — guest time on the wall clock
 
