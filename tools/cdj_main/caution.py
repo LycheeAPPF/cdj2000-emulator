@@ -788,7 +788,7 @@ def run_main_only(seconds: float, extra_env: dict[str, str], sd: str | None,
     because the run itself looks perfectly normal.
     """
     env = qemu_environment()
-    env.setdefault("CDJ_TMU_FREQ", "270000000")
+    env.setdefault("CDJ_TMU_FREQ", "54000000")
     env.setdefault("CDJ_SD_INSERT", "25")
     if sd:
         env.setdefault("CDJ_PANEL_FRAME",

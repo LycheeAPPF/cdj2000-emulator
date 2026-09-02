@@ -5,11 +5,27 @@
 # Build the CDJ-2000 GUI board simulator: GNU sim from GDB 17.2, plus the
 # patches in patches/.
 #
-#   sh scripts/build-bfin-sim.sh [GDB_TARBALL_OR_DIR]
+#   sh scripts/build-bfin-sim.sh [options] [GDB_TARBALL_OR_DIR]
 #
 # With no argument the script looks for gdb-17.2.tar.xz beside the repository
 # and in build/, and downloads it if neither is there.  The result is installed
 # as bin/cdj-run.
+#
+# Options:
+#   --march=ARCH     -march for the simulator; default "native", because the
+#                    binary is a local tool.  Pass --march=nocona (the MSYS2
+#                    baseline) for a binary that has to run elsewhere.
+#   --opt=FLAG       optimisation level, default -O3.
+#   --profile        build with -pg into a separate object tree and install
+#                    as bin/cdj-run-pg, for gprof.  Give the run
+#                    BFIN_EXIT_AFTER_WALL=<seconds> so the simulator exits
+#                    normally and gmon.out is written.
+#   --reconfigure    throw the object tree away first.  configure runs only
+#                    when there is no config.status, so a change of flags
+#                    does nothing without this.
+#
+# CDJ_SIM_CFLAGS overrides the compiler flags outright (it replaces the
+# -O/-march/-g set, and --profile still appends -pg).
 #
 # Prerequisites: a C toolchain, make, patch, tar.  On MSYS2 MINGW64:
 #   pacman -S --needed base-devel mingw-w64-x86_64-toolchain
@@ -17,6 +33,23 @@
 # Everything upstream is GPLv3; see THIRD_PARTY.md.
 
 set -e
+
+MARCH=native
+OPT=-O3
+PROFILE=
+RECONFIGURE=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --march=*)     MARCH=${1#--march=} ;;
+        --opt=*)       OPT=${1#--opt=} ;;
+        --profile)     PROFILE=1 ;;
+        --reconfigure) RECONFIGURE=1 ;;
+        --help|-h)     sed -n '2,40p' "$0"; exit 0 ;;
+        --*)           echo "unknown option: $1" >&2; exit 2 ;;
+        *)             break ;;
+    esac
+    shift
+done
 
 GDB_VERSION=17.2
 GDB_TARBALL=gdb-$GDB_VERSION.tar.xz
@@ -26,6 +59,20 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${CDJ_BUILD_DIR:-$REPO/build}
 SRC=$WORK/gdb-$GDB_VERSION
 OBJ=$WORK/sim-build
+INSTALL_NAME=cdj-run
+if [ -n "$PROFILE" ]; then
+    OBJ=$WORK/sim-build-pg
+    INSTALL_NAME=cdj-run-pg
+fi
+
+# The flags the simulator is compiled with.  -O3 -march=native because the
+# interpreter's hot loop is the whole cost of a run; -g costs nothing at run
+# time and keeps the binary debuggable.  --enable-sim-inline lets sim-core's
+# and sim-events' small functions inline into their callers instead of being
+# out-of-line calls on every guest memory access; --disable-sim-assert drops
+# the three ASSERTs that otherwise run per byte in sim_core_find_mapping.
+SIM_CFLAGS=${CDJ_SIM_CFLAGS:-"$OPT -march=$MARCH -g"}
+[ -n "$PROFILE" ] && SIM_CFLAGS="$SIM_CFLAGS -pg"
 
 case $(uname -s 2>/dev/null) in
     MINGW*|MSYS*|CYGWIN*) EXE=.exe ;;
@@ -91,16 +138,22 @@ for patch in "$REPO"/patches/0*-gdb-*.patch; do
 done
 
 # ------------------------------------------------------------------ build ---
+if [ -n "$RECONFIGURE" ] && [ -d "$OBJ" ]; then
+    echo "removing $OBJ"
+    rm -rf "$OBJ"
+fi
 if [ ! -f "$OBJ/config.status" ]; then
-    echo "configuring"
+    echo "configuring with CFLAGS=\"$SIM_CFLAGS\""
     mkdir -p "$OBJ"
     # The simulator only.  Building gdb itself takes an order of magnitude
-    # longer and nothing here uses it.
-    (cd "$OBJ" && "$SRC/configure" \
+    # longer and nothing here uses it.  CFLAGS in the environment reaches
+    # bfd, opcodes and libiberty as well, which is harmless.
+    (cd "$OBJ" && CFLAGS="$SIM_CFLAGS" "$SRC/configure" \
         --target=bfin-elf \
         --disable-gdb --disable-binutils --disable-gas --disable-ld \
         --disable-gprof --disable-gprofng --disable-nls --disable-werror \
-        --enable-sim)
+        --enable-sim --enable-sim-inline --disable-sim-assert)
+    echo "$SIM_CFLAGS" > "$OBJ/cdj-cflags"
 fi
 
 # The top-level configure does not descend; sim/Makefile is written by the
@@ -151,13 +204,17 @@ real=$OBJ/sim/bfin/.libs/run$EXE
 [ -f "$real" ] || { echo "no simulator was built" >&2; exit 1; }
 
 mkdir -p "$REPO/bin"
-cp "$real" "$REPO/bin/cdj-run$EXE"
-chmod +x "$REPO/bin/cdj-run$EXE"
+cp "$real" "$REPO/bin/$INSTALL_NAME$EXE"
+chmod +x "$REPO/bin/$INSTALL_NAME$EXE"
 
-size=$(wc -c < "$REPO/bin/cdj-run$EXE")
+size=$(wc -c < "$REPO/bin/$INSTALL_NAME$EXE")
 echo
-echo "built: $REPO/bin/cdj-run$EXE ($size bytes)"
+echo "built: $REPO/bin/$INSTALL_NAME$EXE ($size bytes, CFLAGS $(cat "$OBJ/cdj-cflags" 2>/dev/null))"
 if [ "$size" -lt 1000000 ]; then
     echo "that is far too small to be the simulator -- it is libtool's wrapper" >&2
     exit 1
 fi
+
+# A rebuilt tree with the old binary still installed is the most expensive
+# silent error in the project (BUILD.md), so say when the copy is fresh.
+echo "installed $(date -r "$REPO/bin/$INSTALL_NAME$EXE" +%H:%M:%S 2>/dev/null)"

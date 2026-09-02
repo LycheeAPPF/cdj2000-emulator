@@ -18,17 +18,26 @@ use a CDJ-2000 on your desktop, and it will not become one by itself.
 
 Three things to expect before you build anything:
 
-- **It is very slow.** A boot takes minutes of wall clock — plan for around
-  five, sometimes more — to reach a state a real player reaches in seconds.
-  Two emulated CPUs, one of them an interpreting instruction-set simulator.
-  Leave it running; it is not hung.
-- **It is unreliable, and it gets worse when the host is busy.** The GUI board
-  double-faults intermittently at `0x00b99196`, usually one to three minutes
-  in; the panel then freezes wherever it got to and the launcher reports
-  `simulator exited with code 1`. Measured here: about one run in three faults
-  on an idle machine, and five of six while a compile was running alongside.
-  So do not build something else in another window and expect a clean run.
-  This is long-standing behaviour, not a broken checkout.
+- **It is slower than the real thing, but not by much any more.** Measured
+  here on an i7-13700H: the Pioneer logo at about 20 s, the player screen with
+  `NO DISC` -- the handshake with MAIN complete -- at about 35 s of wall clock.
+  Before the speed work of September 2026 the same run showed the `Wait`
+  spinner still at 150 s; the player screen now comes at 28-34 s. MAIN's
+  RTOS tick runs at its real 1000 Hz;
+  what remains is MAIN's own boot sequence and its device time-outs, which
+  are real firmware time-outs. See "Speed" in RUNNING.md for the numbers and
+  the knobs.
+- **It can still die at `0x00b99196`.** The GUI board's long-standing double
+  fault is a link race: the interpreter is still thirty times slower than the
+  real chip on real work, an announcement-plus-payload transaction takes it
+  longer than MAIN's status interval, and the next plain record lands on the
+  validated announcement. The launchers now run the simulator with
+  `BFIN_LINK_ANNOUNCE_STICKY=1`, which carries the announcement over until the
+  payload has gone through: measured on the wall-clock time base, four of six
+  90 s boots faulted without it and none of three with it. Three runs is a
+  small sample; if the panel freezes and the launcher reports `simulator
+  exited with code 1`, that is what happened, and the fault line is in the
+  simulator's log.
 - **Almost nothing is finished past booting.** See "What does not" below. If you
   need a working player, this is the wrong repository.
 
@@ -68,7 +77,11 @@ If you are here to build on it, that is exactly what it is for.
   and its caution store can be read back and decoded, so the machine can be
   asked what it thinks rather than guessed at.
 * An SD card image is accepted by the card controller and the guest reads
-  sectors from it.
+  sectors from it, and with `--sd card.img` the card is the source from the
+  start: its library -- categories, folders, playlists from the rekordbox
+  export -- is on the screen with the player screen, at 33-35 s. Switching
+  to it later, from another source, mostly is not (see "Switching to a
+  medium" in RUNNING.md).
 
 ## What does not
 
@@ -78,16 +91,31 @@ Be clear about this: **the player is not usable as a player.**
   after one to three minutes. The panel stops updating and the launcher says
   `simulator exited with code 1`. Run it again, and keep the machine quiet
   while you do -- see the note above.
-* **Speed.** Minutes, not seconds. Every measurement you take costs a run.
-* **The browse list does not come from the card.** MAIN answers every browse
-  request as `DISC` even with a card present, and the panel shows `NO CARD`.
-  Browse screens can be reached, but only by feeding the GUI canned MAIN
-  answers — which proves the GUI renders them, not that the machine produced
-  them.
-* **No track loading**, for the same reason.
+* **Speed.** Tens of seconds, not seconds. A boot to the idle player screen
+  costs 28-36 s; the GUI board runs on the wall clock and sleeps when the
+  firmware idles, so the host is mostly free while it waits.
+* **Switching sources after boot.** A source with nothing in it shows the
+  `Wait` platter and stays there. Switching to the card from a running
+  machine brings its library in 0.6-2.6 s in six runs of eight; in the
+  others MAIN answers the GUI's polls with a stale browse answer and the GUI
+  never learns of the key (see "Switching to a medium" in RUNNING.md). Give
+  a freshly inserted card ~25 s before its key. The card at launch is seven
+  of seven.
+* **No track loading.** The library lists come from the card; selecting a
+  track in them has not been driven, and there is no audio path.
 * **No audio at all.** The DSP is a register model with a position counter and
   no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
+  **Selecting `USB` shows the `Wait` platter and leaves it there**: the GUI
+  routes a source whose media state MAIN reports as zero to the platter
+  screen, and without a USB host MAIN reports zero for ever. Measured: the
+  platter appears six seconds after the key and turns at about 2.4 frames a
+  second, and the GUI's browse requests switch to the USB source a minute
+  later; MAIN meanwhile answers the GUI's ~60 requests a second in one burst
+  every 3.000 s. This is the two boards' link protocol, not emulation speed:
+  the GUI board runs at 2-5 MIPS throughout. `CDJ_USB_ABSENT=1` is not the
+  answer -- it adds the `E-7020: USB-B DEVICE ERROR` caution and the platter
+  stays. See "What the SOURCE key costs" in RUNNING.md for what was tried.
 * No link between players.
 
 Most inputs, measured properly against a control run, are proven no-ops on the

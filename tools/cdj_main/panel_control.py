@@ -421,8 +421,12 @@ def apply_analog(payload: bytearray, field: int, value: int) -> None:
 
 
 def button_mask(name: str) -> tuple[int, int]:
-    """Resolve 'sd', '19.1' or '19:02' to a (payload byte, mask) pair."""
-    key = name.strip().lower()
+    """Resolve 'sd', '19.1' or '19:02' to a (payload byte, mask) pair.
+
+    A suffix after '-' names a way of pressing the same bit -- '20.3-hold' is
+    MENU held down, the deck's UTILITY key -- and is not part of the bit.
+    """
+    key = name.strip().lower().split("-")[0]
     if key in BUTTON_NAMES:
         return BUTTON_NAMES[key]
     separator = "." if "." in key else (":" if ":" in key else None)

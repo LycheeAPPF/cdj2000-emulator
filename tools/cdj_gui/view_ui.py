@@ -235,13 +235,35 @@ def firmware_name(byte: int, bit: int) -> str:
     return panel_control.FIRMWARE_KEY_NAMES.get((byte, bit), "")
 
 
+# How long a click holds a key down.  MAIN copies the key level into the
+# status record it builds next, and it builds one every 3.05 s when nothing
+# else changes (measured on the link, menu2: 42.59, 45.61, 48.66 ...), so a
+# press lands only if it spans one of those.  The plan hold of 2 800 ms
+# (panel_control.PLAN_HOLD_MS) was chosen against a measurement plan's 10 s
+# attribution window and covers a 3.05 s cadence 92 times in 100; a click
+# has no such constraint, and 3 300 ms covers it every time.  The screen
+# follows the record: measured, the UTILITY menu (hold MENU) is drawn about
+# five seconds after the click, the Wait platter after a SOURCE key about
+# four.  Every press is therefore a long press as far as MAIN can tell; a
+# short one cannot be delivered on this link at all.
+WINDOW_HOLD_MS = 3300
+
+# A long press.  The firmware tells a short MENU from a held one by whether
+# the key is still down in the *next* status record, so on this link "held"
+# means held across two of MAIN's 3.05 s record builds.  Measured, MENU
+# alone: 1.5 s and 3.3 s open the CUE LINK box (the short-press function),
+# 7 s opens the UTILITY screen (its list empty: the entries are payloads
+# MAIN does not deliver).  6.5 s spans two builds wherever it starts.
+WINDOW_LONG_HOLD_MS = 6500
+
+
 def hardware_button(label: str, key: str, group: str, note: str) -> Control:
     """One front-panel key, resolved through the one naming table there is."""
     byte, mask = panel_control.button_mask(key)
     bit = mask.bit_length() - 1
     name = firmware_name(byte, bit)
     return Control(label, "%d.%d" % (byte, bit), "button", group,
-                   (panel_control.encode_press(byte, mask),),
+                   (panel_control.encode_press(byte, mask, WINDOW_HOLD_MS),),
                    "%s; MAIN calls it %s" % (note, name) if name else note)
 
 
@@ -265,6 +287,16 @@ def button_controls() -> list[Control]:
                 label, key, "top",
                 "decoded by 0x28e59a/0x28e44a and named by MAIN's SERVICE MODE "
                 "table"))
+    # UTILITY is not a key of its own: on the player it is MENU held down, and
+    # on this link "held down" means held across two of MAIN's 3 s status
+    # records (WINDOW_LONG_HOLD_MS).  A key of its own beside MENU says so
+    # without asking anyone to remember a modifier.
+    byte, mask = panel_control.button_mask("20.3")
+    controls.append(Control(
+        "UTILITY", "20.3-hold", "hold", "top",
+        (panel_control.encode_press(byte, mask, WINDOW_LONG_HOLD_MS),),
+        "MENU held down; the firmware calls it UTILITY when the key is still "
+        "down in the next status record"))
     for label, key in LEFT_BUTTONS:
         controls.append(hardware_button(
             label, key, "left",
@@ -274,7 +306,7 @@ def button_controls() -> list[Control]:
         name = firmware_name(byte, bit)
         controls.append(Control(
             "%d.%d" % (byte, bit), "%d.%d" % (byte, bit), "button", "bits",
-            (panel_control.encode_press(byte, 1 << bit),),
+            (panel_control.encode_press(byte, 1 << bit, WINDOW_HOLD_MS),),
             "decoded by 0x28e1ae" + ("; %s" % name if name else
                                      "; no name in MAIN's table")))
     return controls
@@ -442,6 +474,16 @@ class UiViewer:
         self.control_note = tk.StringVar(value="")
         self.status = tk.StringVar(value="Starting Blackfin firmware…")
         self.held: dict[tuple[int, int], Control] = {}
+        # Key -> the time its click's press is over (hold plus the board's
+        # gap).  The board queues presses one behind the other, so a click
+        # repeated while the first is still down does not land sooner: it
+        # lands 3.6 s later and, for a key that toggles something (MENU
+        # opens the UTILITY menu and closes it again), undoes the first.
+        # That is what made the menu "close again after a few seconds"
+        # under repeated clicking.  A click inside the window is refused
+        # with the time left, and the screen is expected a few seconds
+        # after that.
+        self.in_flight: dict[str, float] = {}
         self.analog_value: dict[int, tk.StringVar] = {}
         self.analog_position: dict[int, tk.DoubleVar] = {}
         self.analog_touch: dict[int, tk.BooleanVar] = {}
@@ -625,6 +667,10 @@ class UiViewer:
         """
         button = ttk.Button(parent, text=button_text(control), width=11,
                             command=lambda: self.click(control))
+        # Shift-click holds the key long enough to count as held (UTILITY on
+        # MENU); "break" keeps the plain click from firing on top of it.
+        button.bind("<Shift-Button-1>",
+                    lambda _event, c=control: self.long_press(c) or "break")
         if control.input_id is None:
             button.configure(style="Unbound.TButton")
         return button
@@ -640,8 +686,9 @@ class UiViewer:
         """
         verdicts = manifest_verdicts()
         box = ttk.LabelFrame(parent, text="panel bits — MAIN's own names, then "
-                                          "INPUT_MANIFEST.md; right-click holds "
-                                          "a bit down",
+                                          "INPUT_MANIFEST.md; Shift-click is a "
+                                          "long press, right-click holds a bit "
+                                          "down",
                              padding=6)
         box.grid(row=0, column=0, sticky="ew")
         # Two columns since the inventory went from 22 bits to 40: one column of
@@ -659,6 +706,8 @@ class UiViewer:
             # them from here those two verbs existed and nobody could use them.
             button.bind("<Button-3>",
                         lambda _event, c=control: self.toggle_hold(c))
+            button.bind("<Shift-Button-1>",
+                        lambda _event, c=control: self.long_press(c) or "break")
             button.grid(row=row, column=column, pady=1)
             verdict, world = verdicts.get(control.input_id, ("", ""))
             # The run name is part of the finding, not decoration: 18.1 is
@@ -792,10 +841,49 @@ class UiViewer:
         return reply
 
     def click(self, control: Control) -> None:
+        if control.kind == "hold" and control.input_id is not None:
+            self.long_press(control)
+            return
+        if control.kind == "button" and control.input_id is not None:
+            self.press(control, WINDOW_HOLD_MS,
+                       "the screen follows about 5 s after the click")
+            return
         if control.lines:
             self.send(control, control.lines[0])
         else:
             self.send(control, "")
+
+    def long_press(self, control: Control) -> None:
+        """Shift-click, or the UTILITY key: down across two status records."""
+        if control.kind not in ("button", "hold") or control.input_id is None:
+            self.click(control)
+            return
+        self.press(control, WINDOW_LONG_HOLD_MS,
+                   "a long press, held across two of MAIN's 3 s status "
+                   "records; UTILITY on MENU follows a few seconds after "
+                   "release")
+
+    def press(self, control: Control, hold_ms: int, then: str) -> None:
+        """One press of `hold_ms`, refused while the previous one is down."""
+        now = time.monotonic()
+        # "20.3-hold" is the same key as "20.3"; a press of either is a press
+        # of the bit, and the other must wait for it too.
+        bit_id = control.input_id.split("-")[0]
+        over = self.in_flight.get(bit_id, 0.0)
+        if now < over:
+            self.control_note.set(
+                "%s: press still down for %.1f s -- MAIN samples it into "
+                "its next status record and the screen follows a few "
+                "seconds later; a second press would undo a toggle like "
+                "MENU" % (control.label, over - now))
+            return
+        byte, mask = panel_control.button_mask(bit_id)
+        if self.send(control, panel_control.encode_press(byte, mask,
+                                                         hold_ms)) is not None:
+            self.in_flight[bit_id] = (
+                now + panel_control.press_period_s(hold_ms))
+            self.control_note.set("%s: held %.1f s; %s"
+                                  % (control.label, hold_ms / 1000.0, then))
 
     def toggle_hold(self, control: Control) -> None:
         """Right-click: hold the bit down, right-click again to release it."""
@@ -924,7 +1012,6 @@ class UiViewer:
             {
                 "BFIN_GUI_OUTPUT": str(output),
                 "BFIN_GUI_HEIGHT": str(self.args.height),
-                "BFIN_PPI_DMA_DELAY": str(self.args.ppi_delay),
                 "BFIN_FAST_LZSS": str(
                     (FIRMWARE / "gui-flash-image.bin").resolve()
                 ),
@@ -952,11 +1039,17 @@ class UiViewer:
             board_path(self.args.board),
             simulator_path(self.args.elf),
         ]
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        creationflags = ((subprocess.CREATE_NO_WINDOW
+                          | subprocess.ABOVE_NORMAL_PRIORITY_CLASS)
+                         if sys.platform == "win32" else 0)
         self.process = subprocess.Popen(
             command,
             cwd=REPO_ROOT,
             env=env,
+            # No console for the simulator: the UART model polls stdin
+            # (bfin_uart_get_status -> sim_io_poll_read), and on MinGW that
+            # read blocks inside the run loop if a console is attached.
+            stdin=subprocess.DEVNULL,
             stdout=self.log_stream,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
@@ -1080,7 +1173,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "costs ~8 ms and the board publishes ~32 fps "
                              "under the live link, so the old 100 ms dropped "
                              "roughly three frames in four")
-    parser.add_argument("--ppi-delay", type=int, default=50000)
+    parser.add_argument("--ppi-delay", type=int, default=0,
+                        help="ticks per display scanline (BFIN_PPI_DMA_DELAY); "
+                             "0, the default, lets the simulator pace the "
+                             "display per frame on its wall-clock time base")
     parser.add_argument("--control-port", type=int, default=0,
                         help="port of MAIN's CDJ_INPUT_PORT control channel; "
                              "0 leaves the controls refusing rather than inert")
@@ -1102,8 +1198,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         path = getattr(args, name)
         if not path.exists():
             parser.error(f"{name} does not exist: {path}")
-    if args.height <= 0 or args.scale <= 0 or args.ppi_delay <= 0:
-        parser.error("height, scale, and ppi-delay must be positive")
+    if args.height <= 0 or args.scale <= 0 or args.ppi_delay < 0:
+        parser.error("height and scale must be positive, ppi-delay 0 or more")
     if args.refresh_ms < 5:
         parser.error("refresh-ms below 5 spends the whole Tk main loop looking "
                      "for frames; one pass costs about 8 ms")

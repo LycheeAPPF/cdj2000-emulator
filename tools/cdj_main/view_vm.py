@@ -127,7 +127,7 @@ def main() -> int:
     parser.add_argument("--source-key", choices=sorted(SOURCE_KEYS), default=None,
                         help="press a SOURCE key on the panel; defaults to 'sd' "
                              "when a card image is given")
-    parser.add_argument("--source-key-at", type=float, default=40.0,
+    parser.add_argument("--source-key-at", type=float, default=None,
                         help="virtual seconds at which to press it")
     parser.add_argument("--control-port", type=int, default=CONTROL_PORT,
                         help="port for MAIN's runtime panel control channel "
@@ -179,6 +179,14 @@ def main() -> int:
         return 2
 
     source_key = args.source_key or ("sd" if args.sd else None)
+    # A card that is the source before the GUI's first browse gives the
+    # card's library with the player screen (measured: 2 of 2, at 33 s);
+    # a card selected after it meets the GUI's browse loop for the boot
+    # source and the key is lost more often than not (1 of 6, see
+    # RUNNING.md, "Switching to a medium").  So with a card and no other
+    # instruction the card goes in at 10 s and its key is pressed at 12 s.
+    if args.source_key_at is None:
+        args.source_key_at = 12.0 if (args.sd and source_key == "sd") else 40.0
     keys = os.environ.get("CDJ_PANEL_KEYS", "")
     if source_key and not keys:
         keys = "%g:19:%02x" % (args.source_key_at, SOURCE_KEYS[source_key])
@@ -199,8 +207,13 @@ def main() -> int:
                 "-monitor", f"telnet:127.0.0.1:{PORT + 1},server,nowait",
                 *(["-drive", f"if=sd,format=raw,file={args.sd}"] if args.sd else []),
             ],
-            env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "270000000"),
-                     CDJ_SD_INSERT=os.environ.get("CDJ_SD_INSERT", "25"),
+            env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "54000000"),
+                     CDJ_SD_INSERT=os.environ.get("CDJ_SD_INSERT",
+                                              "10" if args.sd else "25"),
+                 # A press lands only if MAIN builds a status record while
+                 # the key is down, every 3.05 s when nothing else changes;
+                 # the board's own 300 ms never spans one.
+                 CDJ_PANEL_HOLD_MS=os.environ.get("CDJ_PANEL_HOLD_MS", "3300"),
                      CDJ_PANEL_KEYS=keys,
                      # Unset means no socket, no poll, no merge: cdj2000_input.c
                      # is inert and the run is indistinguishable from one built
@@ -250,13 +263,11 @@ def main() -> int:
     if control_port and not args.no_main:
         command += ["--control-port", str(control_port)]
     if not args.no_main:
-        # The DMAC's retry interval after a receive with nothing to hand over.
-        # The live link genuinely waits for MAIN, so the 50000 default throttles
-        # the whole machine: 69 requests in 150 s against 2238 at 2000.
-        command += ["--ppi-delay", "2000"]
-    if not args.no_main:
         command += [
             "--env", f"BFIN_MAIN_LINK=127.0.0.1:{PORT}",
+            # See boot_vm.py: without this the GUI double-faults at
+            # 0x00b99196 in most boots on the wall-clock time base.
+            "--env", "BFIN_LINK_ANNOUNCE_STICKY=1",
             # A real MAIN is already transmitting when the GUI boots, so the
             # peer answers until the link takes over.
             "--env", "BFIN_MAIN_PEER=1",

@@ -42,9 +42,12 @@ environment variable, so an unconfigured simulator behaves as it does upstream.
                         or ERR is pending and drops only when firmware
                         acknowledges those bits, so a zero-length pulse can no
                         longer be lost before the CEC services the SIC and leave
-                        a receive task asleep for good.  BFIN_PPI_DMA_DELAY
-                        paces the display DMA; without it the LCD consumes one
-                        hardware event per simulated cycle.
+                        a receive task asleep for good.  On the wall-clock time
+                        base the display DMA is paced per frame (BFIN_PPI_FPS)
+                        and a receive with nothing to hand over retries after
+                        BFIN_SPORT_RETRY_US; BFIN_PPI_DMA_DELAY still forces a
+                        per-line tick count.  The environment is read once, not
+                        several times per DMA event.
 
   sim/bfin/bfin-sim.c   Packet write-back semantics for parallel-issue
   sim/bfin/bfin-sim.h   containers (BFIN_PARALLEL_WRITEBACK), a host-side fast
@@ -52,6 +55,13 @@ environment variable, so an unconfigured simulator behaves as it does upstream.
                         (BFIN_FAST_LZSS), and the observation tools the board
                         work needed: a PC ring and sampler, PC hit counters,
                         call and memory watches, and register/memory injection.
+                        All of those probes sit behind one gate
+                        (bfin_probes_active) that is set when any of their
+                        variables is, so a plain run pays one branch per
+                        instruction for them.  Guest loads, stores and fetches
+                        go through a page cache of host pointers for plain
+                        memory (bfin_fast_host) instead of the core's one
+                        mapping walk per byte; BFIN_MEM_FAST=0 disables it.
 
   sim/common/sim-load.c A loaded section that was only partly written is
                         indistinguishable from one fully written, because the
@@ -62,19 +72,41 @@ environment variable, so an unconfigured simulator behaves as it does upstream.
   sim/common/sim-core.c SIM_CORE_CENSUS=<lo>:<hi> names which mapping served
                         each stretch of a write.  A hw device that accepts bytes
                         and drops them still returns a full count, so "written
-                        == requested" does not mean "stored".
+                        == requested" does not mean "stored".  A stretch of
+                        plain memory is copied in one memcpy rather than one
+                        byte per mapping walk, and sim_core_generation counts
+                        attaches and detaches so a cache of host pointers can
+                        notice the EBIU re-attaching its banks.
 
   sim/bfin/dv-bfin_cec.c
   sim/bfin/dv-bfin_mmu.c
   sim/bfin/dv-bfin_gpio.c
   sim/bfin/machs.c      Exception and CPLB tracing, a GPIO PF0 flash-ready
                         toggle (BFIN_GPIO5_READY_TOGGLE) for the boot handshake,
-                        and the BF531 wiring the board needs.
+                        and the BF531 wiring the board needs.  The MMU keeps a
+                        memo of the last CPLB entry that matched, per table, so
+                        an access inside that page with a permission the entry
+                        grants skips the sixteen-entry walk; any write to the
+                        MMU's registers empties it.
 
-  sim/bfin/interp.c     A comment only.  It records why the guest idle loop must
-                        not be optimised away: guest time advances per
-                        instruction executed, and two attempts at skipping it
-                        made boot slower.
+  sim/bfin/interp.c     Guest time on the wall clock (BFIN_TIME_BASE=wall, the
+  sim/bfin/sim-main.h   default): ticks are delivered at BFIN_CCLK_HZ per
+                        second instead of one per instruction, and a parked
+                        CPU -- the firmware's jump-to-itself idle loop, or
+                        IDLE -- sleeps until the next event or the next record
+                        from MAIN.  Upstream's time base was the interpreter's
+                        own speed, a tenth of real time here, and every
+                        firmware delay stretched with it.  sim-main.h silences
+                        the event queue's own poll event, which at 400 MHz
+                        would wake a sleeping run a hundred thousand times a
+                        second.  Also here: BFIN_STATS, BFIN_EXIT_AFTER_WALL
+                        and BFIN_EXIT_AFTER_TICKS for measuring the simulator,
+                        and the page cache behind the memory fast path.
+
+  sim/bfin/dv-bfin_ctimer.c
+                        Reports once what the firmware programs its core timer
+                        for, which is how BFIN_CCLK_HZ was confirmed
+                        (TPERIOD 400000 for a 1 ms tick).
 
 Not included: sim/sh/ also carries changes in the tree this came from -- an
 attempt to run the CDJ's MAIN board on the SH simulator rather than on QEMU.
@@ -82,8 +114,9 @@ That line of work is not part of this emulator and is left out deliberately.
 
 Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 
---- a/sim/bfin/bfin-sim.c
-+++ b/sim/bfin/bfin-sim.c
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/bfin-sim.c gdb-17.2/sim/bfin/bfin-sim.c
+--- a/sim/bfin/bfin-sim.c	2026-09-02 15:08:11.434125700 +0200
++++ b/sim/bfin/bfin-sim.c	2026-09-02 15:01:17.834525000 +0200
 @@ -36,6 +36,662 @@
  
  #define HOST_LONG_WORD_SIZE (sizeof (long) * 8)
@@ -229,7 +262,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +}
 +
 +void
-+bfin_trace_framebuffer_store (SIM_CPU *cpu, bu32 addr, bu32 value,
++bfin_trace_framebuffer_store_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
 +			      unsigned bytes)
 +{
 +  static int enabled = -1;
@@ -625,7 +658,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +}
 +
 +void
-+bfin_trace_gui_state_read (SIM_CPU *cpu, bu32 addr, bu32 value,
++bfin_trace_gui_state_read_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
 +			   unsigned bytes)
 +{
 +  static int enabled = -1;
@@ -687,7 +720,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +   copies appear exactly once each and in program order.  */
 +
 +void
-+bfin_trace_gui_state_write (SIM_CPU *cpu, bu32 addr, bu32 value,
++bfin_trace_gui_state_write_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
 +			    unsigned bytes)
 +{
 +  static int initialized;
@@ -773,7 +806,32 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    while (1)
      cec_exception (cpu, VEC_UNDEF_I);
  }
-@@ -554,6 +1229,37 @@
+@@ -195,11 +870,24 @@
+   { "huimm32e",  32, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+ };
+ 
++/* Whether the instruction text is wanted at all.  Every decoder builds the
++   operand strings of the instruction it executes -- `val_str = imm16_str
++   (hword)` and the like, a sprintf each -- and the only reader of those
++   strings is TRACE_INSN, which is off in every run that is not a trace.
++   Measured with the sampling profiler on a plain boot: the formatting
++   was 8 % of the run thread, more than the MMU check.  interp_insn_bfin
++   sets this once per instruction from TRACE_INSN_P; an empty string is
++   what a decoder gets when nothing will print it.  */
++static int bfin_insn_text;
++
+ static const char *
+ fmtconst_str (const_forms_t cf, bs32 x, bu32 pc)
+ {
+   static char buf[60];
+ 
++  if (!bfin_insn_text)
++    return "";
++
+   if (constant_formats[cf].reloc)
+     {
+ #if 0
+@@ -554,6 +1242,37 @@
      queue_store (cpu, &(X), (Y)); \
    } while (0)
  
@@ -811,202 +869,118 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  static void
  setflags_nz (SIM_CPU *cpu, bu32 val)
  {
-@@ -6436,9 +7142,2047 @@
- bu32
- interp_insn_bfin (SIM_CPU *cpu, bu32 pc)
- {
-+  static int pc_sample_enabled = -1;
-+  static unsigned pc_sample_countdown = 10000000;
-+  static unsigned pc_sample_interval = 10000000;
-+  static unsigned pc_sample_number;
-+  static bool resource_dumped;
-+  static bu32 resource_dump_pc = 0x00b81e3c;
-+  static bool object_dumped;
-   int i;
-   bu32 insn_len;
+@@ -1843,11 +2562,22 @@
+       if (PARALLEL_GROUP != BFIN_PARALLEL_NONE)
+ 	illegal_instruction_combination (cpu);
  
-+  /* The CDJ-2000 GUI expands ten large, already-verified resource banks with
-+     the routine at 0x00b832cc.  Interpreting that byte loop costs several
-+     minutes on the host.  Keep firmware ordering intact, but optionally run
-+     the identical 4 KiB-window LZSS operation natively at the call boundary.  */
-+  if (pc == 0x00b832cc && getenv ("BFIN_FAST_LZSS"))
+-      /* Timewarp !  */
+-      if (events->queue)
+-	CYCLE_DELAY = events->time_from_event;
++      /* A wake-up that is already asserted -- the PLL locked while the
++	 core was still on its way here, which on the wall-clock time base
++	 it always has, the lock taking 8 us -- ends the IDLE at once, as
++	 SIC_IWR does on the chip.  Otherwise timewarp!  On the wall-clock
++	 time base the run loop sleeps instead (interp.c); CYCLE_DELAY is
++	 not what advances time there.  */
++      if (bfin_idle_wake_pending)
++	bfin_idle_wake_pending = 0;
+       else
+-	abort (); /* XXX: Should this ever happen ?  */
++	{
++	  bfin_idle_hint = 1;
++	  if (events->queue)
++	    CYCLE_DELAY = events->time_from_event;
++	  else
++	    abort (); /* XXX: Should this ever happen ?  */
++	}
+     }
+   else if (prgfunc == 2 && poprnd == 3)
+     {
+@@ -6433,17 +7163,2163 @@
+   return insn_len;
+ }
+ 
++
++/* The CDJ probes: every environment-gated diagnostic that used to run inline
++   before and after each instruction, and the three trace hooks on every guest
++   memory access.  None of them does anything unless its BFIN_* variable is
++   set, but "nothing" still cost ~25 branches, an out-of-line call and three
++   clobbered register sets per instruction on the hottest path in the
++   simulator.
++
++   bfin_probes_active is decided once, from the environment, and is the only
++   test left on the fast path.  It is 1 if any variable in bfin_probe_vars is
++   set, so a probe run behaves exactly as before; it is 0 for a plain run.
++   A new probe must add its variable to the list, or it will never run.  */
++
++int bfin_probes_active = -1;
++
++static const char *const bfin_probe_vars[] = {
++  /* interp_insn_bfin, before the dispatch */
++  "BFIN_BLIT_TRACE", "BFIN_BLIT_TRACE_LIMIT",
++  "BFIN_CALL_WATCH", "BFIN_CALL_WATCH_DUMP", "BFIN_CALL_WATCH_LIMIT",
++  "BFIN_CALL_WATCH_SNAP", "BFIN_CALL_WATCH_SNAP_BASE",
++  "BFIN_CLEAR_SUBMODE",
++  "BFIN_FORCE_ROUTER", "BFIN_FORCE_ROUTER_AFTER",
++  "BFIN_INJECT", "BFIN_INJECT_AT",
++  "BFIN_OBJECT_DUMP",
++  "BFIN_PC_COUNT", "BFIN_PC_COUNT_EVERY",
++  "BFIN_PC_HIST",
++  "BFIN_PC_SAMPLE_INTERVAL", "BFIN_PC_SAMPLE_TRACE",
++  "BFIN_RECORD_TRACE",
++  "BFIN_RESOURCE_DUMP_PC", "BFIN_RESOURCE_DUMP_PREFIX",
++  "BFIN_ROUTER_TRACE",
++  "BFIN_SKIP_WIDGET", "BFIN_SKIP_WINDOW",
++  "BFIN_STEP_TRACE",
++  "BFIN_SURFACE_DUMP", "BFIN_SURFACE_DUMP_EVERY", "BFIN_SURFACE_DUMP_PC",
++  "BFIN_SURFACE_DUMP_PREFIX",
++  "BFIN_WIDGET_TRACE",
++  /* bfin_pc_ring_record and the peek/poke watches */
++  "BFIN_PC_PEEK", "BFIN_PC_PEEK_AT", "BFIN_PC_RING", "BFIN_PC_RING_DUMP_PC",
++  "BFIN_PEEK_WATCH", "BFIN_PEEK_WATCH_LIMIT",
++  "BFIN_POKE", "BFIN_POKE_AT_PC", "BFIN_POKE_LIMIT",
++  /* the memory access hooks */
++  "BFIN_FRAMEBUFFER_WRITE_TRACE", "BFIN_FRAMEBUFFER_TARGET",
++  "BFIN_TARGET_TRACE_ZERO", "BFIN_TARGET_TRACE_LIMIT",
++  "BFIN_TARGET_TRACE_IGNORE", "BFIN_TARGET_DUMP_AFTER",
++  "BFIN_TARGET_DUMP_PREFIX",
++  "BFIN_GUI_STATE_READ_TRACE", "BFIN_HOUSEKEEPING_READ_TRACE",
++  "BFIN_BOOTSTRAP_READ_TRACE",
++  "BFIN_GUI_STATE_READ_START", "BFIN_GUI_STATE_READ_END",
++  "BFIN_GUI_STATE_WRITE_START", "BFIN_GUI_STATE_WRITE_END",
++  "BFIN_GUI_STATE_WRITE_LIMIT", "BFIN_GUI_STATE_WRITE_STACK",
++  /* step_once in interp.c */
++  "BFIN_GUI_STATE_TRACE",
++  NULL
++};
++
++void
++bfin_probes_init (void)
++{
++  const char *const *name;
++
++  bfin_probes_active = 0;
++  for (name = bfin_probe_vars; *name; ++name)
 +    {
-+      SIM_DESC sd = CPU_STATE (cpu);
-+      const char *flash_path = getenv ("BFIN_FAST_LZSS");
-+      static unsigned char *flash_image;
-+      static size_t flash_size;
-+      bu32 source = DREG (0);
-+      bu32 destination = DREG (1);
-+      bu32 output_size = DREG (2);
-+      bu32 packed_size = 0;
-+      unsigned char *packed;
-+      unsigned char *output;
-+      unsigned char window[4096];
-+      unsigned source_position = 0;
-+      unsigned output_position = 0;
-+      unsigned write_position = 4096 - 18;
-+      unsigned flags = 0;
-+      static const struct { bu32 source, packed, output; } banks[] =
-+        {
-+          { 0x200ebba0, 0x39d55, 0xf8853 },
-+          { 0x201258f5, 0x12a4d, 0x6a692 },
-+          { 0x20138342, 0x007b4, 0x02000 },
-+          { 0x20138af6, 0x00749, 0x02000 },
-+          { 0x2013923f, 0x0078a, 0x02000 },
-+          { 0x201399c9, 0x0077f, 0x02000 },
-+          { 0x2013a148, 0x007b2, 0x02000 },
-+          { 0x2013a8fa, 0x23d23, 0x36400 },
-+          { 0x2015e61d, 0x06b12, 0x1d600 },
-+          { 0x2016512f, 0x73ed8, 0xa7700 },
-+        };
-+      unsigned bank;
-+
-+      /* The table above is the STOCK image's bank layout.  A patched image that
-+         inserts anything ahead of the resource tail moves every one of these
-+         sources, nothing matches, the accelerator declines, and the guest's own
-+         decompressor then reads flash the ELF never maps -- so every bank
-+         unpacks out of the still-empty 0x20-filled window and the font becomes
-+         vertical bars.  That is a property of this shortcut, not of the image.
-+         BFIN_FAST_LZSS_SHIFT=<bytes> moves the table with the image.  */
-+      {
-+        const char *shift_env = getenv ("BFIN_FAST_LZSS_SHIFT");
-+        bu32 shift = shift_env && *shift_env
-+                     ? (bu32) strtoul (shift_env, NULL, 0) : 0;
-+
-+        for (bank = 0; bank < ARRAY_SIZE (banks); ++bank)
-+          if (banks[bank].source + shift == source
-+              && banks[bank].output == output_size)
-+            {
-+              packed_size = banks[bank].packed;
-+              break;
-+            }
-+      }
-+      if (packed_size == 0)
-+        goto normal_interpretation;
-+
-+      if (!flash_image)
-+        {
-+          FILE *flash = fopen (flash_path, "rb");
-+          long size;
-+          if (!flash || fseek (flash, 0, SEEK_END) != 0
-+              || (size = ftell (flash)) < 0 || fseek (flash, 0, SEEK_SET) != 0)
-+            {
-+              if (flash)
-+                fclose (flash);
-+              goto normal_interpretation;
-+            }
-+          flash_image = xmalloc ((size_t) size);
-+          flash_size = (size_t) size;
-+          if (fread (flash_image, 1, flash_size, flash) != flash_size)
-+            {
-+              fclose (flash);
-+              free (flash_image);
-+              flash_image = NULL;
-+              flash_size = 0;
-+              goto normal_interpretation;
-+            }
-+          fclose (flash);
-+        }
-+      if ((source & 0x1fffff) + packed_size > flash_size)
-+        goto normal_interpretation;
-+      packed = xmalloc (packed_size);
-+      output = xmalloc (output_size);
-+      /* Match the firmware's window exactly.  FUN_00b832cc fills its buffer at
-+	 0x58ae68 with 0x20 for 1019 words plus one halfword -- 4078 bytes, not
-+	 4096 -- while its indices still wrap at 4096, so the last 18 bytes are
-+	 whatever the RAM held (zero here).  Filling all 4096 with spaces makes
-+	 every back-reference that reaches into that tail decode differently,
-+	 which corrupts small, scattered regions of an otherwise correct bank:
-+	 the TRACK/REMAIN/BPM label bitmaps came out as garbage while their
-+	 immediate neighbours were pixel-perfect.  */
-+      memset (window, ' ', 4096 - 18);
-+      memset (window + 4096 - 18, 0, 18);
-+      memcpy (packed, flash_image + (source & 0x1fffff), packed_size);
-+
-+      while (source_position < packed_size && output_position < output_size)
-+        {
-+          flags >>= 1;
-+          if (!(flags & 0x100))
-+            flags = packed[source_position++] | 0xff00;
-+          if (flags & 1)
-+            {
-+              unsigned char value;
-+              if (source_position >= packed_size)
-+                break;
-+              value = packed[source_position++];
-+              output[output_position++] = value;
-+              window[write_position] = value;
-+              write_position = (write_position + 1) & 4095;
-+            }
-+          else
-+            {
-+              unsigned read_position;
-+              unsigned count;
-+              unsigned offset;
-+              if (source_position + 1 >= packed_size)
-+                break;
-+              read_position = (packed[source_position]
-+                               | ((packed[source_position + 1] & 0xf0) << 4));
-+              count = (packed[source_position + 1] & 0x0f) + 3;
-+              source_position += 2;
-+              for (offset = 0; offset < count && output_position < output_size;
-+                   ++offset)
-+                {
-+                  unsigned char value = window[(read_position + offset) & 4095];
-+                  output[output_position++] = value;
-+                  window[write_position] = value;
-+                  write_position = (write_position + 1) & 4095;
-+                }
-+            }
-+        }
-+      if (output_position != output_size)
-+        {
-+          fprintf (stderr,
-+                   "fast LZSS decode mismatch source=%#x got=%#x expected=%#x\n",
-+                   source, output_position, output_size);
-+          free (output);
-+          free (packed);
-+          goto normal_interpretation;
-+        }
-+      for (output_position = 0; output_position < output_size;
-+           output_position += 4096)
-+        {
-+          unsigned amount = min (4096, output_size - output_position);
-+          if (sim_write (sd, destination + output_position,
-+                         output + output_position, amount) != amount)
-+            {
-+              fprintf (stderr,
-+                       "fast LZSS write mismatch destination=%#x offset=%#x\n",
-+                       destination, output_position);
-+              free (output);
-+              free (packed);
-+              goto normal_interpretation;
-+            }
-+        }
-+      if (getenv ("BFIN_FAST_LZSS_TRACE"))
-+        {
-+          /* run_headless stops the simulator with a hard terminate, and a
-+             redirected stderr is fully buffered on Windows, so an unflushed
-+             line is simply lost.  A silent trace then reads exactly like
-+             "this code never ran" -- a wrong conclusion this already cost
-+             one session.  BFIN_CALL_WATCH flushes for the same reason.  */
-+          fprintf (stderr,
-+                   "fast LZSS source=%#x destination=%#x output=%#x\n",
-+                   source, destination, output_size);
-+          fflush (stderr);
-+        }
-+      free (output);
-+      free (packed);
-+      BFIN_CPU_STATE.did_jump = true;
-+      SET_PCREG (RETSREG);
-+      return 2;
++      const char *value = getenv (*name);
++      if (value && *value)
++	{
++	  bfin_probes_active = 1;
++	  fprintf (stderr, "bfin: probes on (%s is set)\n", *name);
++	  fflush (stderr);
++	  break;
++	}
 +    }
++}
 +
-+  /* The GUI composites nine window objects (base 0x588224, stride 0x180)
-+     through the dispatcher at 0xba0320, which receives the object pointer in
-+     R0.  Optionally suppress a window's draw so its screen contribution can be
-+     isolated (diff against a full render) and, ultimately, routed to a
-+     separate output (e.g. the jog-wheel LCD).  BFIN_SKIP_WINDOW=<obj>[,<obj>].  */
++/* What ran before the dispatch, verbatim.  Four of these probes skip the
++   instruction (BFIN_SKIP_WINDOW, BFIN_SKIP_WIDGET, BFIN_FORCE_ROUTER,
++   BFIN_INJECT): they set the PC themselves and return the length the
++   caller should report.  -1 means "nothing happened, dispatch".  */
++static int
++bfin_cdj_probes_before (SIM_CPU *cpu, bu32 pc)
++{
++
 +  if (pc == 0xba0340)
 +    {
 +      static int sw_initialized;
@@ -2652,8 +2626,21 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +      }
 +  }
 +
-+ normal_interpretation:
++  return -1;
++}
 +
++/* What ran after the normal_interpretation label, verbatim.  */
++static void
++bfin_cdj_probes_after (SIM_CPU *cpu, bu32 pc)
++{
++
++  static int pc_sample_enabled = -1;
++  static unsigned pc_sample_countdown = 10000000;
++  static unsigned pc_sample_interval = 10000000;
++  static unsigned pc_sample_number;
++  static bool resource_dumped;
++  static bu32 resource_dump_pc = 0x00b81e3c;
++  static bool object_dumped;
 +  bfin_pc_ring_record (cpu, pc);
 +
 +  /* Call-RATE measurement, counting only.  BFIN_CALL_WATCH prints (and
@@ -2856,45 +2843,419 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +      object_dumped = true;
 +    }
 +
++}
++
+ bu32
+ interp_insn_bfin (SIM_CPU *cpu, bu32 pc)
+ {
+   int i;
+   bu32 insn_len;
+ 
++  if (__builtin_expect (bfin_probes_active < 0, 0))
++    bfin_probes_init ();
++
++
++  /* The CDJ-2000 GUI expands ten large, already-verified resource banks with
++     the routine at 0x00b832cc.  Interpreting that byte loop costs several
++     minutes on the host.  Keep firmware ordering intact, but optionally run
++     the identical 4 KiB-window LZSS operation natively at the call boundary.  */
++  if (pc == 0x00b832cc && getenv ("BFIN_FAST_LZSS"))
++    {
++      SIM_DESC sd = CPU_STATE (cpu);
++      const char *flash_path = getenv ("BFIN_FAST_LZSS");
++      static unsigned char *flash_image;
++      static size_t flash_size;
++      bu32 source = DREG (0);
++      bu32 destination = DREG (1);
++      bu32 output_size = DREG (2);
++      bu32 packed_size = 0;
++      unsigned char *packed;
++      unsigned char *output;
++      unsigned char window[4096];
++      unsigned source_position = 0;
++      unsigned output_position = 0;
++      unsigned write_position = 4096 - 18;
++      unsigned flags = 0;
++      static const struct { bu32 source, packed, output; } banks[] =
++        {
++          { 0x200ebba0, 0x39d55, 0xf8853 },
++          { 0x201258f5, 0x12a4d, 0x6a692 },
++          { 0x20138342, 0x007b4, 0x02000 },
++          { 0x20138af6, 0x00749, 0x02000 },
++          { 0x2013923f, 0x0078a, 0x02000 },
++          { 0x201399c9, 0x0077f, 0x02000 },
++          { 0x2013a148, 0x007b2, 0x02000 },
++          { 0x2013a8fa, 0x23d23, 0x36400 },
++          { 0x2015e61d, 0x06b12, 0x1d600 },
++          { 0x2016512f, 0x73ed8, 0xa7700 },
++        };
++      unsigned bank;
++
++      /* The table above is the STOCK image's bank layout.  A patched image that
++         inserts anything ahead of the resource tail moves every one of these
++         sources, nothing matches, the accelerator declines, and the guest's own
++         decompressor then reads flash the ELF never maps -- so every bank
++         unpacks out of the still-empty 0x20-filled window and the font becomes
++         vertical bars.  That is a property of this shortcut, not of the image.
++         BFIN_FAST_LZSS_SHIFT=<bytes> moves the table with the image.  */
++      {
++        const char *shift_env = getenv ("BFIN_FAST_LZSS_SHIFT");
++        bu32 shift = shift_env && *shift_env
++                     ? (bu32) strtoul (shift_env, NULL, 0) : 0;
++
++        for (bank = 0; bank < ARRAY_SIZE (banks); ++bank)
++          if (banks[bank].source + shift == source
++              && banks[bank].output == output_size)
++            {
++              packed_size = banks[bank].packed;
++              break;
++            }
++      }
++      if (packed_size == 0)
++        goto normal_interpretation;
++
++      if (!flash_image)
++        {
++          FILE *flash = fopen (flash_path, "rb");
++          long size;
++          if (!flash || fseek (flash, 0, SEEK_END) != 0
++              || (size = ftell (flash)) < 0 || fseek (flash, 0, SEEK_SET) != 0)
++            {
++              if (flash)
++                fclose (flash);
++              goto normal_interpretation;
++            }
++          flash_image = xmalloc ((size_t) size);
++          flash_size = (size_t) size;
++          if (fread (flash_image, 1, flash_size, flash) != flash_size)
++            {
++              fclose (flash);
++              free (flash_image);
++              flash_image = NULL;
++              flash_size = 0;
++              goto normal_interpretation;
++            }
++          fclose (flash);
++        }
++      if ((source & 0x1fffff) + packed_size > flash_size)
++        goto normal_interpretation;
++      packed = xmalloc (packed_size);
++      output = xmalloc (output_size);
++      /* Match the firmware's window exactly.  FUN_00b832cc fills its buffer at
++	 0x58ae68 with 0x20 for 1019 words plus one halfword -- 4078 bytes, not
++	 4096 -- while its indices still wrap at 4096, so the last 18 bytes are
++	 whatever the RAM held (zero here).  Filling all 4096 with spaces makes
++	 every back-reference that reaches into that tail decode differently,
++	 which corrupts small, scattered regions of an otherwise correct bank:
++	 the TRACK/REMAIN/BPM label bitmaps came out as garbage while their
++	 immediate neighbours were pixel-perfect.  */
++      memset (window, ' ', 4096 - 18);
++      memset (window + 4096 - 18, 0, 18);
++      memcpy (packed, flash_image + (source & 0x1fffff), packed_size);
++
++      while (source_position < packed_size && output_position < output_size)
++        {
++          flags >>= 1;
++          if (!(flags & 0x100))
++            flags = packed[source_position++] | 0xff00;
++          if (flags & 1)
++            {
++              unsigned char value;
++              if (source_position >= packed_size)
++                break;
++              value = packed[source_position++];
++              output[output_position++] = value;
++              window[write_position] = value;
++              write_position = (write_position + 1) & 4095;
++            }
++          else
++            {
++              unsigned read_position;
++              unsigned count;
++              unsigned offset;
++              if (source_position + 1 >= packed_size)
++                break;
++              read_position = (packed[source_position]
++                               | ((packed[source_position + 1] & 0xf0) << 4));
++              count = (packed[source_position + 1] & 0x0f) + 3;
++              source_position += 2;
++              for (offset = 0; offset < count && output_position < output_size;
++                   ++offset)
++                {
++                  unsigned char value = window[(read_position + offset) & 4095];
++                  output[output_position++] = value;
++                  window[write_position] = value;
++                  write_position = (write_position + 1) & 4095;
++                }
++            }
++        }
++      if (output_position != output_size)
++        {
++          fprintf (stderr,
++                   "fast LZSS decode mismatch source=%#x got=%#x expected=%#x\n",
++                   source, output_position, output_size);
++          free (output);
++          free (packed);
++          goto normal_interpretation;
++        }
++      for (output_position = 0; output_position < output_size;
++           output_position += 4096)
++        {
++          unsigned amount = min (4096, output_size - output_position);
++          if (sim_write (sd, destination + output_position,
++                         output + output_position, amount) != amount)
++            {
++              fprintf (stderr,
++                       "fast LZSS write mismatch destination=%#x offset=%#x\n",
++                       destination, output_position);
++              free (output);
++              free (packed);
++              goto normal_interpretation;
++            }
++        }
++      if (getenv ("BFIN_FAST_LZSS_TRACE"))
++        {
++          /* run_headless stops the simulator with a hard terminate, and a
++             redirected stderr is fully buffered on Windows, so an unflushed
++             line is simply lost.  A silent trace then reads exactly like
++             "this code never ran" -- a wrong conclusion this already cost
++             one session.  BFIN_CALL_WATCH flushes for the same reason.  */
++          fprintf (stderr,
++                   "fast LZSS source=%#x destination=%#x output=%#x\n",
++                   source, destination, output_size);
++          fflush (stderr);
++        }
++      free (output);
++      free (packed);
++      BFIN_CPU_STATE.did_jump = true;
++      SET_PCREG (RETSREG);
++      return 2;
++    }
++
++  /* The GUI composites nine window objects (base 0x588224, stride 0x180)
++     through the dispatcher at 0xba0320, which receives the object pointer in
++     R0.  Optionally suppress a window's draw so its screen contribution can be
++     isolated (diff against a full render) and, ultimately, routed to a
++     separate output (e.g. the jog-wheel LCD).  BFIN_SKIP_WINDOW=<obj>[,<obj>].  */
++
++  if (__builtin_expect (bfin_probes_active > 0, 0))
++    {
++      int skip = bfin_cdj_probes_before (cpu, pc);
++
++      if (skip >= 0)
++	return skip;
++    }
++
++ normal_interpretation:
++
++  if (__builtin_expect (bfin_probes_active > 0, 0))
++    bfin_cdj_probes_after (cpu, pc);
++
    BFIN_CPU_STATE.n_stores = 0;
    PARALLEL_GROUP = BFIN_PARALLEL_NONE;
    DIS_ALGN_EXPT &= ~1;
---- a/sim/bfin/bfin-sim.h
-+++ b/sim/bfin/bfin-sim.h
-@@ -310,6 +310,13 @@
+   CYCLE_DELAY = 1;
+   INSN_LEN = 0;
++  bfin_insn_text = TRACE_INSN_P (cpu);
+ 
+   insn_len = _interp_insn_bfin (cpu, pc);
+ 
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/bfin-sim.h gdb-17.2/sim/bfin/bfin-sim.h
+--- a/sim/bfin/bfin-sim.h	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/bfin-sim.h	2026-09-02 14:38:31.701735200 +0200
+@@ -310,14 +310,148 @@
  #define SYSCFG_CCEN	(1 << 1)
  #define SYSCFG_SNEN	(1 << 2)
  
-+void bfin_trace_framebuffer_store (SIM_CPU *cpu, bu32 addr, bu32 value,
-+				   unsigned bytes);
-+void bfin_trace_gui_state_read (SIM_CPU *cpu, bu32 addr, bu32 value,
-+				unsigned bytes);
-+void bfin_trace_gui_state_write (SIM_CPU *cpu, bu32 addr, bu32 value,
-+				 unsigned bytes);
++/* The memory trace hooks are behind the probe gate (bfin-sim.c): one
++   predicted branch per access instead of an out-of-line call.  */
++extern int bfin_probes_active;
++void bfin_probes_init (void);
++
++/* The wall-clock time base (interp.c) and what the device models ask it.  */
++extern int bfin_idle_hint;
++/* A wake-up source asserted since the last IDLE: the next IDLE returns at
++   once instead of parking, as the chip does when SIC_IWR already shows the
++   source.  Set by the PLL when it locks (dv-bfin_pll.c).  */
++extern int bfin_idle_wake_pending;
++int bfin_wall_active (void);
++unsigned bfin_wall_ticks_us (unsigned us);
++unsigned bfin_wall_frame_gap_ticks (unsigned lines_already);
++int bfin_sport_link_wait_fd (void);
++void bfin_sport_clock_report (struct hw *sport);
++void bfin_trace_framebuffer_store_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
++					unsigned bytes);
++void bfin_trace_gui_state_read_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
++				     unsigned bytes);
++void bfin_trace_gui_state_write_slow (SIM_CPU *cpu, bu32 addr, bu32 value,
++				      unsigned bytes);
++#define bfin_trace_framebuffer_store(cpu, addr, value, bytes) \
++  do { \
++    if (__builtin_expect (bfin_probes_active > 0, 0)) \
++      bfin_trace_framebuffer_store_slow (cpu, addr, value, bytes); \
++  } while (0)
++#define bfin_trace_gui_state_read(cpu, addr, value, bytes) \
++  do { \
++    if (__builtin_expect (bfin_probes_active > 0, 0)) \
++      bfin_trace_gui_state_read_slow (cpu, addr, value, bytes); \
++  } while (0)
++#define bfin_trace_gui_state_write(cpu, addr, value, bytes) \
++  do { \
++    if (__builtin_expect (bfin_probes_active > 0, 0)) \
++      bfin_trace_gui_state_write_slow (cpu, addr, value, bytes); \
++  } while (0)
++
++/* Guest memory, the fast way.
++
++   Every load, store and instruction fetch used to go through
++   sim_core_read_buffer / sim_core_write_buffer: one walk of the mapping list
++   per byte, through a linked list of ~40 mappings, with three ASSERTs on the
++   way.  That was most of the cost of an instruction.
++
++   This is a direct-mapped cache of host pointers, one entry per 4 KiB guest
++   page and per map (read / write / exec).  A page is cached only when it is
++   plain memory -- no device behind it, wholly inside one mapping, not
++   straddling a modulo alias -- so every device register still goes through
++   the core and its hardware tree.  An access that crosses a page boundary
++   takes the old path too.  Bytes are copied raw, exactly as the core does:
++   the buffer already holds guest byte order.
++
++   The cache is stamped with sim_core_generation and flushed when a mapping
++   is attached or detached, which the EBIU model does at run time.  */
++
++#include <string.h>
++
++#define BFIN_PAGE_SHIFT 12
++#define BFIN_PAGE_SIZE (1u << BFIN_PAGE_SHIFT)
++#define BFIN_PAGE_CACHE_ENTRIES 4096u
++
++struct bfin_page_entry
++{
++  bu32 page;			/* addr >> BFIN_PAGE_SHIFT, or ~0 for empty */
++  unsigned char *host;		/* NULL: known not cacheable */
++};
++
++extern struct bfin_page_entry bfin_page_cache[nr_maps][BFIN_PAGE_CACHE_ENTRIES];
++extern unsigned bfin_page_cache_generation;
++extern unsigned sim_core_generation;
++extern int bfin_page_cache_disabled;
++unsigned char *bfin_page_fill (SIM_CPU *cpu, unsigned map, bu32 addr);
++
++static inline unsigned char *
++bfin_fast_host (SIM_CPU *cpu, unsigned map, bu32 addr, unsigned bytes)
++{
++  struct bfin_page_entry *e;
++
++  if (__builtin_expect ((addr & (BFIN_PAGE_SIZE - 1)) + bytes > BFIN_PAGE_SIZE, 0))
++    return NULL;
++  if (__builtin_expect (bfin_page_cache_generation != sim_core_generation, 0))
++    return bfin_page_fill (cpu, map, addr);
++  e = &bfin_page_cache[map][(addr >> BFIN_PAGE_SHIFT)
++			    & (BFIN_PAGE_CACHE_ENTRIES - 1)];
++  if (__builtin_expect (e->page == (addr >> BFIN_PAGE_SHIFT), 1))
++    return e->host ? e->host + (addr & (BFIN_PAGE_SIZE - 1)) : NULL;
++  return bfin_page_fill (cpu, map, addr);
++}
++
++/* The MMU check's fast path.  dv-bfin_mmu.c publishes, per table (0 data,
++   1 instruction), the page of its last single-hit CPLB walk together with
++   the kinds of access that entry grants -- one bit per (supervisor, write)
++   pair -- or, while the CPLBs are off, all of memory below L1.  An aligned
++   access inside that page of a granted kind needs no walk: the table would
++   find the same single entry, and the implicit rules (MMR space, which L1
++   bank may hold code) are folded into the bits when the window is
++   published.  Everything else takes mmu_check_addr exactly as before, and
++   any write to the MMU's registers empties both windows.  Measured before:
++   the check was a quarter of the interpreter's time, most of it the two
++   calls a memo hit still made.  */
++struct bfin_mmu_fast
++{
++  bu32 lo, hi;
++  unsigned ok;			/* bit (supervisor << 1 | write) */
++};
++extern struct bfin_mmu_fast bfin_mmu_fast[2];
++/* The CEC's IPEND, for the supervisor test without a call: supervisor mode
++   is any bit set other than EMU (0) and IRPTEN (4), see dv-bfin_cec.c.  */
++extern const bu32 *bfin_cec_ipend_ptr;
++
++static inline int
++bfin_mmu_fast_ok (bu32 addr, bool write, bool inst, int size)
++{
++  const struct bfin_mmu_fast *f = &bfin_mmu_fast[inst];
++  unsigned supv;
++
++  if (addr < f->lo || addr >= f->hi || (addr & (size - 1)))
++    return 0;
++  supv = (*bfin_cec_ipend_ptr & ~0x11u) != 0;
++  return (f->ok >> ((supv << 1) | (unsigned) write)) & 1;
++}
 +
  #define __PUT_MEM(taddr, v, size) \
  do { \
    bu##size __v = (v); \
-@@ -318,6 +325,8 @@
-   mmu_check_addr (cpu, __taddr, true, false, __bytes); \
-   __cnt = sim_core_write_buffer (CPU_STATE(cpu), cpu, write_map, \
- 				 (void *)&__v, __taddr, __bytes); \
+   bu32 __taddr = (taddr); \
+   int __cnt, __bytes = size / 8; \
+-  mmu_check_addr (cpu, __taddr, true, false, __bytes); \
+-  __cnt = sim_core_write_buffer (CPU_STATE(cpu), cpu, write_map, \
+-				 (void *)&__v, __taddr, __bytes); \
++  unsigned char *__host; \
++  if (!bfin_mmu_fast_ok (__taddr, true, false, __bytes)) \
++    mmu_check_addr (cpu, __taddr, true, false, __bytes); \
++  __host = bfin_fast_host (cpu, write_map, __taddr, __bytes); \
++  if (__builtin_expect (__host != NULL, 1)) \
++    { \
++      memcpy (__host, &__v, __bytes); \
++      __cnt = __bytes; \
++    } \
++  else \
++    __cnt = sim_core_write_buffer (CPU_STATE(cpu), cpu, write_map, \
++				   (void *)&__v, __taddr, __bytes); \
 +  bfin_trace_framebuffer_store (cpu, __taddr, __v, __bytes); \
 +  bfin_trace_gui_state_write (cpu, __taddr, __v, __bytes); \
    if (__cnt != __bytes) \
      mmu_process_fault (cpu, __taddr, true, false, false, true); \
    BFIN_TRACE_CORE (cpu, __taddr, __bytes, write_map, __v); \
-@@ -334,6 +343,8 @@
-   mmu_check_addr (cpu, __taddr, false, inst, __bytes); \
-   __cnt = sim_core_read_buffer (CPU_STATE(cpu), cpu, map, \
- 				(void *)&__ret, __taddr, __bytes); \
+@@ -331,9 +465,20 @@
+   bu##size __ret; \
+   bu32 __taddr = (taddr); \
+   int __cnt, __bytes = size / 8; \
+-  mmu_check_addr (cpu, __taddr, false, inst, __bytes); \
+-  __cnt = sim_core_read_buffer (CPU_STATE(cpu), cpu, map, \
+-				(void *)&__ret, __taddr, __bytes); \
++  unsigned char *__host; \
++  if (!bfin_mmu_fast_ok (__taddr, false, inst, __bytes)) \
++    mmu_check_addr (cpu, __taddr, false, inst, __bytes); \
++  __host = bfin_fast_host (cpu, map, __taddr, __bytes); \
++  if (__builtin_expect (__host != NULL, 1)) \
++    { \
++      memcpy (&__ret, __host, __bytes); \
++      __cnt = __bytes; \
++    } \
++  else \
++    __cnt = sim_core_read_buffer (CPU_STATE(cpu), cpu, map, \
++				  (void *)&__ret, __taddr, __bytes); \
 +  if (!(inst)) \
 +    bfin_trace_gui_state_read (cpu, __taddr, __ret, __bytes); \
    if (__cnt != __bytes) \
      mmu_process_fault (cpu, __taddr, false, inst, false, true); \
    BFIN_TRACE_CORE (cpu, __taddr, __bytes, map, __ret); \
---- a/sim/bfin/dv-bfin_cec.c
-+++ b/sim/bfin/dv-bfin_cec.c
+@@ -345,7 +490,12 @@
+ #define GET_LONG(taddr) _GET_MEM(taddr, 32)
+ 
+ #define IFETCH(taddr) __GET_MEM(taddr, 16, true, exec_map)
+-#define IFETCH_CHECK(taddr) mmu_check_addr (cpu, taddr, false, true, 2)
++#define IFETCH_CHECK(taddr) \
++do { \
++  bu32 __ta = (taddr); \
++  if (!bfin_mmu_fast_ok (__ta, false, true, 2)) \
++    mmu_check_addr (cpu, __ta, false, true, 2); \
++} while (0)
+ 
+ extern void bfin_syscall (SIM_CPU *);
+ extern bu32 interp_insn_bfin (SIM_CPU *, bu32);
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_cec.c gdb-17.2/sim/bfin/dv-bfin_cec.c
+--- a/sim/bfin/dv-bfin_cec.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_cec.c	2026-09-02 13:13:36.756464400 +0200
 @@ -22,6 +22,7 @@
  #include "defs.h"
  
@@ -2903,10 +3264,15 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  
  #include "sim-main.h"
  #include "sim-signal.h"
-@@ -51,6 +52,101 @@
+@@ -51,6 +52,106 @@
  
  static void _cec_raise (SIM_CPU *, struct bfin_cec *, int);
  
++/* IPEND for the MMU fast path (bfin-sim.h); points at a zero until the
++   CEC exists, and user mode is the safe reading of zero.  */
++static bu32 bfin_cec_no_ipend;
++const bu32 *bfin_cec_ipend_ptr = &bfin_cec_no_ipend;
++
 +/* Wall clock for the fault trace, anchored at simulator start.
 +
 +   A fault line is only usable if it can be placed against the frame clock:
@@ -3005,7 +3371,15 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  static void
  bfin_cec_hw_event_callback (struct hw *me, void *data)
  {
-@@ -332,6 +428,8 @@
+@@ -205,6 +306,7 @@
+   struct bfin_cec *cec;
+ 
+   cec = HW_ZALLOC (me, struct bfin_cec);
++  bfin_cec_ipend_ptr = &cec->ipend;
+ 
+   set_hw_data (me, cec);
+   set_hw_io_read_buffer (me, bfin_cec_io_read_buffer);
+@@ -332,6 +434,8 @@
    TRACE_EVENTS (cpu, "processing exception %#x in EVT%i", excp,
  		cec_get_ivg (cpu));
  
@@ -3014,7 +3388,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    /* Ideally what would happen here for real hardware exceptions (not
       fake sim ones) is that:
        - For service exceptions (excp <= 0x11):
-@@ -534,7 +632,8 @@
+@@ -534,7 +638,8 @@
  	  /* Double fault ! :(  */
  	  SET_EXCAUSE (VEC_UNCOV);
  	  /* XXX: SET_RETXREG (...);  */
@@ -3024,8 +3398,9 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  	  excp_to_sim_halt (sim_stopped, SIM_SIGABRT);
  	}
  
---- a/sim/bfin/dv-bfin_cec.h
-+++ b/sim/bfin/dv-bfin_cec.h
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_cec.h gdb-17.2/sim/bfin/dv-bfin_cec.h
+--- a/sim/bfin/dv-bfin_cec.h	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_cec.h	2026-09-02 09:40:29.157546400 +0200
 @@ -133,4 +133,9 @@
  extern void cec_push_reti (SIM_CPU *);
  extern void cec_pop_reti (SIM_CPU *);
@@ -3036,8 +3411,36 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +extern double bfin_sim_seconds (void);
 +
  #endif
---- a/sim/bfin/dv-bfin_dma.c
-+++ b/sim/bfin/dv-bfin_dma.c
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_ctimer.c gdb-17.2/sim/bfin/dv-bfin_ctimer.c
+--- a/sim/bfin/dv-bfin_ctimer.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_ctimer.c	2026-09-02 10:48:26.378027900 +0200
+@@ -155,7 +155,22 @@
+ 	  bfin_ctimer_deschedule (me, ctimer);
+ 	}
+       else
+-	bfin_ctimer_schedule (me, ctimer);
++	{
++	  static int reported;
++
++	  /* Once: what the firmware thinks a core-timer tick is.  With a
++	     one-millisecond RTOS tick this says what CCLK it assumes, which
++	     is what BFIN_CCLK_HZ has to be.  */
++	  if (!reported)
++	    {
++	      reported = 1;
++	      fprintf (stderr, "bfin clock: core timer enabled tperiod=%u"
++		       " tscale=%u tcount=%u\n", ctimer->tperiod,
++		       ctimer->tscale, ctimer->tcount);
++	      fflush (stderr);
++	    }
++	  bfin_ctimer_schedule (me, ctimer);
++	}
+ 
+       break;
+     case mmr_offset(tcount):
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_dma.c gdb-17.2/sim/bfin/dv-bfin_dma.c
+--- a/sim/bfin/dv-bfin_dma.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_dma.c	2026-09-02 14:38:31.702719200 +0200
 @@ -22,6 +22,7 @@
  #include "defs.h"
  
@@ -3046,11 +3449,13 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  
  #include "sim-main.h"
  #include "devices.h"
-@@ -44,6 +45,17 @@
+@@ -44,6 +45,19 @@
    struct hw_event *handler;
    unsigned ele_size;
    struct hw *hw_peer;
 +  unsigned long cdj_events;
++  int cdj_frame_done;		/* the 2D block just wrapped (a PPI frame) */
++  int cdj_fresh;		/* just enabled; the first pump is still due */
 +  /* BFIN_DMA_CENSUS: four numbers per channel, so that "the firmware armed N
 +     receives" and "the peer was read N times" can be told apart.  r123 counted
 +     1 379 calls to the GUI's own arming helper 0xb7c1aa against 22 064 64-byte
@@ -3064,7 +3469,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  
    /* Order after here is important -- matches hardware MMR layout.  */
    union {
-@@ -197,9 +209,6 @@
+@@ -197,9 +211,6 @@
    /* XXX: This would be the time to process the next descriptor.  */
    /* XXX: Should this toggle Enable in dma->config ?  */
  
@@ -3074,7 +3479,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    if ((dma->config & DMA2D) && dma->curr_y_count > 1)
      {
        dma->curr_y_count -= 1;
-@@ -216,8 +225,18 @@
+@@ -216,14 +227,145 @@
      case DMAFLOW_STOP:
        HW_TRACE ((me, "dma is complete"));
        dma->irq_status = (dma->irq_status & ~DMA_RUN) | DMA_DONE;
@@ -3091,9 +3496,136 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +      if (dma->config & DI_EN)
 +	hw_port_event (me, 0, 1);
        bfin_dma_process_desc (me, dma);
++      dma->cdj_frame_done = 1;
        return 1;
      }
-@@ -249,7 +268,7 @@
+ }
+ 
++
+ static void bfin_dma_hw_event_callback (struct hw *, void *);
++static unsigned bfin_dma_env_sport_retry_us (void);
++/* The wall-clock time base, interp.c.  */
++extern int bfin_wall_active (void);
++extern unsigned bfin_wall_ticks_us (unsigned us);
++extern unsigned bfin_wall_frame_gap_ticks (unsigned lines_already);
++
++/* The environment, read once.  getenv() is a linear scan of the process
++   environment and these were being called several times per DMA event,
++   at tens of thousands of events a second.  */
++static struct
++{
++  int init;
++  int census;
++  int trace;
++  unsigned long trace_limit;
++  unsigned long ppi_delay;
++} bfin_dma_env;
++
++static unsigned
++bfin_dma_env_sport_retry_us (void)
++{
++  static unsigned cached;
++
++  if (!cached)
++    {
++      const char *value = getenv ("BFIN_SPORT_RETRY_US");
++
++      cached = value && *value ? strtoul (value, NULL, 0) : 1000;
++      if (!cached)
++	cached = 1;
++    }
++  return cached;
++}
++
++static void
++bfin_dma_env_init (void)
++{
++  const char *value;
++
++  bfin_dma_env.init = 1;
++  bfin_dma_env.census = getenv ("BFIN_DMA_CENSUS") != NULL;
++  bfin_dma_env.trace = getenv ("BFIN_DMA_TRACE") != NULL;
++  value = getenv ("BFIN_DMA_TRACE_LIMIT");
++  /* The fixed cap of 12 only ever showed the first 12 scanlines of the
++     first descriptor, which hid the shape of the descriptor chain.  */
++  bfin_dma_env.trace_limit = value && *value ? strtoul (value, NULL, 0) : 12;
++  value = getenv ("BFIN_PPI_DMA_DELAY");
++  if (value && *value)
++    {
++      unsigned long configured = strtoul (value, NULL, 0);
++
++      if (configured != 0 && configured <= 100000000)
++	bfin_dma_env.ppi_delay = configured;
++    }
++}
++
++/* How long until this channel pumps again, in ticks.
++
++   Upstream pumped again after one tick whenever the peer took the data,
++   which for the display DMA meant one scanline per tick -- the LCD
++   consuming a hardware event per simulated cycle -- and after 5000 ticks
++   when it did not.  BFIN_PPI_DMA_DELAY (a per-line tick count) is kept as
++   an explicit override.  On the wall-clock time base the display is paced
++   per frame: the lines of a frame go out back to back and the channel then
++   waits out the rest of the frame period (BFIN_PPI_FPS), and a receive that
++   had nothing to hand over retries after BFIN_SPORT_RETRY_US of guest time
++   rather than after 5000 ticks, which at 400 MHz would be twelve
++   microseconds -- a wake-up rate no sleeping run loop could afford.  */
++static unsigned
++bfin_dma_pacing (struct hw *me, struct bfin_dma *dma, struct hw *peer, int ret)
++{
++  int frame_done = dma->cdj_frame_done;
++
++  dma->cdj_frame_done = 0;
++  if (!ret)
++    return bfin_wall_active ()
++      ? bfin_wall_ticks_us (bfin_dma_env_sport_retry_us ()) : 5000;
++  if (strstr (hw_name (peer), "bfin_ppi") != NULL)
++    {
++      if (bfin_dma_env.ppi_delay)
++	return (unsigned) bfin_dma_env.ppi_delay;
++      if (bfin_wall_active () && frame_done)
++	return bfin_wall_frame_gap_ticks (dma->y_count ? dma->y_count : 1);
++    }
++  return 1;
++}
++
++/* BFIN_SPORT_RX_US: how long after a receive is armed its first record
++   lands, in microseconds of guest time.  Off (0) by default: the record
++   lands on the next tick, as this model always did.
++
++   The idea was that landing it on the next tick is a race -- the record
++   and its completion arrive while the firmware is still on its way from
++   the arm to whatever it waits on for them, and over one 500 s run the GUI
++   armed 7 019 64-byte receives and parsed 77 of the records handed over,
++   losing them between the arm and the handler -- and that a few hundred
++   microseconds, a 64-byte frame's time on a megabit serial link, would
++   land it where the task's state machine expects it.  Measured at 500 us
++   (r g1, one run): the boot reached the player screen as before, and the
++   GUI then sent no request at all from t35 to t80 and never reacted to a
++   SOURCE key; the same run without it reacts in six seconds.  The
++   housekeeping loop arms this same channel for its 200-byte reads, so the
++   latency lands on every poll as well.  Kept for a narrower experiment;
++   not the default.  */
++static unsigned
++bfin_dma_sport_rx_ticks (void)
++{
++  static long cached = -1;
++
++  if (cached < 0)
++    {
++      const char *value = getenv ("BFIN_SPORT_RX_US");
++
++      cached = value && *value ? strtol (value, NULL, 0) : 0;
++      if (cached < 0)
++	cached = 0;
++    }
++  return cached ? bfin_wall_ticks_us ((unsigned) cached) : 0;
++}
+ 
+ static void
+ bfin_dma_reschedule (struct hw *me, unsigned delay)
+@@ -249,11 +391,30 @@
    struct hw *peer;
    struct dv_bfin *bfin_peer;
    bu8 buf[4096];
@@ -3102,12 +3634,41 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  
    dma->handler = NULL;
    peer = bfin_dma_get_peer (me, dma);
-@@ -261,6 +280,32 @@
+   bfin_peer = hw_data (peer);
++  if (dma->cdj_fresh)
++    {
++      dma->cdj_fresh = 0;
++      /* The 64-byte arms are the status-record path (0xb7c1aa with 32
++	 words); the housekeeping loop's 200-byte polls stay on the next
++	 tick, so the latency lands only where the parse is lost.  */
++      if ((dma->config & WNR) && strstr (hw_name (peer), "bfin_sport") != NULL
++	  && dma->x_count * dma->ele_size == 64)
++	{
++	  unsigned latency = bfin_dma_sport_rx_ticks ();
++
++	  bfin_sport_clock_report (peer);
++	  if (latency)
++	    {
++	      bfin_dma_reschedule (me, latency);
++	      return;
++	    }
++	}
++    }
+   ret = 0;
+   if (dma->x_modify < 0)
+     /* XXX: This sucks performance wise.  */
+@@ -261,6 +422,35 @@
    else
      nr_bytes = min (sizeof (buf), dma->curr_x_count * dma->ele_size);
  
 +  dma->cdj_events++;
-+  if (getenv ("BFIN_DMA_CENSUS") && dma->cdj_events % 2000 == 0)
++  {
++    extern unsigned long bfin_stat_dma_events;
++    ++bfin_stat_dma_events;
++  }
++  if (!bfin_dma_env.init)
++    bfin_dma_env_init ();
++  if (bfin_dma_env.census && dma->cdj_events % 2000 == 0)
 +    {
 +      fprintf (stderr, "dma census dev=%s pmap=%#x enables %lu, pumps %lu,"
 +	       " done %lu, irq %lu, bytes %u\n",
@@ -3116,12 +3677,9 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +      fflush (stderr);
 +    }
 +  {
-+    /* The fixed cap of 12 only ever showed the first 12 scanlines of the
-+       first descriptor, which hid the shape of the descriptor chain.  */
-+    const char *limit_env = getenv ("BFIN_DMA_TRACE_LIMIT");
-+    unsigned long limit = limit_env && *limit_env ? strtoul (limit_env, NULL, 0) : 12;
++    unsigned long limit = bfin_dma_env.trace_limit;
 +
-+    if (getenv ("BFIN_DMA_TRACE") && dma->cdj_events <= limit)
++    if (bfin_dma_env.trace && dma->cdj_events <= limit)
 +    {
 +      fprintf (stderr,
 +	       "DMA event dev=%s peer=%s event=%lu config=%#x pmap=%#x addr=%#x bytes=%u x=%u y=%u\n",
@@ -3135,33 +3693,27 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    /* Pumping a chunk!  */
    bfin_peer->dma_master = me;
    bfin_peer->acked = false;
-@@ -302,7 +347,20 @@
+@@ -302,7 +492,12 @@
    if ((!dma->acked && dma->curr_x_count) || bfin_dma_finish_x (me, dma))
      /* Still got work to do, so schedule again.  */
   reschedule:
 -    bfin_dma_reschedule (me, ret ? 1 : 5000);
 +    {
-+      const char *ppi_delay = getenv ("BFIN_PPI_DMA_DELAY");
-+
-+      delay = ret ? 1 : 5000;
-+      if (ret && ppi_delay && *ppi_delay
-+	  && strstr (hw_name (peer), "bfin_ppi") != NULL)
-+	{
-+	  unsigned long configured = strtoul (ppi_delay, NULL, 0);
-+
-+	  if (configured != 0 && configured <= 100000000)
-+	    delay = (unsigned) configured;
-+	}
++      if (!bfin_dma_env.init)
++	bfin_dma_env_init ();
++      delay = bfin_dma_pacing (me, dma, peer, ret);
 +      bfin_dma_reschedule (me, delay);
 +    }
  
    return;
  
-@@ -384,7 +442,17 @@
+@@ -384,7 +579,20 @@
  
        if (bfin_dma_enabled (dma))
  	{
-+	  if (getenv ("BFIN_DMA_TRACE"))
++	  if (!bfin_dma_env.init)
++	    bfin_dma_env_init ();
++	  if (bfin_dma_env.trace)
 +	    {
 +	      fprintf (stderr,
 +		       "DMA enable dev=%s config=%#x pmap=%#x start=%#x next=%#x x=%u/%d y=%u/%d\n",
@@ -3172,10 +3724,11 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +	    }
  	  dma->irq_status |= DMA_RUN;
 +	  dma->cdj_enables++;
++	  dma->cdj_fresh = 1;
  	  bfin_dma_process_desc (me, dma);
  	  /* The writer is the master.  */
  	  if (!(dma->peripheral_map & CTYPE) || (dma->config & WNR))
-@@ -398,6 +466,12 @@
+@@ -398,6 +606,12 @@
        break;
      case mmr_offset(irq_status):
        dv_w1c_2 (value16p, value, DMA_DONE | DMA_ERR);
@@ -3188,8 +3741,9 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
        break;
      case mmr_offset(curr_x_count):
      case mmr_offset(curr_y_count):
---- a/sim/bfin/dv-bfin_gpio.c
-+++ b/sim/bfin/dv-bfin_gpio.c
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_gpio.c gdb-17.2/sim/bfin/dv-bfin_gpio.c
+--- a/sim/bfin/dv-bfin_gpio.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_gpio.c	2026-09-02 09:40:29.183325500 +0200
 @@ -200,7 +200,20 @@
      case mmr_offset(clear):
      case mmr_offset(set):
@@ -3212,9 +3766,93 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
        break;
      case mmr_offset(maska):
      case mmr_offset(maska_clear):
---- a/sim/bfin/dv-bfin_mmu.c
-+++ b/sim/bfin/dv-bfin_mmu.c
-@@ -315,6 +315,138 @@
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_mmu.c gdb-17.2/sim/bfin/dv-bfin_mmu.c
+--- a/sim/bfin/dv-bfin_mmu.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_mmu.c	2026-09-02 13:13:36.756464400 +0200
+@@ -60,6 +60,71 @@
+   char _ipad3[0x400 - 0x300 - (4 * 1)];
+   bu32 itest_data[2];
+ };
++/* The result of the last successful CPLB table walk, per table (0 data,
++   1 instruction): the entry that matched, its range and its protection
++   word.  An access inside that range with a permission the entry grants
++   would walk the table to the same single hit, so it is granted without the
++   walk.  Anything else -- another page, a permission the entry withholds,
++   a second matching entry -- takes the full walk exactly as before, and any
++   write to the MMU's registers empties both memos.  The implicit checks
++   (alignment, MMR space, L1 rules) still run on every access.  */
++struct bfin_cplb_memo
++{
++  int valid;
++  bu32 lo, hi;
++  bu32 data;
++  bu32 mask;
++};
++static struct bfin_cplb_memo bfin_cplb_memo[2];
++
++/* The windows bfin_mmu_fast_ok (bfin-sim.h) tests.  Both start empty.  */
++struct bfin_mmu_fast bfin_mmu_fast[2];
++
++/* Publish [lo, hi) of table `inst` as the fast window, granting what the
++   protection word `data` grants -- everything when `all`, the CPLBs being
++   off -- less what the implicit rules refuse: nothing at or above the MMRs,
++   and in L1 only code from the instruction bank and data from anywhere
++   else.  That L1 rule is one answer per page only while the page stays
++   inside one megabyte, so a larger L1 page is left to the walk, as is the
++   top page, whose end wraps to zero.  */
++static void
++bfin_mmu_fast_publish (bool inst, bu32 lo, bu32 hi, bu32 data, bool all)
++{
++  struct bfin_mmu_fast *f = &bfin_mmu_fast[inst];
++  unsigned ok;
++
++  f->lo = f->hi = 0;
++  if (hi <= lo || lo >= BFIN_SYSTEM_MMR_BASE)
++    return;
++  if (hi > BFIN_SYSTEM_MMR_BASE)
++    hi = BFIN_SYSTEM_MMR_BASE;
++  if ((lo & 0xFF000000) == 0xFF000000)
++    {
++      bool code_bank = (lo & 0xFFF00000) == 0xFFA00000;
++
++      if (hi - lo > 0x100000 || inst != code_bank)
++	return;
++    }
++  if (all)
++    ok = 0xf;
++  else
++    {
++      ok = 1 << 2;		/* a supervisor read is always granted */
++      if (data & CPLB_USER_RD)
++	ok |= 1 << 0;
++      if ((data & (CPLB_WT | CPLB_L1_CHBL | CPLB_DIRTY)) != CPLB_L1_CHBL)
++	{
++	  if (data & CPLB_USER_WR)
++	    ok |= 1 << 1;
++	  if (data & CPLB_SUPV_WR)
++	    ok |= 1 << 3;
++	}
++    }
++  f->lo = lo;
++  f->hi = hi;
++  f->ok = ok;
++}
++
+ #define mmr_base()      offsetof(struct bfin_mmu, sram_base_address)
+ #define mmr_offset(mmr) (offsetof(struct bfin_mmu, mmr) - mmr_base())
+ #define mmr_idx(mmr)    (mmr_offset (mmr) / 4)
+@@ -102,6 +167,10 @@
+   bu32 value;
+   bu32 *valuep;
+ 
++  bfin_cplb_memo[0].valid = bfin_cplb_memo[1].valid = 0;
++  bfin_mmu_fast[0].lo = bfin_mmu_fast[0].hi = 0;
++  bfin_mmu_fast[1].lo = bfin_mmu_fast[1].hi = 0;
++
+   /* Invalid access mode is higher priority than missing register.  */
+   if (!dv_bfin_mmr_require_32 (me, addr, nr_bytes, true))
+     return 0;
+@@ -315,6 +384,138 @@
  
  #define MMU_STATE(cpu) DV_STATE_CACHED (cpu, mmu)
  
@@ -3353,7 +3991,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  static void
  _mmu_log_ifault (SIM_CPU *cpu, struct bfin_mmu *mmu, bu32 pc, bool supv)
  {
-@@ -374,6 +506,9 @@
+@@ -374,6 +575,9 @@
      }
  
    _mmu_log_fault (cpu, mmu, addr, write, inst, miss, supv, dag1, 0);
@@ -3363,7 +4001,17 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    cec_exception (cpu, excp);
  }
  
-@@ -466,6 +601,10 @@
+@@ -455,6 +659,9 @@
+   bu32 faults;
+   bool supv, do_excp, dag1;
+   int i, hits;
++  int last_hit = -1;
++  bu32 last_lo = 0, last_hi = 0;
++  struct bfin_cplb_memo *memo = &bfin_cplb_memo[inst ? 1 : 0];
+ 
+   supv = cec_is_supervisor_mode (cpu);
+   dag1 = (BFIN_CPU_STATE.multi_pc == PCREG + 6);
+@@ -466,6 +673,10 @@
        if (ret < 0)
  	return 0;
        _mmu_process_fault (cpu, NULL, addr, write, inst, (ret == 3), false, supv, dag1);
@@ -3374,7 +4022,73 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
      }
  
    mmu = MMU_STATE (cpu);
-@@ -545,16 +684,18 @@
+@@ -481,9 +692,36 @@
+   if (!(*mem_control & ENCPLB))
+     {
+       hits = 1;
++      bfin_mmu_fast_publish (inst, 0, 0xFF000000, 0, true);
+       goto implicit_check;
+     }
+ 
++  /* The memo first: same page as the last single hit, and a permission
++     that entry grants.  */
++  if (memo->valid && addr >= memo->lo && addr < memo->hi)
++    {
++      bu32 d = memo->data;
++      bool ok = true;
++
++      if (write)
++	{
++	  if (!supv && !(d & CPLB_USER_WR))
++	    ok = false;
++	  if (supv && !(d & CPLB_SUPV_WR))
++	    ok = false;
++	  if ((d & (CPLB_WT | CPLB_L1_CHBL | CPLB_DIRTY)) == CPLB_L1_CHBL)
++	    ok = false;
++	}
++      else if (!supv && !(d & CPLB_USER_RD))
++	ok = false;
++      if (ok)
++	{
++	  hits = 1;
++	  faults = memo->mask;
++	  goto memo_hit;
++	}
++    }
++
+   /* Check all the CPLBs first.  */
+   for (i = 0; i < 16; ++i)
+     {
+@@ -502,6 +740,9 @@
+ 
+       ++hits;
+       faults |= (1 << i);
++      last_hit = i;
++      last_lo = addr_lo;
++      last_hi = addr_hi;
+       if (write)
+ 	{
+ 	  if (!supv && !(cplb_data[i] & CPLB_USER_WR))
+@@ -518,6 +759,18 @@
+ 	}
+     }
+ 
++  if (hits == 1 && !do_excp && last_hit >= 0)
++    {
++      memo->valid = 1;
++      memo->lo = last_lo;
++      memo->hi = last_hi;
++      memo->data = cplb_data[last_hit];
++      memo->mask = faults;
++      bfin_mmu_fast_publish (inst, last_lo, last_hi, cplb_data[last_hit],
++			     false);
++    }
++
++ memo_hit:
+   /* Handle default/implicit CPLBs.  */
+   if (!do_excp && hits < 2)
+     {
+@@ -545,16 +798,18 @@
  
    _mmu_log_fault (cpu, mmu, addr, write, inst, hits == 0, supv, dag1, faults);
  
@@ -3403,9 +4117,77 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  }
  
  void
---- a/sim/bfin/dv-bfin_ppi.c
-+++ b/sim/bfin/dv-bfin_ppi.c
-@@ -25,8 +25,13 @@
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_pll.c gdb-17.2/sim/bfin/dv-bfin_pll.c
+--- a/sim/bfin/dv-bfin_pll.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_pll.c	2026-09-02 13:19:03.153859500 +0200
+@@ -38,7 +38,10 @@
+ 
+   /* XXX: Not really the best place for this ...  */
+   bu32 chipid;
++
++  struct hw_event *lock;
+ };
++#define PLL_LOCKED (1 << 5)
+ #define mmr_base()      offsetof(struct bfin_pll, pll_ctl)
+ #define mmr_offset(mmr) (offsetof(struct bfin_pll, mmr) - mmr_base())
+ 
+@@ -48,6 +51,43 @@
+ };
+ #define mmr_name(off) mmr_names[(off) / 4]
+ 
++/* A write to PLL_CTL starts a relock.  The firmware here does what the
++   manual prescribes: SIC_IWR = PLL_WAKEUP, PLL_CTL, PLL_DIV, then IDLE
++   until the loop has locked, which takes PLL_LOCKCNT system clocks.
++   Without this event the simulator had nothing pending that early but its
++   own poll event, so the IDLE lasted until that -- 2.68 s of wall clock
++   at the top of every boot on the wall-clock time base, and the same leap
++   of guest time on the instruction-counted one.  One tick here is one
++   core clock; SCLK is VCO / SSEL and CCLK is VCO / 2^CSEL, so a system
++   clock is SSEL >> CSEL ticks.  The wake-up itself needs no interrupt:
++   the lock marks a wake-up pending, which ends the IDLE at once if the
++   lock came first (bfin-sim.c) and otherwise ends it as the next event;
++   the SIC line stays quiet as it would with the PLL_WAKEUP interrupt
++   masked.  */
++static void
++bfin_pll_locked (struct hw *me, void *data)
++{
++  struct bfin_pll *pll = hw_data (me);
++
++  pll->lock = NULL;
++  pll->pll_stat |= PLL_LOCKED;
++  bfin_idle_wake_pending = 1;
++}
++
++static void
++bfin_pll_relock (struct hw *me, struct bfin_pll *pll)
++{
++  unsigned ssel = pll->pll_div & 0xf;
++  unsigned csel = (pll->pll_div >> 4) & 3;
++  unsigned ratio = ssel >> csel;
++  bu32 count = (pll->pll_lockcnt ? pll->pll_lockcnt : 1) * (ratio ? ratio : 1);
++
++  pll->pll_stat &= ~PLL_LOCKED;
++  if (pll->lock)
++    hw_event_queue_deschedule (me, pll->lock);
++  pll->lock = hw_event_queue_schedule (me, count, bfin_pll_locked, NULL);
++}
++
+ static unsigned
+ bfin_pll_io_write_buffer (struct hw *me, const void *source,
+ 			  int space, address_word addr, unsigned nr_bytes)
+@@ -85,6 +125,8 @@
+       if (!dv_bfin_mmr_require_16 (me, addr, nr_bytes, true))
+ 	return 0;
+       *value16p = value;
++      if (mmr_off == mmr_offset (pll_ctl))
++	bfin_pll_relock (me, pll);
+       break;
+     }
+ 
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_ppi.c gdb-17.2/sim/bfin/dv-bfin_ppi.c
+--- a/sim/bfin/dv-bfin_ppi.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/dv-bfin_ppi.c	2026-09-02 14:38:31.702719200 +0200
+@@ -25,10 +25,49 @@
  #include "sim-main.h"
  #include "devices.h"
  #include "dv-bfin_ppi.h"
@@ -3418,8 +4200,44 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +
  /* XXX: TX is merely a stub.  */
  
++/* Trace switches read once; these sit on the PPI scanline and SPORT DMA
++   paths, which run tens of thousands of times a second.  */
++static struct
++{
++  int init;
++  int ppi_trace;
++  int sport_trace;
++  int rx_addr_trace;
++  int rx_zero_200;
++} bfin_ppi_env;
++
++static void
++bfin_ppi_env_init (void)
++{
++  bfin_ppi_env.init = 1;
++  bfin_ppi_env.ppi_trace = getenv ("BFIN_PPI_TRACE") != NULL;
++  bfin_ppi_env.sport_trace = getenv ("BFIN_SPORT_TRACE") != NULL;
++  bfin_ppi_env.rx_addr_trace = getenv ("BFIN_SPORT_RX_ADDR_TRACE") != NULL;
++  bfin_ppi_env.rx_zero_200 = getenv ("BFIN_SPORT_RX_ZERO_200") != NULL;
++}
++
++#define BFIN_PPI_ENV(field) \
++  ((bfin_ppi_env.init ? 0 : (bfin_ppi_env_init (), 0)), bfin_ppi_env.field)
++
++/* The record socket of the open MAIN link, for the run loop: a parked CPU
++   waits on it so a record from MAIN ends the sleep (interp.c).  */
++static int bfin_sport_link_record_fd_open = -1;
++
++int
++bfin_sport_link_wait_fd (void)
++{
++  return bfin_sport_link_record_fd_open;
++}
++
  struct bfin_ppi
-@@ -43,6 +48,7 @@
+ {
+   /* This top portion matches common dv_bfin struct.  */
+@@ -43,6 +82,7 @@
    /* GUI state.  */
    void *gui_state;
    int color;
@@ -3427,7 +4245,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  
    /* Order after here is important -- matches hardware MMR layout.  */
    bu16 BFIN_MMR_16(control);
-@@ -63,16 +69,13 @@
+@@ -63,16 +103,13 @@
  static void
  bfin_ppi_gui_setup (struct bfin_ppi *ppi)
  {
@@ -3445,23 +4263,23 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  				   ppi->frame,
  				   ppi->color);
  }
-@@ -96,6 +99,10 @@
+@@ -96,6 +133,10 @@
  
    HW_TRACE_WRITE ();
  
-+  if (getenv ("BFIN_PPI_TRACE"))
++  if (BFIN_PPI_ENV (ppi_trace))
 +    fprintf (stderr, "PPI MMR write off=%#x value=%#x control=%#x count=%u frame=%u\n",
 +	     mmr_off, value, ppi->control, ppi->count, ppi->frame);
 +
    switch (mmr_off)
      {
      case mmr_offset(control):
-@@ -170,6 +177,20 @@
+@@ -170,6 +211,20 @@
  
    HW_TRACE_DMA_WRITE ();
  
 +  ppi->cdj_dma_writes++;
-+  if (getenv ("BFIN_PPI_TRACE")
++  if (BFIN_PPI_ENV (ppi_trace)
 +      && (ppi->cdj_dma_writes <= 20
 +	  || (ppi->cdj_dma_writes % 255) == 0
 +	  || ((ppi->cdj_dma_writes - 1) % 255) == 0))
@@ -3477,7 +4295,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    return bfin_gui_update (ppi->gui_state, source, nr_bytes);
  }
  
-@@ -232,8 +253,2371 @@
+@@ -232,8 +287,2398 @@
    ppi->color = bfin_gui_color (color);
  }
  
@@ -3814,6 +4632,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +  if (sport->link_request_fd >= 0 && sport->link_record_fd >= 0)
 +    {
 +      sport->link_opened = 1;
++      bfin_sport_link_record_fd_open = sport->link_record_fd;
 +      bfin_sport_peer_trace (sport, "link-open", port);
 +    }
 +  else
@@ -4401,7 +5220,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +
 +      /* Which frame lands in which slot, and whether the record that announced
 +	 a payload is still the one the GUI holds when the payload arrives.  */
-+      if (getenv ("BFIN_SPORT_RX_ADDR_TRACE"))
++      if (BFIN_PPI_ENV (rx_addr_trace))
 +	{
 +	  const unsigned char *b = head + 8;
 +
@@ -4529,6 +5348,10 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +      if (got <= 0)
 +	break;
 +      sport->link_rx_bytes += (unsigned long) got;
++      {
++	extern unsigned long bfin_stat_link_rx_bytes;
++	bfin_stat_link_rx_bytes += (unsigned long) got;
++      }
 +      sport->link_in_len += (size_t) got;
 +    }
 +  bfin_sport_link_split (sport);
@@ -5362,7 +6185,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +  else
 +    sport->regs[off / 4] = ((sport->regs[off / 4] & 0xffff0000)
 +			    | dv_load_2 (source));
-+  if (getenv ("BFIN_SPORT_TRACE"))
++  if (BFIN_PPI_ENV (sport_trace))
 +    fprintf (stderr, "SPORT MMR base=%#x write off=%#x bytes=%u value=%#x\n",
 +	     sport->base, off, nr_bytes, sport->regs[off / 4]);
 +  return nr_bytes;
@@ -5402,7 +6225,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +     goes to 0x00f00000 and an announced payload to 0x00f00040, and a 64-byte
 +     record delivered into 0x00f00000 while the firmware is waiting for a
 +     payload rewrites the word count it is about to use.  */
-+  if (getenv ("BFIN_SPORT_RX_ADDR_TRACE"))
++  if (BFIN_PPI_ENV (rx_addr_trace))
 +    {
 +      unsigned char state = 0;
 +      unsigned char busy = 0;
@@ -5427,7 +6250,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +     cannot predict how many housekeeping reads the emulated threads will
 +     schedule, so optionally satisfy those reads without advancing the MAIN
 +     packet script.  */
-+  if (nr_bytes == 200 && getenv ("BFIN_SPORT_RX_ZERO_200"))
++  if (nr_bytes == 200 && BFIN_PPI_ENV (rx_zero_200))
 +    {
 +      /* record_waiting() drains the socket and spends the yield budget, so it
 +	 has to run whichever way the refusal below goes -- otherwise the switch
@@ -5810,6 +6633,28 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +  { NULL, 0, 0, 0, },
 +};
 +
++/* Once, on the first status-record receive: the SPORT's clock registers,
++   so the wire rate the firmware programmed is on the log next to any
++   latency experiment.  TCR1/RCR1 bit 1 (ITCLK/IRCLK) says whether the
++   clock is internal, in which case the bit rate is SCLK / (2 * (div + 1));
++   otherwise MAIN drives it and the registers say nothing about it.  */
++void
++bfin_sport_clock_report (struct hw *me)
++{
++  static int reported;
++  struct bfin_sport *sport = hw_data (me);
++
++  if (reported)
++    return;
++  reported = 1;
++  fprintf (stderr, "bfin sport: tcr1=%#x tcr2=%#x tclkdiv=%u rcr1=%#x"
++	   " rcr2=%#x rclkdiv=%u (%s clock)\n",
++	   sport->regs[0], sport->regs[1], sport->regs[2], sport->regs[8],
++	   sport->regs[9], sport->regs[10],
++	   (sport->regs[8] & 2) ? "internal receive" : "external receive");
++  fflush (stderr);
++}
++
 +static void
 +bfin_sport_finish (struct hw *me)
 +{
@@ -5849,8 +6694,9 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +  {"bfin_sport", bfin_sport_finish,},
    {NULL, NULL},
  };
---- a/sim/bfin/gui.c
-+++ b/sim/bfin/gui.c
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/gui.c gdb-17.2/sim/bfin/gui.c
+--- a/sim/bfin/gui.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/gui.c	2026-09-02 12:18:29.160827900 +0200
 @@ -294,6 +294,12 @@
  };
  #define SDL_PIXELFORMAT_RGB565 &sdl_rgb_565
@@ -5872,7 +6718,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    { "rgb565",   2, SDL_PIXELFORMAT_RGB565,   GUI_COLOR_RGB_565,   },
    { "bgr565",   2, SDL_PIXELFORMAT_BGR565,   GUI_COLOR_BGR_565,   },
    { "rgb888",   3, SDL_PIXELFORMAT_RGB888,   GUI_COLOR_RGB_888,   },
-@@ -383,4 +390,483 @@
+@@ -383,4 +390,507 @@
    return format ? bytes_per_pixel * 8 : 0;
  }
  
@@ -6045,8 +6891,8 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +  output_path = getenv ("BFIN_GUI_DETAIL_OUTPUT");
 +  gui->detail_output_path = output_path && *output_path
 +			    ? xstrdup (output_path) : NULL;
-+  gui->rgb = XNEWVEC (unsigned char, (size_t) width * height * 3);
-+  gui->raw = XNEWVEC (unsigned char,
++  gui->rgb = XCNEWVEC (unsigned char, (size_t) width * height * 3);
++  gui->raw = XCNEWVEC (unsigned char,
 +		     (size_t) width * height * bytes_per_pixel);
 +  gui->published = XNEWVEC (unsigned char, (size_t) width * height * 3);
 +  gui->have_published = 0;
@@ -6129,19 +6975,20 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +	  *dest++ = b;
 +	}
 +
-+      {
-+	unsigned long pixel = ((unsigned long) pixel_dest[0] << 16)
-+			      | ((unsigned long) pixel_dest[1] << 8)
-+			      | pixel_dest[2];
-+	if (pixel)
-+	  gui->frame_score++;
-+	if (pixel != previous)
-+	  {
-+	    gui->frame_score += 64;
-+	    gui->frame_detail++;
-+	  }
-+	previous = pixel;
-+      }
++      if (gui->best_output_path || gui->detail_output_path)
++	{
++	  unsigned long pixel = ((unsigned long) pixel_dest[0] << 16)
++				| ((unsigned long) pixel_dest[1] << 8)
++				| pixel_dest[2];
++	  if (pixel)
++	    gui->frame_score++;
++	  if (pixel != previous)
++	    {
++	      gui->frame_score += 64;
++	      gui->frame_detail++;
++	    }
++	  previous = pixel;
++	}
 +
 +      source += gui->bytes_per_pixel;
 +    }
@@ -6277,11 +7124,30 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +  if (nr_bytes < line_bytes)
 +    return 0;
 +
-+  memcpy (gui->raw + (size_t) gui->curr_line * line_bytes,
-+	  source, line_bytes);
-+  bfin_gui_convert_line (gui, source);
++  /* The display scans at 60 frames a second and the picture changes a few
++     times a second, so almost every line arriving here is the line already
++     converted last time.  Convert only when the raw pixels differ from what
++     is stored -- both buffers start zeroed, and a zero pixel converts to
++     black in every format, so the first frame is right too.  The best/detail
++     scores are per frame and need every line, so they keep the old path
++     while their outputs are in use.  Measured: the conversion was 27 % of
++     the simulator's wall clock while the firmware idled.  */
++  {
++    unsigned char *raw_line = gui->raw + (size_t) gui->curr_line * line_bytes;
++    int scoring = gui->best_output_path || gui->detail_output_path;
++
++    if (scoring || memcmp (raw_line, source, line_bytes) != 0)
++      {
++	memcpy (raw_line, source, line_bytes);
++	bfin_gui_convert_line (gui, source);
++      }
++  }
 +  if (++gui->curr_line == gui->height)
 +    {
++      {
++	extern unsigned long bfin_stat_frames;
++	++bfin_stat_frames;
++      }
 +      /* BFIN_GUI_FRAME_TRACE: how many frames the compositor has *completed*,
 +	 which is the one thing a frame sampler cannot see.  A screen whose
 +	 bytes stop changing and a compositor that has stopped publishing look
@@ -6334,6 +7200,10 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +	  {
 +	    memcpy (gui->published, gui->rgb, bytes);
 +	    gui->have_published = 1;
++	    {
++	      extern unsigned long bfin_stat_frames_published;
++	      ++bfin_stat_frames_published;
++	    }
 +	    bfin_gui_write_frame_to (gui, gui->output_path);
 +	    bfin_gui_write_raw_frame (gui);
 +	  }
@@ -6356,8 +7226,9 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +}
 +
  #endif
---- a/sim/bfin/gui.h
-+++ b/sim/bfin/gui.h
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/gui.h gdb-17.2/sim/bfin/gui.h
+--- a/sim/bfin/gui.h	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/gui.h	2026-09-02 09:40:29.286209800 +0200
 @@ -22,7 +22,7 @@
  #define BFIN_GUI_H
  
@@ -6375,21 +7246,42 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    GUI_COLOR_RGB_565,
    GUI_COLOR_BGR_565,
    GUI_COLOR_RGB_888,
---- a/sim/bfin/interp.c
-+++ b/sim/bfin/interp.c
-@@ -549,6 +549,25 @@
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/interp.c gdb-17.2/sim/bfin/interp.c
+--- a/sim/bfin/interp.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/interp.c	2026-09-02 13:22:43.152968800 +0200
+@@ -40,6 +40,19 @@
+ 
+ #include "bfin-sim.h"
+ 
++#include <inttypes.h>
++#include <limits.h>
++#include <time.h>
++#ifdef _WIN32
++#include <winsock2.h>
++#include <windows.h>
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++#else
++#include <sys/select.h>
++#endif
++
+ /* The numbers here do not matter.  They just need to be unique.  They also
+    need not be static across releases -- they're used internally only.  The
+    mapping from the Linux ABI to the CB values is in linux-targ-map.h.  */
+@@ -549,6 +562,25 @@
    bu32 insn_len, oldpc = PCREG;
    int i;
    bool ssstep;
 +  static int state_trace = -1;
 +  static unsigned state_trace_count;
 +
-+  if (state_trace < 0)
++  if (__builtin_expect (bfin_probes_active > 0, 0) && state_trace < 0)
 +    {
 +      const char *trace_env = getenv ("BFIN_GUI_STATE_TRACE");
 +      state_trace = trace_env && *trace_env;
 +    }
-+  if (state_trace && state_trace_count < 64
++  if (state_trace > 0 && state_trace_count < 64
 +      && (oldpc == 0x00b7dec8 || oldpc == 0x00b7defa
 +	  || oldpc == 0x00b7df92 || oldpc == 0x00b7c85c))
 +    {
@@ -6403,48 +7295,643 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  
    if (TRACE_ANY_P (cpu))
      trace_prefix (sd, cpu, NULL_CIA, oldpc, TRACE_LINENUM_P (cpu),
-@@ -620,6 +639,31 @@
+@@ -607,6 +639,567 @@
+   return oldpc;
+ }
+ 
++/* The page cache behind bfin_fast_host (bfin-sim.h).  */
++
++struct bfin_page_entry bfin_page_cache[nr_maps][BFIN_PAGE_CACHE_ENTRIES];
++unsigned bfin_page_cache_generation = (unsigned) -1;
++int bfin_page_cache_disabled;
++unsigned long bfin_stat_mem_fill;
++
++static void
++bfin_page_cache_flush (void)
++{
++  unsigned map, i;
++
++  for (map = 0; map < nr_maps; map++)
++    for (i = 0; i < BFIN_PAGE_CACHE_ENTRIES; i++)
++      {
++	bfin_page_cache[map][i].page = (bu32) -1;
++	bfin_page_cache[map][i].host = NULL;
++      }
++  bfin_page_cache_generation = sim_core_generation;
++}
++
++unsigned char *
++bfin_page_fill (SIM_CPU *cpu, unsigned map, bu32 addr)
++{
++  sim_core_common *core = &CPU_CORE (cpu)->common;
++  bu32 page = addr >> BFIN_PAGE_SHIFT;
++  bu32 start = page << BFIN_PAGE_SHIFT;
++  struct bfin_page_entry *e
++    = &bfin_page_cache[map][page & (BFIN_PAGE_CACHE_ENTRIES - 1)];
++  sim_core_mapping *mapping;
++  unsigned char *host = NULL;
++
++  if (bfin_page_cache_disabled)
++    return NULL;
++  if (bfin_page_cache_generation != sim_core_generation)
++    bfin_page_cache_flush ();
++  ++bfin_stat_mem_fill;
++
++  /* The same walk as sim_core_find_mapping, done here because that function
++     and sim_core_translate are module-inline and not visible from this file
++     in every inline configuration.  The list is ordered the way the core
++     keeps it, so the first mapping that covers the page is the one the core
++     would use.  */
++  for (mapping = core->map[map].first; mapping != NULL; mapping = mapping->next)
++    if (start >= mapping->base && start <= mapping->bound)
++      break;
++  if (mapping != NULL
++      && mapping->device == NULL
++      && mapping->buffer != NULL
++      && start + (BFIN_PAGE_SIZE - 1) <= mapping->bound
++      && (mapping->mask & (BFIN_PAGE_SIZE - 1)) == BFIN_PAGE_SIZE - 1
++      && (mapping->base & (BFIN_PAGE_SIZE - 1)) == 0)
++    host = ((unsigned char *) mapping->buffer
++	    + ((start - mapping->base) & mapping->mask));
++
++  e->page = page;
++  e->host = host;
++  return host ? host + (addr & (BFIN_PAGE_SIZE - 1)) : NULL;
++}
++
++/* The wall-clock time base's state; the code is below the statistics.  */
++struct bfin_wall
++{
++  int init;
++  int active;
++  double cclk_hz;
++  double t0;
++  int64_t base_ticks;
++  int64_t lag_cap;
++  int64_t prepaid;		/* ticks a wait covered, not yet delivered */
++  int64_t dropped;
++  double parked_s;
++  unsigned ppi_fps;
++  unsigned sport_retry_us;
++  unsigned long waits, spins;
++};
++static struct bfin_wall bfin_wall;
++int bfin_idle_hint;
++int bfin_idle_wake_pending;
++
++/* Wall-clock statistics and a clean exit, for measuring the simulator itself.
++
++     BFIN_STATS=<seconds>            print a STATS line to stderr every <seconds>
++     BFIN_EXIT_AFTER_WALL=<seconds>  halt with exit status 0 after this much
++                                     wall clock, so gprof and PGO can write
++                                     their files.  Every launcher otherwise ends
++                                     a run in TerminateProcess, and nothing
++                                     written at exit survives that.
++
++   The counters cost one increment per instruction and one wall-clock read per
++   65536 instructions, and the wall clock is only read when one of the two
++   variables is set.  The other counters are incremented where the events
++   happen (dv-bfin_dma.c, gui.c, dv-bfin_ppi.c) and only read here.  */
++
++unsigned long bfin_stat_dma_events;
++unsigned long bfin_stat_frames;
++unsigned long bfin_stat_frames_published;
++unsigned long bfin_stat_link_rx_bytes;
++
++struct bfin_stats
++{
++  int initialised;
++  int enabled;
++  double every;
++  double exit_after;
++  int64_t exit_after_ticks;
++  double t0;
++  double next_report;
++  double last_wall;
++  uint64_t insns;
++  uint64_t last_insns;
++  int64_t last_ticks;
++  unsigned long events;
++  unsigned long last_events;
++};
++static struct bfin_stats bfin_stats;
++
++double
++bfin_wall_seconds (void)
++{
++#ifdef _WIN32
++  static LARGE_INTEGER freq;
++  LARGE_INTEGER now;
++  if (freq.QuadPart == 0)
++    QueryPerformanceFrequency (&freq);
++  QueryPerformanceCounter (&now);
++  return (double) now.QuadPart / (double) freq.QuadPart;
++#else
++  struct timespec ts;
++  clock_gettime (CLOCK_MONOTONIC, &ts);
++  return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
++#endif
++}
++
++#ifdef _WIN32
++/* BFIN_SAMPLE_PROFILE=<file>: a sampling profiler that needs nothing from the
++   toolchain.  A second thread suspends the run thread about a thousand times
++   a second, reads its instruction pointer and appends it to the file; the
++   first eight bytes are the module base, so the addresses can be rebased to
++   the link-time image and resolved with addr2line -f -e bin/cdj-run.exe.
++   gprof on MinGW produced call counts but no samples, which is what this is
++   for.  Costs ~1 % while it runs; nothing at all when the variable is unset.  */
++static struct
++{
++  HANDLE target;
++  FILE *out;
++  volatile int stop;
++  unsigned long samples;
++  double start_after;		/* BFIN_SAMPLE_PROFILE_AT, wall seconds */
++} bfin_sampler;
++
++static DWORD WINAPI
++bfin_sampler_thread (LPVOID arg)
++{
++  uint64_t buffer[256];
++  unsigned n = 0;
++
++  if (bfin_sampler.start_after > 0)
++    Sleep ((DWORD) (bfin_sampler.start_after * 1000));
++  while (!bfin_sampler.stop)
++    {
++      CONTEXT ctx;
++
++      Sleep (1);
++      memset (&ctx, 0, sizeof (ctx));
++      ctx.ContextFlags = CONTEXT_CONTROL;
++      if (SuspendThread (bfin_sampler.target) == (DWORD) -1)
++	continue;
++      if (GetThreadContext (bfin_sampler.target, &ctx))
++	{
++	  buffer[n++] = ctx.Rip;
++	  bfin_sampler.samples++;
++	}
++      ResumeThread (bfin_sampler.target);
++      if (n == 256)
++	{
++	  fwrite (buffer, sizeof (buffer[0]), n, bfin_sampler.out);
++	  fflush (bfin_sampler.out);
++	  n = 0;
++	}
++    }
++  if (n)
++    fwrite (buffer, sizeof (buffer[0]), n, bfin_sampler.out);
++  fflush (bfin_sampler.out);
++  return 0;
++}
++
++static void
++bfin_sampler_start (const char *path)
++{
++  uint64_t base = (uint64_t) (uintptr_t) GetModuleHandleA (NULL);
++  const char *at = getenv ("BFIN_SAMPLE_PROFILE_AT");
++
++  if (at && *at)
++    bfin_sampler.start_after = strtod (at, NULL);
++  bfin_sampler.out = fopen (path, "wb");
++  if (!bfin_sampler.out)
++    return;
++  fwrite (&base, sizeof (base), 1, bfin_sampler.out);
++  if (!DuplicateHandle (GetCurrentProcess (), GetCurrentThread (),
++			GetCurrentProcess (), &bfin_sampler.target,
++			0, FALSE, DUPLICATE_SAME_ACCESS))
++    return;
++  CreateThread (NULL, 0, bfin_sampler_thread, NULL, 0, NULL);
++  fprintf (stderr, "bfin: sampling profile -> %s\n", path);
++  fflush (stderr);
++}
++#endif
++
++static void
++bfin_stats_init (void)
++{
++  const char *value;
++
++  bfin_stats.initialised = 1;
++#ifdef _WIN32
++  value = getenv ("BFIN_SAMPLE_PROFILE");
++  if (value && *value)
++    bfin_sampler_start (value);
++#endif
++  value = getenv ("BFIN_STATS");
++  if (value && *value)
++    bfin_stats.every = strtod (value, NULL);
++  value = getenv ("BFIN_EXIT_AFTER_WALL");
++  if (value && *value)
++    bfin_stats.exit_after = strtod (value, NULL);
++  /* BFIN_EXIT_AFTER_TICKS=<n>: halt at a guest time rather than a wall time.
++     Two binaries run to the same tick count from the same input have to
++     produce the same picture and the same instruction count; that is the
++     regression test for anything that touches the interpreter.  */
++  value = getenv ("BFIN_EXIT_AFTER_TICKS");
++  if (value && *value)
++    bfin_stats.exit_after_ticks = strtoll (value, NULL, 0);
++  /* BFIN_MEM_FAST=0 keeps every access on the core's slow path (A/B).  */
++  value = getenv ("BFIN_MEM_FAST");
++  if (value && *value && strtol (value, NULL, 0) == 0)
++    bfin_page_cache_disabled = 1;
++  bfin_stats.enabled = (bfin_stats.every > 0 || bfin_stats.exit_after > 0
++			|| bfin_stats.exit_after_ticks > 0);
++  bfin_stats.t0 = bfin_wall_seconds ();
++  bfin_stats.last_wall = bfin_stats.t0;
++  bfin_stats.next_report = bfin_stats.t0 + bfin_stats.every;
++}
++
++static void
++bfin_stats_poll (SIM_DESC sd, SIM_CPU *cpu)
++{
++  double now = bfin_wall_seconds ();
++
++  if (bfin_stats.every > 0 && now >= bfin_stats.next_report)
++    {
++      int64_t ticks = sim_events_time (sd);
++      double dt = now - bfin_stats.last_wall;
++
++      fprintf (stderr,
++	       "STATS wall=%.1f insns=%" PRIu64 " mips=%.2f ticks=%" PRId64
++	       " tick_rate=%.3fM/s events=%lu dma=%lu frames=%lu"
++	       " published=%lu link_rx=%lu mem_fill=%lu"
++	       " guest_s=%.2f parked_s=%.2f dropped_ms=%.1f waits=%lu spins=%lu\n",
++	       now - bfin_stats.t0, bfin_stats.insns,
++	       (double) (bfin_stats.insns - bfin_stats.last_insns) / dt / 1e6,
++	       ticks, (double) (ticks - bfin_stats.last_ticks) / dt / 1e6,
++	       bfin_stats.events, bfin_stat_dma_events, bfin_stat_frames,
++	       bfin_stat_frames_published, bfin_stat_link_rx_bytes,
++	       bfin_stat_mem_fill,
++	       (double) (ticks - bfin_wall.base_ticks) / bfin_wall.cclk_hz,
++	       bfin_wall.parked_s,
++	       (double) bfin_wall.dropped / bfin_wall.cclk_hz * 1e3,
++	       bfin_wall.waits, bfin_wall.spins);
++      fflush (stderr);
++      bfin_stats.last_wall = now;
++      bfin_stats.last_insns = bfin_stats.insns;
++      bfin_stats.last_ticks = ticks;
++      bfin_stats.last_events = bfin_stats.events;
++      while (bfin_stats.next_report <= now)
++	bfin_stats.next_report += bfin_stats.every;
++    }
++  if (bfin_stats.exit_after_ticks > 0
++      && sim_events_time (sd) >= bfin_stats.exit_after_ticks)
++    {
++      fprintf (stderr, "STATS exit at %" PRId64 " ticks after %" PRIu64
++	       " insns, %.1f s\n",
++	       sim_events_time (sd), bfin_stats.insns, now - bfin_stats.t0);
++      fflush (stderr);
++#ifdef _WIN32
++      bfin_sampler.stop = 1;
++      Sleep (20);
++#endif
++      sim_engine_halt (sd, cpu, NULL, PCREG, sim_exited, 0);
++    }
++  if (bfin_stats.exit_after > 0
++      && now - bfin_stats.t0 >= bfin_stats.exit_after)
++    {
++      fprintf (stderr, "STATS exit after %.1f s of wall clock\n",
++	       now - bfin_stats.t0);
++      fflush (stderr);
++#ifdef _WIN32
++      bfin_sampler.stop = 1;
++      Sleep (20);
++#endif
++      sim_engine_halt (sd, cpu, NULL, PCREG, sim_exited, 0);
++    }
++}
++
++/* Guest time on the wall clock.
++
++   The simulator's event queue counts ticks, and every device model schedules
++   in ticks: the core timer, the DMA engines, the link retry.  Upstream ticks
++   once per instruction (plus a few for slow ones), so guest time is however
++   fast the interpreter happens to run -- here about a tenth of real time --
++   and the firmware's every delay, timeout and animation stretches with it.
++
++   BFIN_TIME_BASE=wall (the default) delivers ticks at the rate the wall clock
++   advances, BFIN_CCLK_HZ ticks per second: every 256 instructions the due
++   ticks are delivered in one go, and when the CPU is parked -- the firmware
++   idles main() in a one-instruction loop that jumps to itself, or executes
++   IDLE -- the simulator sleeps until the next event is due, or until data
++   arrives on the MAIN link.  Guest time never runs ahead of the wall clock,
++   which is what lets this board and the QEMU board, which already runs on
++   the wall clock, see the same time.
++
++   A burst that the interpreter cannot keep up with makes guest time fall
++   behind; BFIN_WALL_LAG_MS (50) caps how far, the excess is dropped, and the
++   STATS line reports it.  Delivery stops early whenever a handler moves the
++   PC, so an interrupt runs before the next expiry is delivered rather than
++   piling expiries up in ILAT.
++
++   BFIN_TIME_BASE=insn is the upstream behaviour, for reproducing a run
++   instruction for instruction.  */
++
++
++int
++bfin_wall_active (void)
++{
++  return bfin_wall.active;
++}
++
++unsigned
++bfin_wall_ticks_us (unsigned us)
++{
++  return (unsigned) (bfin_wall.cclk_hz * us / 1e6);
++}
++
++unsigned
++bfin_wall_frame_gap_ticks (unsigned lines_already)
++{
++  unsigned frame = (unsigned) (bfin_wall.cclk_hz / bfin_wall.ppi_fps);
++
++  return frame > lines_already ? frame - lines_already : 1;
++}
++
++static void
++bfin_wall_init (SIM_DESC sd)
++{
++  const char *value;
++
++  bfin_wall.init = 1;
++  bfin_wall.active = 1;
++  bfin_wall.cclk_hz = 400e6;
++  bfin_wall.ppi_fps = 60;
++  bfin_wall.sport_retry_us = 1000;
++  value = getenv ("BFIN_TIME_BASE");
++  if (value && strcmp (value, "insn") == 0)
++    bfin_wall.active = 0;
++  value = getenv ("BFIN_CCLK_HZ");
++  if (value && *value)
++    bfin_wall.cclk_hz = strtod (value, NULL);
++  value = getenv ("BFIN_PPI_FPS");
++  if (value && *value)
++    bfin_wall.ppi_fps = strtoul (value, NULL, 0);
++  value = getenv ("BFIN_SPORT_RETRY_US");
++  if (value && *value)
++    bfin_wall.sport_retry_us = strtoul (value, NULL, 0);
++  value = getenv ("BFIN_WALL_LAG_MS");
++  bfin_wall.lag_cap = (int64_t) (bfin_wall.cclk_hz
++				 * (value && *value ? strtod (value, NULL) : 50.0)
++				 / 1e3);
++  bfin_wall.t0 = bfin_wall_seconds ();
++  bfin_wall.base_ticks = sim_events_time (sd);
++  fprintf (stderr, "bfin: time base %s, cclk %.0f MHz, ppi %u fps,"
++	   " sport retry %u us, lag cap %" PRId64 " ticks\n",
++	   bfin_wall.active ? "wall" : "insn", bfin_wall.cclk_hz / 1e6,
++	   bfin_wall.ppi_fps, bfin_wall.sport_retry_us, bfin_wall.lag_cap);
++  fflush (stderr);
++}
++
++/* Sleep for about this long, or until the MAIN link has data.  Below a
++   third of a millisecond the caller spins instead: the Windows scheduler
++   cannot do better, and a late wake is absorbed by the catch-up anyway.  */
++static void
++bfin_wall_wait (double seconds)
++{
++  int fd = bfin_sport_link_wait_fd ();
++
++  if (seconds <= 0)
++    return;
++#ifdef _WIN32
++  if (fd >= 0)
++    {
++      WSAPOLLFD pfd;
++      int timeout_ms = (int) (seconds * 1000);
++
++      pfd.fd = (SOCKET) fd;
++      pfd.events = POLLRDNORM;
++      pfd.revents = 0;
++      WSAPoll (&pfd, 1, timeout_ms < 1 ? 1 : timeout_ms);
++      return;
++    }
++  {
++    static HANDLE timer;
++    static int timer_tried;
++    LARGE_INTEGER due;
++
++    if (!timer_tried)
++      {
++	timer_tried = 1;
++	timer = CreateWaitableTimerExW (NULL, NULL,
++					CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++					TIMER_ALL_ACCESS);
++	if (!timer)
++	  timer = CreateWaitableTimerW (NULL, TRUE, NULL);
++      }
++    due.QuadPart = -(LONGLONG) (seconds * 1e7);
++    if (timer && SetWaitableTimer (timer, &due, 0, NULL, NULL, FALSE))
++      WaitForSingleObject (timer, INFINITE);
++    else
++      Sleep ((DWORD) (seconds * 1000));
++  }
++#else
++  {
++    fd_set rd;
++    struct timeval tv;
++
++    FD_ZERO (&rd);
++    if (fd >= 0)
++      FD_SET (fd, &rd);
++    tv.tv_sec = (long) seconds;
++    tv.tv_usec = (long) ((seconds - tv.tv_sec) * 1e6);
++    select (fd >= 0 ? fd + 1 : 0, fd >= 0 ? &rd : NULL, NULL, NULL, &tv);
++  }
++#endif
++}
++
++/* Deliver up to `rest` ticks.  sim_events_tick fires at time_from_event == 0
++   and sim_events_tickn only when the chunk is larger than time_from_event,
++   so a chunk is never larger than the distance to the next event, and the
++   last tick of a chunk is delivered by sim_events_tick.  Stops as soon as a
++   handler moved the PC, so the interrupt runs before the next expiry.  */
++static void
++bfin_wall_deliver (SIM_DESC sd, SIM_CPU *cpu, int64_t rest)
++{
++  bu32 pc_before = PCREG;
++  sim_events *events = STATE_EVENTS (sd);
++
++  while (rest > 0)
++    {
++      int64_t T = events->time_from_event;
++
++      if (T <= 0 || events->work_pending)
++	{
++	  if (sim_events_tick (sd))
++	    {
++	      sim_events_process (sd);
++	      ++bfin_stats.events;
++	    }
++	  rest--;
++	}
++      else
++	{
++	  int64_t n = rest < T ? rest : T;
++
++	  if (n > INT_MAX / 2)
++	    n = INT_MAX / 2;
++	  if (sim_events_tickn (sd, (int) n))
++	    {
++	      sim_events_process (sd);
++	      ++bfin_stats.events;
++	    }
++	  rest -= n;
++	}
++      if (PCREG != pc_before)
++	break;
++    }
++}
++
++/* Bring guest time up to the wall clock.  When the CPU is parked and guest
++   time has caught up, wait for the next event.  */
++static void
++bfin_wall_sync (SIM_DESC sd, SIM_CPU *cpu, int parked)
++{
++  double now = bfin_wall_seconds ();
++  int64_t target = bfin_wall.base_ticks
++    + (int64_t) ((now - bfin_wall.t0) * bfin_wall.cclk_hz);
++  int64_t current = sim_events_time (sd);
++  int64_t rest = target - current;
++  /* Ticks a deliberate wait below has already covered are not lag: they
++     are delivered in full, on top of the cap, so an event further away
++     than the cap -- a one-second timer, the simulator's own poll event --
++     fires once, at its time, instead of being chased in 50 ms slices with
++     a full wait before each.  Measured before this: the first IDLE of a
++     boot waited 2.68 s and then had 2.63 s of it dropped.  */
++  int64_t cap = bfin_wall.lag_cap + bfin_wall.prepaid;
++
++  if (rest > cap)
++    {
++      /* Too far behind: forgive the excess by moving the origin, so the
++	 guest clock loses that time once rather than chasing it.  */
++      int64_t excess = rest - cap;
++
++      bfin_wall.dropped += excess;
++      bfin_wall.t0 += (double) excess / bfin_wall.cclk_hz;
++      rest = cap;
++    }
++  if (rest > 0)
++    {
++      bu32 pc_before = PCREG;
++      unsigned long events_before = bfin_stats.events;
++
++      bfin_wall_deliver (sd, cpu, rest);
++      bfin_wall.prepaid -= sim_events_time (sd) - current;
++      if (bfin_wall.prepaid < 0)
++	bfin_wall.prepaid = 0;
++      if (PCREG != pc_before)
++	return;			/* a handler is due to run */
++      /* An event fired while catching up.  For an IDLE that is the wake-up
++	 it was waiting for -- the PLL lock, due 8 us after the write and so
++	 always inside the first catch-up -- and the core goes on; the
++	 self-jump idle loop simply parks again on its next instruction.
++	 Measured before: the lock fired here unnoticed and the IDLE then
++	 slept 2.68 s to the simulator's poll event.  */
++      if (parked && bfin_stats.events != events_before)
++	return;
++    }
++  if (!parked)
++    return;
++
++  {
++    sim_events *events = STATE_EVENTS (sd);
++    double due, wait;
++
++    current = sim_events_time (sd);
++    due = bfin_wall.t0
++      + (double) (current + events->time_from_event - bfin_wall.base_ticks)
++      / bfin_wall.cclk_hz;
++    now = bfin_wall_seconds ();
++    wait = due - now;
++    if (wait > 0.0003)
++      {
++	double before = now;
++
++	bfin_wall_wait (wait - 0.0002);
++	now = bfin_wall_seconds ();
++	bfin_wall.parked_s += now - before;
++	bfin_wall.prepaid += (int64_t) ((now - before) * bfin_wall.cclk_hz);
++	bfin_wall.waits++;
++      }
++    else
++      bfin_wall.spins++;
++  }
++}
++
+ void
+ sim_engine_run (SIM_DESC sd,
+ 		int next_cpu_nr, /* ignore  */
+@@ -620,14 +1213,59 @@
  
    cpu = STATE_CPU (sd, 0);
  
-+  /* **Do not "optimise" the idle loop away.  It was tried and it is wrong.**
++  /* The idle loop.
 +
-+     The GUI firmware parks main() at 0x00b7bb98 in a one-instruction loop that
-+     jumps to itself, and 83% of every instruction this simulator executes is
-+     that JUMP (measured 2026-08-07 with BFIN_PC_SAMPLE_TRACE).  It looks like
-+     free money.  It is not: in this simulator guest time advances *per
-+     instruction executed* -- CYCLE_DELAY event ticks per step_once -- so the
-+     idle loop is not wasted host time, it is how guest time passes.
++     The GUI firmware parks main() at 0x00b7bb98 in a one-instruction loop
++     that jumps to itself, and most of what this simulator used to execute was
++     that JUMP, because guest time advanced only by executing instructions.
++     An earlier attempt to skip it made the boot slower and concluded that a
++     faster interpreter was the only answer.  It was not: that attempt let
++     guest time run ahead of the wall clock while parked, so the display DMA
++     and the link retries fired as fast as the host could manage while MAIN,
++     on real time, fell behind.
 +
-+     Two versions were built and measured over 100 s of wall clock against the
-+     stock loop, which reached its seven boot pictures at 0, 28, 31, 34, 60, 63
-+     and 65 s:
++     The wall-clock time base (bfin_wall_sync) skips the loop the right way
++     round: a parked CPU sleeps until the next event is due, ticks are
++     delivered at BFIN_CCLK_HZ per wall second and never ahead of the clock.
++     Measured: guest ticks track the wall clock at exactly 400 M/s, the
++     simulator sleeps two thirds of a boot, and the player screen appears in
++     about 35 s where the instruction-counted time base still showed the
++     "Wait" spinner at 150 s.  BFIN_TIME_BASE=insn keeps the old behaviour for
++     reproducing a run.  */
++  if (!bfin_stats.initialised)
++    bfin_stats_init ();
++  if (!bfin_wall.init)
++    bfin_wall_init (sd);
 +
-+       - jump the event queue to `time_from_event` while parked:
-+         2604 PPI scanouts but ONE picture.
-+       - tick at the original rate but skip only the decode:
-+         7178 scanouts, and the same seven pictures arrived *later*
-+         (1, 24, 34, 45, 63, 75, 86 s).
-+
-+     Both make guest time advance without the guest executing, so the CPU gets
-+     less work done per guest second and the freed host time goes into running
-+     the PPI DMA faster, which nobody wanted.  The boot is not host-CPU-bound
-+     on the idle loop; it is bound by interpreter throughput, 3.5 MIPS against
-+     a real BF531's ~500.  That is a 143x gap and no amount of idle-skipping
-+     closes it -- it needs a faster interpreter, not a cleverer wait.  */
    while (1)
      {
-       step_once (cpu);
-@@ -628,6 +672,7 @@
-       for (ticks = 0; ticks < CYCLE_DELAY; ++ticks)
- 	if (sim_events_tick (sd))
- 	  sim_events_process (sd);
+-      step_once (cpu);
+-      /* Process any events -- can't use tickn because it may
+-         advance right over the next event.  */
+-      for (ticks = 0; ticks < CYCLE_DELAY; ++ticks)
+-	if (sim_events_tick (sd))
+-	  sim_events_process (sd);
++      bu32 oldpc = step_once (cpu);
 +
++      ++bfin_stats.insns;
++      if (bfin_wall.active)
++	{
++	  /* Parked: a jump to itself outside a hardware loop, or IDLE.  */
++	  int parked = ((PCREG == oldpc && BFIN_CPU_STATE.did_jump
++			 && LCREG (0) == 0 && LCREG (1) == 0)
++			|| bfin_idle_hint);
++
++	  bfin_idle_hint = 0;
++	  if (parked || (bfin_stats.insns & 0xff) == 0)
++	    bfin_wall_sync (sd, cpu, parked);
++	}
++      else
++	{
++	  /* Process any events -- can't use tickn because it may
++	     advance right over the next event.  */
++	  for (ticks = 0; ticks < CYCLE_DELAY; ++ticks)
++	    if (sim_events_tick (sd))
++	      {
++		sim_events_process (sd);
++		++bfin_stats.events;
++	      }
++	}
++      if ((bfin_stats.insns & 0xffff) == 0 && bfin_stats.enabled)
++	bfin_stats_poll (sd, cpu);
      }
  }
  
---- a/sim/bfin/machs.c
-+++ b/sim/bfin/machs.c
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/machs.c gdb-17.2/sim/bfin/machs.c
+--- a/sim/bfin/machs.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/machs.c	2026-09-02 09:40:29.321344000 +0200
 @@ -510,8 +510,6 @@
  static const struct bfin_memory_layout bf531_mem[] =
  {
@@ -6481,8 +7968,27 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    DEVICE (0xFFC00A00, BFIN_MMR_EBIU_AMC_SIZE,  "bfin_ebiu_amc"),
    DEVICE (0xFFC00A10, BFIN_MMR_EBIU_SDC_SIZE,  "bfin_ebiu_sdc"),
    DEVICE (0xFFC01000, BFIN_MMR_PPI_SIZE,       "bfin_ppi@0"),
---- a/sim/common/dv-cfi.c
-+++ b/sim/common/dv-cfi.c
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/sim-main.h gdb-17.2/sim/bfin/sim-main.h
+--- a/sim/bfin/sim-main.h	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/bfin/sim-main.h	2026-09-02 10:46:37.759949100 +0200
+@@ -21,6 +21,14 @@
+ #ifndef _BFIN_MAIN_SIM_H_
+ #define _BFIN_MAIN_SIM_H_
+ 
++/* The event queue's own poll event: sim-events.c schedules one every
++   SIM_EVENTS_POLL_RATE ticks so a debugger can interrupt a run.  With the
++   wall-clock time base a parked CPU sleeps until the next event, and at
++   400 MHz the default 0x1000 ticks is ten microseconds -- a hundred thousand
++   wake-ups a second for nothing.  The standalone run has no poll_quit
++   callback anyway.  */
++#define SIM_EVENTS_POLL_RATE (1 << 30)
++
+ #include "sim-basics.h"
+ #include "sim-base.h"
+ 
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/common/dv-cfi.c gdb-17.2/sim/common/dv-cfi.c
+--- a/sim/common/dv-cfi.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/common/dv-cfi.c	2026-09-02 10:35:19.600590400 +0200
 @@ -166,6 +166,9 @@
  
    unsigned char *erase_region_info;
@@ -6602,11 +8108,16 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  
        return nr_bytes;
      }
-@@ -466,6 +556,19 @@
+@@ -466,6 +556,25 @@
      {
      case CFI_STATE_READ:
        memcpy (dest, cfi->data + offset, nr_bytes);
-+      if (getenv ("BFIN_CFI_TRACE") && offset >= 0xc372a)
++      {
++	static int trace = -1;
++
++	if (trace < 0)
++	  trace = getenv ("BFIN_CFI_TRACE") != NULL;
++	if (trace && offset >= 0xc372a)
 +	{
 +	  cfi->cdj_resource_reads++;
 +	  if (cfi->cdj_resource_reads <= 80
@@ -6619,10 +8130,11 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +		     nr_bytes > 2 ? sdest[2] : 0,
 +		     nr_bytes > 3 ? sdest[3] : 0);
 +	}
++      }
        break;
  
      case CFI_STATE_CFI_QUERY:
-@@ -722,7 +825,7 @@
+@@ -722,7 +831,7 @@
  	  fd_writable = !strcmp (writable, "rw");
  	}
  
@@ -6631,7 +8143,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
        if (fd < 0)
  	hw_abort (me, "unable to read file `%s': %s", file, strerror (errno));
      }
-@@ -755,13 +858,19 @@
+@@ -755,13 +864,19 @@
        if (fd != -1)
  	{
  	  /* Use stdio to avoid EINTR issues with read().  */
@@ -6652,8 +8164,9 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
  	  /* Don't need to fclose() with fdopen("r").  */
  	}
        else
---- a/sim/common/dv-cfi.h
-+++ b/sim/common/dv-cfi.h
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/common/dv-cfi.h gdb-17.2/sim/common/dv-cfi.h
+--- a/sim/common/dv-cfi.h	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/common/dv-cfi.h	2026-09-02 09:40:29.364248500 +0200
 @@ -57,4 +57,16 @@
  
  #define INTEL_ID_MANU		0x89
@@ -6671,9 +8184,69 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
 +#define AMD_ID_MANU			0x01
 +
  #endif
---- a/sim/common/sim-core.c
-+++ b/sim/common/sim-core.c
-@@ -585,6 +585,29 @@
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/common/sim-core.c gdb-17.2/sim/common/sim-core.c
+--- a/sim/common/sim-core.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/common/sim-core.c	2026-09-02 10:22:22.602343400 +0200
+@@ -252,6 +252,13 @@
+ /* Attach memory or a memory mapped device to the simulator.
+    See sim-core.h for a full description.  */
+ 
++/* Bumped by every attach and detach.  A cache of host pointers into the
++   mapped buffers (sim/bfin keeps one per map) compares this against the
++   generation it was filled at, because a mapping can go away at run time:
++   the Blackfin EBIU model detaches and re-attaches its async banks on every
++   AMGCTL write, and the buffer behind a plain-RAM bank is freed with it.  */
++unsigned sim_core_generation;
++
+ #if EXTERN_SIM_CORE_P
+ void
+ sim_core_attach (SIM_DESC sd,
+@@ -265,6 +272,7 @@
+ 		 struct hw *client,
+ 		 void *optional_buffer)
+ {
++  ++sim_core_generation;
+   sim_core *memory = STATE_CORE (sd);
+   unsigned map;
+   void *buffer;
+@@ -398,6 +406,7 @@
+ {
+   sim_core *memory = STATE_CORE (sd);
+   unsigned map;
++  ++sim_core_generation;
+   for (map = 0; map < nr_maps; map++)
+     {
+       sim_core_map_detach (sd, &memory->common.map[map],
+@@ -565,9 +574,25 @@
+ 	continue;
+       }
+ #endif
+-    ((unsigned_1*)buffer)[count] =
+-      *(unsigned_1*)sim_core_translate (mapping, raddr);
+-    count += 1;
++    /* Plain memory: copy the whole stretch this mapping serves, rather than
++       one byte per mapping walk.  A modulo mapping is copied only up to the
++       end of its alias period, so the wrap still goes through translate.  */
++    {
++      unsigned nr = len - count;
++      address_word left = mapping->bound - raddr;
++      if (nr - 1 > left)
++	nr = left + 1;
++      if (mapping->mask != (unsigned) -1)
++	{
++	  unsigned to_wrap = mapping->mask + 1
++	    - ((raddr - mapping->base) & mapping->mask);
++	  if (nr > to_wrap)
++	    nr = to_wrap;
++	}
++      memcpy ((unsigned_1*)buffer + count,
++	      sim_core_translate (mapping, raddr), nr);
++      count += nr;
++    }
+  }
+   return count;
+ }
+@@ -585,6 +610,29 @@
  {
    sim_core_common *core = (cpu == NULL ? &STATE_CORE (sd)->common : &CPU_CORE (cpu)->common);
    unsigned count = 0;
@@ -6703,7 +8276,7 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
    while (count < len)
      {
        address_word raddr = addr + count;
-@@ -593,6 +616,27 @@
+@@ -593,6 +641,27 @@
  			       raddr, /*nr-bytes*/1,
  			       write_transfer,
  			       0 /*dont-abort*/, NULL, NULL_CIA);
@@ -6731,8 +8304,36 @@ Applies to: GDB 17.2, after 01-gdb-17.2-bfin-parallel-dsp32alu.patch.
        if (mapping == NULL)
  	break;
  #if (WITH_HW)
---- a/sim/common/sim-load.c
-+++ b/sim/common/sim-load.c
+@@ -623,9 +692,23 @@
+ 	  continue;
+ 	}
+ #endif
+-      *(unsigned_1*)sim_core_translate (mapping, raddr) =
+-	((unsigned_1*)buffer)[count];
+-      count += 1;
++      /* Plain memory, as in sim_core_read_buffer.  */
++      {
++	unsigned nr = len - count;
++	address_word left = mapping->bound - raddr;
++	if (nr - 1 > left)
++	  nr = left + 1;
++	if (mapping->mask != (unsigned) -1)
++	  {
++	    unsigned to_wrap = mapping->mask + 1
++	      - ((raddr - mapping->base) & mapping->mask);
++	    if (nr > to_wrap)
++	      nr = to_wrap;
++	  }
++	memcpy (sim_core_translate (mapping, raddr),
++		(unsigned_1*)buffer + count, nr);
++	count += nr;
++      }
+     }
+   return count;
+ }
+diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/common/sim-load.c gdb-17.2/sim/common/sim-load.c
+--- a/sim/common/sim-load.c	2026-05-10 16:32:31.000000000 +0200
++++ b/sim/common/sim-load.c	2026-09-02 09:40:29.401148400 +0200
 @@ -128,7 +128,28 @@
  		}
  	      data_count += size;

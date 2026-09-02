@@ -265,6 +265,7 @@ enum {
 #define PANEL_SCIF_TDR   (PANEL_SCIF_BASE + 0x0c)
 #define PANEL_SCIF_RDR   (PANEL_SCIF_BASE + 0x14)
 #define PANEL_FRAME_LEN  24
+#define CDJ_LINK_RX_QUEUE_MAX 64
 #define PANEL_FRAME_MARK 0x8f
 #define PANEL_DMA_RX_IRQ 0x33                       /* INTEVT 0x660, ch3 */
 #define PANEL_DMA_TX_IRQ 0x34                       /* INTEVT 0x680, ch4 */
@@ -408,6 +409,33 @@ enum {
 /* Reading the same register this many times running means a stuck poll. */
 #define SPIN_REPORT     4096
 
+/*
+ * CDJ_LINK_TRACE: log every link arm and acknowledge.  Off by default: at
+ * ~300 exchanges a second those two lines were 43 000 log writes per five
+ * minutes and said nothing the "sent"/"delivered" lines do not.
+ */
+static bool cdj_sdhi_trace(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *env = getenv("CDJ_SDHI_TRACE");
+        enabled = env && *env;
+    }
+    return enabled;
+}
+
+static bool cdj_link_trace(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *env = getenv("CDJ_LINK_TRACE");
+        enabled = env && *env;
+    }
+    return enabled;
+}
+
 typedef struct {
     MemoryRegion trap;
     MemoryRegion trap_p4;
@@ -416,6 +444,17 @@ typedef struct {
     hwaddr last_read;
     uint64_t repeats;
     bool reported;
+
+    /*
+     * The same for writes.  INT2MSKCR (0xffd4003c) is written on every ISR
+     * exit, and logging each one cost 150 000 lines -- three quarters of the
+     * -D log -- in a five-minute run, each line a mutex, a vfprintf and an
+     * fflush.  The first write to an address is logged, a run of repeats is
+     * reported once with its count when the address changes.
+     */
+    hwaddr last_write;
+    uint64_t last_write_value;
+    uint64_t write_repeats;
 
     uint64_t default_value;
 } CdjPeriphState;
@@ -568,11 +607,16 @@ static void cdj_panel_keys_parse(void)
  */
 static void cdj_panel_frame(uint8_t *frame)
 {
-    const char *spec = getenv("CDJ_PANEL_FRAME");
+    static const char *spec;
+    static bool spec_read;
     unsigned sum = 0;
     int64_t now;
     int i;
 
+    if (!spec_read) {
+        spec = getenv("CDJ_PANEL_FRAME");
+        spec_read = true;
+    }
     memset(frame, 0, PANEL_FRAME_LEN);
     for (i = 0; spec && i < PANEL_FRAME_LEN - 2; i++) {
         char digits[3] = { spec[2 * i], spec[2 * i + 1], 0 };
@@ -1029,8 +1073,23 @@ static uint64_t cdj_periph_read(void *opaque, hwaddr offset, unsigned size)
 static void cdj_periph_write(void *opaque, hwaddr offset, uint64_t value,
                              unsigned size)
 {
+    CdjPeriphState *periph = opaque;
     hwaddr address = PERIPH_P4_BASE + offset;
 
+    if (address == periph->last_write && value == periph->last_write_value) {
+        periph->write_repeats++;
+        return;
+    }
+    if (periph->write_repeats > 1) {
+        qemu_log_mask(LOG_UNIMP,
+                      "cdj2000-main: write 0x%" HWADDR_PRIx " = 0x%" PRIx64
+                      " repeated %" PRIu64 " times\n",
+                      periph->last_write, periph->last_write_value,
+                      periph->write_repeats);
+    }
+    periph->last_write = address;
+    periph->last_write_value = value;
+    periph->write_repeats = 1;
     qemu_log_mask(LOG_UNIMP,
                   "cdj2000-main: write 0x%" HWADDR_PRIx " (%u bytes) = 0x%"
                   PRIx64 "\n", address, size, value);
@@ -1371,7 +1430,23 @@ typedef struct CdjLinkState {
     unsigned long n_mode_reg;   /* guest wrote 0xff502000 itself */
     unsigned long n_wbytes;     /* bytes the chardev accepted, header included */
     int64_t census_next;
+    QEMUTimer *tx_timer;        /* the transmit completion, in flight */
+    /*
+     * The receive FIFO (CDJ_LINK_RX_QUEUE).  A frame is delivered into the
+     * guest's buffer only when the previous one has been acknowledged, so
+     * the task that examines it sees every frame in order; frames that
+     * arrive meanwhile wait here, the oldest dropped when it is full.
+     */
+    uint8_t queue[CDJ_LINK_RX_QUEUE_MAX][512];
+    unsigned queue_len[CDJ_LINK_RX_QUEUE_MAX];
+    unsigned queue_head, queue_count;
+    bool rx_pending;            /* delivered, not yet acknowledged */
+    unsigned long n_queued, n_dropped, n_watchdog;
+    QEMUTimer *rx_watchdog;
 } CdjLinkState;
+
+static void cdj_link_rx_next(CdjLinkState *link);
+static bool cdj_link_link_rows(uint8_t *frame, unsigned len);
 
 static int64_t cdj_link_census_every(void)
 {
@@ -1405,11 +1480,13 @@ static void cdj_link_census(CdjLinkState *link)
     qemu_log_mask(LOG_UNIMP,
                   "%s: census t%.1f armed=%lu sent=%lu bail=%lu short=%lu "
                   "rx=%lu ack=%lu gate=%lu moderead=%lu modereg=%lu "
-                  "wbytes=%lu\n", link->name,
+                  "wbytes=%lu queued=%lu dropped=%lu watchdog=%lu\n",
+                  link->name,
                   (double)now / NANOSECONDS_PER_SECOND, link->n_armed,
                   link->n_sent, link->n_bail, link->n_short, link->n_rx,
                   link->n_ack, link->n_gate, link->n_mode_read,
-                  link->n_mode_reg, link->n_wbytes);
+                  link->n_mode_reg, link->n_wbytes, link->n_queued,
+                  link->n_dropped, link->n_watchdog);
 }
 
 static void cdj_intc2_set(CdjLinkState *link, bool raise)
@@ -1450,6 +1527,70 @@ static unsigned cdj_link_frame_len(CdjLinkState *link)
  * simulator falls back to raw bytes when the magic is absent), so it costs
  * nothing but makes the boundary explicit.
  */
+/*
+ * CDJ_LINK_TX_US: how long a transmitted frame is in flight before its
+ * completion is reported, in microseconds of guest time.  Off (0) by
+ * default: the completion is reported inside the arm write, as this model
+ * always did.
+ *
+ * Why it exists, and why it is off.  With the completion synchronous, MAIN
+ * answers the GUI's browse requests in one burst every 3.000 s -- hundreds
+ * of 48-byte answers 0.1 ms apart behind one 64-byte status record, then
+ * nothing for three seconds -- while the GUI asks sixty times a second
+ * (usb3, 130 s).  That looks like a completion landing before the sending
+ * task has reached its wait, which a frame's time on the wire (64 bytes at
+ * a megabit or so: a few hundred microseconds) would cure.  Measured at
+ * 500 us, same binaries otherwise: one boot without a key answered spread
+ * out instead of in bursts and reached the player screen at 34 s as before
+ * (m1); two boots with a SOURCE key at 40 s never showed the player screen
+ * at all -- one stayed black for 130 s (usb8), one sent only status
+ * requests and drew nothing (usb7) -- where the same configuration without
+ * it shows the player screen at 28 s and the Wait platter six seconds after
+ * the key (usb6).  The two boards' protocol tasks are balanced against each
+ * other by timing on both sides (dv-bfin_ppi.c's yield budget and holds),
+ * and moving this one edge upsets that balance.  Kept for the experiment
+ * that finds the matching change on the other side.
+ */
+static int64_t cdj_link_tx_ns(void)
+{
+    static int64_t ns = -1;
+
+    if (ns < 0) {
+        const char *env = getenv("CDJ_LINK_TX_US");
+
+        ns = (env && *env ? strtoll(env, NULL, 10) : 0) * 1000LL;
+        if (ns < 0) {
+            ns = 0;
+        }
+    }
+    return ns;
+}
+
+/*
+ * Two completions are reported, because the firmware waits for both: the
+ * channel's own one (handler 0x2a3db0 via INTC2 bit 5), and the separate
+ * transfer-done interrupt that handler 0x2a3eb4 services on INTC2 bit 6.
+ * Only the latter clears the transmit-in-progress flag 0x7db3541, and it
+ * insists on bit 25 being set in the status at 0xff502004 *and* in the
+ * control at 0xff502000 (0x2a3f00..0x2a3f14).
+ */
+static void cdj_link_tx_complete(void *opaque)
+{
+    CdjLinkState *link = opaque;
+
+    link->control &= ~LINK_CTRL_START;
+
+    link->status |= link->rx_status;
+    cdj_intc2_set(link, true);
+
+    link->mode_status |= MODE_DONE | MODE_GATE;
+    link->mode_reg |= MODE_GATE;
+    if (link->done_irq) {
+        link->intc2->status |= LINK_DONE_BIT;
+        qemu_set_irq(link->done_irq, 1);
+    }
+}
+
 static void cdj_link_transmit(CdjLinkState *link)
 {
     unsigned frame = cdj_link_frame_len(link);
@@ -1465,8 +1606,10 @@ static void cdj_link_transmit(CdjLinkState *link)
     stl_le_p(buffer + 4, frame);
     address_space_read(&address_space_memory, cdj_dma_phys(link->buffer),
                        MEMTXATTRS_UNSPECIFIED, buffer + 8, frame);
-    int written = owner->connected
-        ? qemu_chr_fe_write_all(&owner->chr, buffer, frame + 8) : -1;
+    bool send = cdj_link_link_rows(buffer + 8, frame);
+    int written = owner->connected && send
+        ? qemu_chr_fe_write_all(&owner->chr, buffer, frame + 8)
+        : (send ? -1 : (int)(frame + 8));
 
     link->n_sent++;
     if (written > 0) {
@@ -1476,29 +1619,18 @@ static void cdj_link_transmit(CdjLinkState *link)
         link->n_short++;
     }
     qemu_log_mask(LOG_UNIMP, "%s: sent %u bytes from 0x%08x (connected=%d "
-                  "written=%d, first words %02x%02x %02x%02x)\n",
+                  "written=%d, first words %02x%02x %02x%02x) t=%.4f\n",
                   link->name, frame, link->buffer, owner->connected, written,
-                  buffer[9], buffer[8], buffer[11], buffer[10]);
+                  buffer[9], buffer[8], buffer[11], buffer[10],
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
     cdj_link_census(link);
 
-    link->control &= ~LINK_CTRL_START;
-
-    /*
-     * Two completions are reported, because the firmware waits for both: the
-     * channel's own one (handler 0x2a3db0 via INTC2 bit 5), and the separate
-     * transfer-done interrupt that handler 0x2a3eb4 services on INTC2 bit 6.
-     * Only the latter clears the transmit-in-progress flag 0x7db3541, and it
-     * insists on bit 25 being set in the status at 0xff502004 *and* in the
-     * control at 0xff502000 (0x2a3f00..0x2a3f14).
-     */
-    link->status |= link->rx_status;
-    cdj_intc2_set(link, true);
-
-    link->mode_status |= MODE_DONE | MODE_GATE;
-    link->mode_reg |= MODE_GATE;
-    if (link->done_irq) {
-        link->intc2->status |= LINK_DONE_BIT;
-        qemu_set_irq(link->done_irq, 1);
+    if (cdj_link_tx_ns() > 0 && link->tx_timer) {
+        /* In flight: START stays set until the frame is out. */
+        timer_mod(link->tx_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + cdj_link_tx_ns());
+    } else {
+        cdj_link_tx_complete(link);
     }
 }
 
@@ -1546,11 +1678,32 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
     case LINK_ENABLE:   link->enable = value; return;
 
     case LINK_CONTROL:
+        /*
+         * With CDJ_LINK_TX_US the previous frame may still be in flight
+         * when the next arm arrives; the firmware's ISR chain arms the next
+         * queued record from the completion handler, so on the chip it
+         * never does, but a poll-and-arm path would.  Complete the frame
+         * in flight first rather than lose the new one to the edge test.
+         */
+        if ((value & LINK_CTRL_START) && link->tx_timer
+            && timer_pending(link->tx_timer)) {
+            timer_del(link->tx_timer);
+            cdj_link_tx_complete(link);
+            link->n_short++;    /* counted: a flush is a model artefact */
+        }
         if ((value & LINK_CTRL_START) && !(link->control & LINK_CTRL_START)) {
-            qemu_log_mask(LOG_UNIMP, "%s: armed buffer=0x%08x len=%u\n",
-                          link->name, link->buffer, cdj_link_frame_len(link));
+            if (cdj_link_trace()) {
+                qemu_log_mask(LOG_UNIMP, "%s: armed buffer=0x%08x len=%u"
+                              " t=%.4f\n",
+                              link->name, link->buffer,
+                              cdj_link_frame_len(link),
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+            }
             link->n_armed++;
             link->control = value;
+            if (!link->transmit && link->rx_pending) {
+                cdj_link_rx_next(link);
+            }
             /*
              * Under the pending reading, arming says nothing about whether a
              * frame is waiting, so it must not touch the bit.  Clearing here
@@ -1573,13 +1726,21 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
 
     case LINK_STATUS:
         /* Written back as (value & 31) to acknowledge. */
-        qemu_log_mask(LOG_UNIMP, "%s: ack status 0x%02x (was 0x%02x)\n",
-                      link->name, (unsigned)(value & 0x1f), link->status);
+        if (cdj_link_trace()) {
+            qemu_log_mask(LOG_UNIMP, "%s: ack status 0x%02x (was 0x%02x)"
+                          " t=%.4f\n",
+                          link->name, (unsigned)(value & 0x1f), link->status,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+        }
         link->n_ack++;
         cdj_link_census(link);
         link->status &= ~(value & 0x1f);
         if (!(link->status & 0x1c)) {
             cdj_intc2_set(link, false);
+        }
+        if (!link->transmit && link->rx_pending
+            && !(link->status & link->rx_status)) {
+            cdj_link_rx_next(link);
         }
         return;
 
@@ -1622,6 +1783,11 @@ static void cdj_link_mode_write(void *opaque, hwaddr offset, uint64_t value,
         link->mode_status = value;
         if (!(link->mode_status & MODE_GATE) && link->done_irq) {
             link->n_gate++;
+            if (cdj_link_trace()) {
+                qemu_log_mask(LOG_UNIMP, "%s: gate cleared t=%.4f\n",
+                              link->name,
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+            }
             cdj_link_census(link);
             qemu_set_irq(link->done_irq, 0);
             link->intc2->status &= ~LINK_DONE_BIT;
@@ -1732,8 +1898,8 @@ static uint16_t cdj_link_crc(const uint8_t *data, size_t len)
  * rewrote every type-1 request and the GUI never left the left column: 1 779
  * cursor-3 requests, no cursor 11 at all, and an empty right pane.  `r157`,
  * which patched only the cursor-1 arm inside MAIN, saw the GUI ask **cursor 11
- * with word 4 = 2 on its own** 2 223 times and fill the pane with `Afrohouse`
- * and `AAA-Tracks`.  Cursor 1 is the only arm that writes `[ctx+4]`
+ * with word 4 = 2 on its own** 2 223 times and fill the pane with the card's
+ * folder and playlist.  Cursor 1 is the only arm that writes `[ctx+4]`
  * (`0x150492`); the other cursors read their own word 4 for their own pane, and
  * overwriting it takes the GUI's answer away from it.  `CDJ_REQ_CURSOR`
  * widens this again for anyone who wants to repeat r158.
@@ -1791,7 +1957,7 @@ static void cdj_link_force_req_kind(uint8_t *frame, unsigned len)
  * six saved TX dumps, MAIN's answers follow the cleared bit and nothing else:
  *
  *     run   type-1 total   bit 15 CLEAR   answers longer than 64 B
- *     r165        4 965             12         56  (Afrohouse / AAA-Tracks)
+ *     r165        4 965             12         56  (the card's two entries)
  *     r173        8 280              6         47
  *     r178        1 737              5         50
  *     r179        4 118              4          4
@@ -1857,6 +2023,277 @@ static void cdj_link_clear_req_cancel(uint8_t *frame, unsigned len)
     }
 }
 
+/*
+ * CDJ_REQ_STATUS_FRESH -- turn every repeated type-0 (status) request into
+ * the GUI's own fresh one (word 0 = 1, bit 15 of word 1 clear), checksum
+ * re-stamped, so MAIN answers each one at once.  On by default; 0 sends
+ * the GUI's bytes untouched.
+ *
+ * Measured with the loop cure (CDJ_LINK_LINK_ROWS) in place, SD key at
+ * 55 s on a running machine: off, 3 of 9 (m1-m3, h1-h3, k1-k3 with only
+ * bit 15 cleared); on, 6 of 8 (n1-n3, t1-t2, p1-p3), the library 0.6-2.6 s
+ * after the key.  The two failures are the same picture as before: MAIN
+ * answering "0000 0000" polls with its last 48-byte browse answer instead
+ * of a status record, and the card's list request with that stale answer.
+ *
+ * Bit 15 is the repeat/cancel bit: MAIN answers a status request with it
+ * clear immediately (measured: 50 a second, 1:1, usb7) and one with it set
+ * on its 3 s timer.  The GUI clears it when it opens a query and sets it on
+ * every repeat -- so once one answer is missed the GUI repeats, MAIN slows
+ * to 3 s, and the GUI keeps repeating: the "slow regime" of every failed
+ * SOURCE key.  The simulator's record path on the GUI side gets its turns
+ * from arriving status records (dv-bfin_ppi.c, the yield budget), so at 3 s
+ * a cadence the card's lists reach the firmware at 0.3 a second and the
+ * GUI's browse loop runs for tens of seconds; at 20-30 a second they reach
+ * it at once.  Every status record MAIN sends is its live state, so
+ * answering a repeat is not an error on the wire, only work MAIN would
+ * otherwise defer.
+ */
+static void cdj_link_status_fresh(uint8_t *frame, unsigned len)
+{
+    static int enabled = -1;
+    static unsigned long rewrites;
+    unsigned word1;
+    uint16_t crc;
+
+    if (enabled < 0) {
+        const char *env = getenv("CDJ_REQ_STATUS_FRESH");
+
+        enabled = !(env && *env == '0');
+    }
+    if (!enabled || len != 48) {
+        return;
+    }
+    word1 = frame[2] | (frame[3] << 8);
+    if ((word1 & 0x3fff) != 0 || !(word1 & 0x8000)) {
+        return;
+    }
+    /*
+     * The GUI's own fresh status poll is "0001 0000 ...": word 0 at 1 as
+     * well.  Clearing bit 15 alone leaves an all-zero header, and MAIN
+     * answers that shape by re-sending its last browse answer (k1: every
+     * "0000 0000" poll got a 48-byte 0x11 frame, every "0001 0000" a
+     * status record).  So the repeat becomes the fresh poll, both words.
+     */
+    word1 &= ~0x8000u;
+    frame[0] = 1;
+    frame[1] = 0;
+    frame[2] = (uint8_t)word1;
+    frame[3] = (uint8_t)(word1 >> 8);
+    crc = cdj_link_crc(frame, 46);
+    frame[46] = (uint8_t)crc;
+    frame[47] = (uint8_t)(crc >> 8);
+    if (rewrites++ == 0) {
+        info_report("cdj2000: CDJ_REQ_STATUS_FRESH: type-0 requests have bit "
+                    "15 cleared, checksum re-stamped");
+    }
+}
+
+/*
+ * CDJ_LINK_RX_QUEUE -- deliver the GUI's frames one per acknowledge.
+ *
+ * Every frame used to be written into the guest's buffer the moment it
+ * arrived, and START stayed set, so the next frame overwrote it before
+ * GuiCom_RcvTASK had looked: r081 measured 439 more type-0 frames examined
+ * than sent and one type-1 request in eleven seen.  Clearing START on
+ * delivery (CDJ_LINK_RX_ONESHOT) fixed the double read and starved the
+ * board, because the GUI's socket then backed up behind a receive MAIN had
+ * not re-armed.  The FIFO takes the frame off the socket at once and hands
+ * it to the guest when the previous one has been acknowledged in the
+ * status register (or the receive re-armed), oldest dropped when 64 wait,
+ * with a 50 ms watchdog in case a frame is never acknowledged.  What this
+ * buys is measured on the SOURCE key: MAIN's status answers and the card's
+ * lists reach the GUI at the rate the GUI asks, which is what the GUI's
+ * browse loop needs to finish.  CDJ_LINK_RX_QUEUE=0 restores the overwrite.
+ */
+static bool cdj_link_rx_queue_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *env = getenv("CDJ_LINK_RX_QUEUE");
+
+        enabled = !(env && *env == '0');
+    }
+    return enabled;
+}
+
+/* The last request handed to the guest: type, cursor, KIND (type-1 words). */
+static unsigned cdj_last_req_type = ~0u, cdj_last_req_cursor, cdj_last_req_kind;
+
+/*
+ * CDJ_LINK_LINK_ROWS=match|drop|empty|off -- MAIN's answer to the GUI's
+ * LINK browse.  Default: match.
+ *
+ * After the player screen the GUI browses the LINK source (type 1, cursor
+ * 3, KIND 0) in a loop, 30-40 requests a second.  MAIN -- with no network
+ * behind its LINK source -- answers each of those with the one-row list
+ * "NO DISC" (id 88) stamped as command 0x11, the answer to a cursor-1
+ * request; the GUI's consumer 0xb7eb48 compares the command's low nibble
+ * with the cursor of the request it has outstanding (3), sets an error
+ * bit on the mismatch and re-sends the request.  That is the loop, and
+ * while it runs a SOURCE key opens the library screen but the card's list
+ * request never goes out (f1-f3, v1-v4: 0 of 6).  The loop ended on its
+ * own only when the GUI was slowed down (three machines on the host, or
+ * probes on: e2, e4, e5), and the e4 dump shows why: under load MAIN's
+ * answers to the same polls came stamped 0x13.
+ *
+ * "match" stamps the low nibble of the command with the cursor of the
+ * request being answered and re-stamps the checksum -- the loop is over
+ * by 40 s in 3 of 3 (m1-m3) and the SD key then brings the card's library
+ * in 1.5 s (m3).  "empty" (count 0, row blanked) and "drop" (not sent)
+ * were tried first and change nothing (r1, r2): the loop is not about the
+ * row, it is about the nibble.  "off" sends MAIN's bytes untouched.
+ */
+static int cdj_link_link_rows_mode(void)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *env = getenv("CDJ_LINK_LINK_ROWS");
+
+        mode = 3;
+        if (env && !strcmp(env, "drop")) {
+            mode = 1;
+        } else if (env && !strcmp(env, "empty")) {
+            mode = 2;
+        } else if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) {
+            mode = 0;
+        }
+    }
+    return mode;
+}
+
+/* Returns false when the frame is not to be sent. */
+static bool cdj_link_link_rows(uint8_t *frame, unsigned len)
+{
+    static unsigned long rewrites;
+    int mode = cdj_link_link_rows_mode();
+    uint16_t crc;
+
+    if (!mode || len != 48 || cdj_last_req_type != 1) {
+        return true;
+    }
+    if (mode == 3) {
+        /*
+         * "match": the answer's command carries the cursor it answers in
+         * its low nibble (0x11 cursor 1, 0x13 cursor 3) and the GUI's
+         * consumer 0xb7eb48 compares that nibble with the cursor of the
+         * request it has outstanding -- a mismatch sets an error bit and
+         * the request is re-sent.  MAIN answers the LINK browse's cursor-3
+         * polls with 0x11 (e4 dump: 62 of them before the first 0x13),
+         * which is the loop.  Stamp the nibble the GUI is waiting for.
+         */
+        unsigned cmd = frame[0] | (frame[1] << 8);
+        unsigned want = (cmd & 0xfff0) | (cdj_last_req_cursor & 0xf);
+
+        if ((cmd & 0xff00) != 0 || cmd == want || cdj_last_req_cursor > 15) {
+            return true;
+        }
+        frame[0] = (uint8_t)want;
+        crc = cdj_link_crc(frame, 46);
+        frame[46] = (uint8_t)crc;
+        frame[47] = (uint8_t)(crc >> 8);
+        if (rewrites++ == 0) {
+            info_report("cdj2000: CDJ_LINK_LINK_ROWS=match: answer command "
+                        "0x%02x -> 0x%02x for the cursor-%u request",
+                        cmd, want, cdj_last_req_cursor);
+        }
+        return true;
+    }
+    if (cdj_last_req_cursor != 3 || cdj_last_req_kind != 0) {
+        return true;
+    }
+    if ((frame[0] | (frame[1] << 8)) != 0x0011) {
+        return true;
+    }
+    if (rewrites++ == 0) {
+        info_report("cdj2000: CDJ_LINK_LINK_ROWS=%s: MAIN's one-row answer "
+                    "to the LINK browse (type 1 cursor 3 KIND 0) is %s",
+                    mode == 1 ? "drop" : "empty",
+                    mode == 1 ? "not sent" : "sent with no rows");
+    }
+    if (mode == 1) {
+        return false;
+    }
+    memset(frame + 16, 0, 46 - 16);       /* count, id, length, text */
+    crc = cdj_link_crc(frame, 46);
+    frame[46] = (uint8_t)crc;
+    frame[47] = (uint8_t)(crc >> 8);
+    return true;
+}
+
+static void cdj_link_deliver(CdjLinkState *link, const uint8_t *frame,
+                             unsigned len)
+{
+    uint8_t copy[512];
+
+    memcpy(copy, frame, len);
+    cdj_link_force_req_kind(copy, len);
+    cdj_link_clear_req_cancel(copy, len);
+    cdj_link_status_fresh(copy, len);
+    if (len == 48) {
+        cdj_last_req_type = (copy[2] | (copy[3] << 8)) & 0x3fff;
+        cdj_last_req_cursor = copy[4] | (copy[5] << 8);
+        cdj_last_req_kind = copy[8] | (copy[9] << 8);
+    }
+    address_space_write(&address_space_memory, cdj_dma_phys(link->buffer),
+                        MEMTXATTRS_UNSPECIFIED, copy, len);
+
+    if (cdj_link_rx_one_shot()) {
+        link->control &= ~LINK_CTRL_START;
+    }
+
+    link->status |= link->rx_status;
+    link->rx_pending = true;
+    if (link->rx_watchdog) {
+        timer_mod(link->rx_watchdog,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50 * SCALE_MS);
+    }
+    if (link->flag) {
+        cdj_link_flag_rx(link->flag, cdj_link_flag_pending());
+    }
+    /* The request header, little-endian halfwords as the GUI lays them
+     * out: 0 tag, 1 type, 2 cursor, 3 word 3, 4 KIND, 5 word 5. */
+    qemu_log_mask(LOG_UNIMP, "%s: delivered %u bytes to 0x%08x, status 0x%02x"
+                  " words %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x"
+                  " queued %u t=%.4f\n",
+                  link->name, len, link->buffer, link->status,
+                  copy[1], copy[0], copy[3], copy[2], copy[5], copy[4],
+                  copy[7], copy[6], copy[9], copy[8], copy[11], copy[10],
+                  link->queue_count,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+    link->n_rx++;
+    cdj_link_census(link);
+    cdj_intc2_set(link, true);
+}
+
+/* The guest acknowledged (or re-armed): hand over the next frame waiting. */
+static void cdj_link_rx_next(CdjLinkState *link)
+{
+    link->rx_pending = false;
+    if (link->rx_watchdog) {
+        timer_del(link->rx_watchdog);
+    }
+    if (link->queue_count) {
+        unsigned slot = link->queue_head;
+
+        link->queue_head = (slot + 1) % CDJ_LINK_RX_QUEUE_MAX;
+        link->queue_count--;
+        cdj_link_deliver(link, link->queue[slot], link->queue_len[slot]);
+    }
+}
+
+static void cdj_link_rx_watchdog(void *opaque)
+{
+    CdjLinkState *link = opaque;
+
+    if (link->rx_pending) {
+        link->n_watchdog++;
+        cdj_link_rx_next(link);
+    }
+}
+
 static void cdj_link_receive(void *opaque, const uint8_t *data, int size)
 {
     CdjLinkState *link = opaque;
@@ -1874,12 +2311,35 @@ static void cdj_link_receive(void *opaque, const uint8_t *data, int size)
     if (link->rx_filled < frame) {
         return;                 /* partial frame, wait for the rest */
     }
+    link->rx_filled = 0;
+
+    if (cdj_link_rx_queue_enabled() && frame <= sizeof(link->queue[0])) {
+        if (link->rx_pending || link->queue_count) {
+            unsigned slot;
+
+            if (link->queue_count == CDJ_LINK_RX_QUEUE_MAX) {
+                link->queue_head = (link->queue_head + 1)
+                                   % CDJ_LINK_RX_QUEUE_MAX;
+                link->queue_count--;
+                link->n_dropped++;
+            }
+            slot = (link->queue_head + link->queue_count)
+                   % CDJ_LINK_RX_QUEUE_MAX;
+            memcpy(link->queue[slot], link->rx, frame);
+            link->queue_len[slot] = frame;
+            link->queue_count++;
+            link->n_queued++;
+            return;
+        }
+        cdj_link_deliver(link, link->rx, frame);
+        return;
+    }
 
     cdj_link_force_req_kind(link->rx, frame);
     cdj_link_clear_req_cancel(link->rx, frame);
+    cdj_link_status_fresh(link->rx, frame);
     address_space_write(&address_space_memory, cdj_dma_phys(link->buffer),
                         MEMTXATTRS_UNSPECIFIED, link->rx, frame);
-    link->rx_filled = 0;
 
     if (cdj_link_rx_one_shot()) {
         link->control &= ~LINK_CTRL_START;
@@ -1889,8 +2349,16 @@ static void cdj_link_receive(void *opaque, const uint8_t *data, int size)
     if (link->flag) {
         cdj_link_flag_rx(link->flag, cdj_link_flag_pending());
     }
-    qemu_log_mask(LOG_UNIMP, "%s: delivered %u bytes to 0x%08x, status 0x%02x\n",
-                  link->name, frame, link->buffer, link->status);
+    /* The request header, little-endian halfwords as the GUI lays them
+     * out: 0 tag, 1 type, 2 cursor, 3 word 3, 4 KIND, 5 word 5. */
+    qemu_log_mask(LOG_UNIMP, "%s: delivered %u bytes to 0x%08x, status 0x%02x"
+                  " words %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x"
+                  " t=%.4f\n",
+                  link->name, frame, link->buffer, link->status,
+                  link->rx[1], link->rx[0], link->rx[3], link->rx[2],
+                  link->rx[5], link->rx[4], link->rx[7], link->rx[6],
+                  link->rx[9], link->rx[8], link->rx[11], link->rx[10],
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
     link->n_rx++;
     cdj_link_census(link);
     cdj_intc2_set(link, true);
@@ -1935,6 +2403,13 @@ static CdjLinkState *cdj_link_init(MemoryRegion *system, CdjIntc2State *intc2,
     link->owner = owner;
     link->intc2 = intc2;
     link->name = name;
+    if (transmit) {
+        link->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_link_tx_complete,
+                                      link);
+    } else {
+        link->rx_watchdog = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         cdj_link_rx_watchdog, link);
+    }
     link->base = base;
     link->intc2_bit = intc2_bit;
     link->irq = irq;
@@ -2792,7 +3267,7 @@ static uint64_t cdj_sdhi_read(void *opaque, hwaddr offset, unsigned size)
      * so a cap of 24 hides the insertion it was added to observe.
      */
     ++reads;
-    if (getenv("CDJ_SDHI_TRACE")
+    if (cdj_sdhi_trace()
         && (offset != last_offset || value != last_value)) {
         fprintf(stderr, "cdj2000-sdhi: read %u @ +%#04x -> %#06x (#%lu) pc %#010x\n",
                 size, (unsigned)offset, (unsigned)value, reads,
@@ -2820,7 +3295,7 @@ static void cdj_sdhi_write(void *opaque, hwaddr offset, uint64_t value,
 {
     CdjSdhiState *s = opaque;
 
-    if (getenv("CDJ_SDHI_TRACE") && (offset & ~1ULL) != SDHI_INFO1
+    if (cdj_sdhi_trace() && (offset & ~1ULL) != SDHI_INFO1
         && (offset & ~1ULL) != SDHI_INFO2) {
         fprintf(stderr, "cdj2000-sdhi: write %u @ +%#04x = %#06x  pc %#010x\n",
                 size, (unsigned)offset, (unsigned)value,
@@ -2924,11 +3399,77 @@ static void cdj_sdhi_data_ready(void *opaque)
     }
 }
 
+/*
+ * The media state the GUI routes on.
+ *
+ * Status halfword 26 carries one 3-bit state per source, built by 0x218afe
+ * from the four words at 0x0489bd68, one per source in MAIN's own numbering
+ * (1 LINK 0x..68, 2 USB 0x..6c, 3 SD 0x..70, 4 DISC 0x..74).  The GUI's
+ * parser (0xb7dfe6) spreads halfword 26 into a table at 0x4b439c in the
+ * same order -- bits [11:9] first -- and its key dispatcher (0xb9b98c)
+ * routes a SOURCE key on the state at index (halfword 18 - 1), i.e. the
+ * source MAIN reports as current.  The screen router (0xb9b706) takes 0
+ * to the Wait platter, 1 to the library, and only from the library does
+ * the GUI ask MAIN for the card's lists.
+ *
+ * Measured with the GUI's own table watched (w4, v1): a 1 written to
+ * 0x0489bd6c lands in the table at index 1 (USB) and the SD key still
+ * routes on index 2 = 0, the platter; a 1 written to 0x0489bd70 lands at
+ * index 2 and the same key routes on state 1.  The earlier order
+ * "(DISC, SD, USB, LINK)" was a guess that put the card's state on the
+ * stick's word.
+ * MAIN writes those words through one accessor, 0x14e0be, from its browse
+ * answer builder -- and only on the media branch, which needs the database
+ * context open ([ctx+0x2d5c]) -- so a card that is mounted is never reported
+ * as such until the GUI browses it, and the GUI never browses it while the
+ * state says 0.  Measured, SD key on the test card: state 0 at the key ->
+ * platter for ever (sd1, sd2, w2); state 1 at the key -> the GUI asks for
+ * the card's lists at once and draws PLAYLIST / SEARCH / ARTIST / ALBUM /
+ * TRACK / KEY from it (e4, e5).
+ *
+ * CDJ_SD_MEDIA_STATE=1 makes the board report the card itself: from
+ * CDJ_SD_MOUNT_S (5) seconds after the insertion it holds the SD state
+ * word at 1, ten times a second.  It is OFF by default, because holding
+ * the word is measurably harmful: with it held (e2) MAIN answered the
+ * GUI's list request for the card with one-row records for 20 s; without
+ * it (e5, f1-f3) MAIN answered the same request with the card's lists at
+ * once and the library was on screen 2.6 s after the SD key.  MAIN's own
+ * media manager sets the word when the GUI browses the card, and the key
+ * gets there without help as long as the GUI's browse loop for the empty
+ * boot source has ended (see BFIN_LINK_BUDGET_ANY / BFIN_LINK_DEPTH in the
+ * launchers).  The report stays as a diagnostic for the routing chain.
+ */
+#define CDJ_SD_STATE_WORD 0x0489bd70ULL
+
+static void cdj_sd_media_state_report(CdjSdhiState *s)
+{
+    const char *enable = getenv("CDJ_SD_MEDIA_STATE");
+    const char *mount = getenv("CDJ_SD_MOUNT_S");
+    uint64_t seconds = mount ? strtoull(mount, NULL, 0) : 5;
+    CdjMainPoke *poke;
+
+    if (!(enable && *enable && *enable != '0')
+        || !sdbus_get_inserted(&s->sdbus)) {
+        return;
+    }
+    poke = g_new0(CdjMainPoke, 1);
+    poke->address[0] = CDJ_SD_STATE_WORD;
+    poke->value[0] = 1;
+    poke->count = 1;
+    poke->period_ns = 100 * SCALE_MS;
+    poke->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_main_poke_fire, poke);
+    timer_mod(poke->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                           seconds * NANOSECONDS_PER_SECOND);
+    qemu_log_mask(LOG_UNIMP, "cdj2000-sd: card inserted; reporting it mounted "
+                  "(media state 1) from %" PRIu64 " s on\n", seconds);
+}
+
 static void cdj_sdhi_insert(void *opaque)
 {
     CdjSdhiState *s = opaque;
 
     s->inserted = true;
+    cdj_sd_media_state_report(s);
 }
 
 static void cdj_sdhi_reset(DeviceState *dev)
@@ -3366,6 +3907,49 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
                 freq, NULL, NULL, NULL, NULL);
 }
 
+#ifdef _WIN32
+/*
+ * The RTOS tick is a 1 ms TMU period, and QEMU's main loop waits for it
+ * with a millisecond g_poll on the Windows scheduler, whose default
+ * resolution is 15.6 ms and which Windows 11 additionally coarsens for
+ * processes without a foreground window.  A tick that fires late enough to
+ * overlap the next one is coalesced by the level-sensitive TMU line, and the
+ * guest loses it: measured 720 ticks a second of the 1000 programmed.  Ask
+ * for a 0.5 ms resolution and opt out of the background throttling.  Both
+ * calls are looked up at run time so the build needs no extra library.
+ */
+static void cdj_host_timer_resolution(void)
+{
+    typedef LONG (WINAPI *set_resolution_t)(ULONG, BOOLEAN, PULONG);
+    typedef BOOL (WINAPI *set_information_t)(HANDLE, int, LPVOID, DWORD);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    set_resolution_t set_resolution = ntdll
+        ? (set_resolution_t)(void *)GetProcAddress(ntdll, "NtSetTimerResolution")
+        : NULL;
+    set_information_t set_information = kernel32
+        ? (set_information_t)(void *)GetProcAddress(kernel32,
+                                                    "SetProcessInformation")
+        : NULL;
+    ULONG actual = 0;
+
+    if (set_information) {
+        /* PROCESS_POWER_THROTTLING_STATE, version 1; control bit 4 is
+         * PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, state 0 means
+         * "do not throttle".  ProcessPowerThrottling is class 4. */
+        struct {
+            ULONG version, control_mask, state_mask;
+        } throttling = { 1, 4, 0 };
+        set_information(GetCurrentProcess(), 4, &throttling, sizeof(throttling));
+    }
+    if (set_resolution) {
+        set_resolution(5000, TRUE, &actual);
+    }
+    info_report("cdj2000-main: host timer resolution %.2f ms",
+                actual / 10000.0);
+}
+#endif
+
 static void cdj2000_main_init(MachineState *machine)
 {
     MemoryRegion *system = get_system_memory();
@@ -3373,6 +3957,10 @@ static void cdj2000_main_init(MachineState *machine)
     CdjResetState *reset;
     SuperHCPU *cpu;
     const char *firmware = machine->firmware;
+
+#ifdef _WIN32
+    cdj_host_timer_resolution();
+#endif
     ssize_t loaded;
 
     cpu = SUPERH_CPU(cpu_create(machine->cpu_type));
