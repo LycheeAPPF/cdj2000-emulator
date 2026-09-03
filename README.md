@@ -114,7 +114,12 @@ Be clear about this: **the player is not usable as a player.**
   player loads a track into the DSP's 32 MB SDRAM) and reports the load
   complete; the time display stays blank because the DSP's position report
   is not modelled, and there is no audio path, so PLAY changes nothing
-  audible.
+  audible. The recipe used to fail one run in four: the board handed the
+  GUI's frames to MAIN in bursts, two of them 0.1 ms apart, and MAIN's
+  receive task read the injected LOAD twice ("MusicID多重要求"). Frames now
+  go into MAIN's buffer no closer than 2 ms apart (`CDJ_LINK_RX_GAP_US`),
+  which is how the wire spaces them; `tools/cdj_main/link_exchanges.py`
+  counts the back-to-back deliveries a run still has.
 * **No audio at all.** The DSP (a Pioneer custom LSI, D710E001, with no
   public instruction set) is modelled from MAIN's side: it takes the request
   words MAIN polls and keeps two buffer levels, and has no signal path.

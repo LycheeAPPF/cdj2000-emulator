@@ -1509,12 +1509,20 @@ typedef struct CdjLinkState {
     uint8_t queue[CDJ_LINK_RX_QUEUE_MAX][512];
     unsigned queue_len[CDJ_LINK_RX_QUEUE_MAX];
     unsigned queue_head, queue_count;
-    bool rx_pending;            /* delivered, not yet acknowledged */
+    bool rx_pending;            /* delivered, not yet handed past */
     unsigned long n_queued, n_dropped, n_watchdog;
+    unsigned long n_answered;   /* handed over because MAIN answered */
+    unsigned long n_gapped;     /* held back for CDJ_LINK_RX_GAP_US */
+    int64_t rx_delivered_ns;    /* when the last frame went into the buffer */
     QEMUTimer *rx_watchdog;
+    QEMUTimer *rx_gap;
+    struct CdjLinkState *rx_peer;   /* transmit half: the receive half it paces */
 } CdjLinkState;
 
 static void cdj_link_rx_next(CdjLinkState *link);
+static void cdj_link_rx_release(CdjLinkState *link);
+static bool cdj_link_rx_handover_on_answer(void);
+static void cdj_link_rx_answered(CdjLinkState *rx);
 static bool cdj_link_link_rows(uint8_t *frame, unsigned len);
 
 static int64_t cdj_link_census_every(void)
@@ -1549,13 +1557,15 @@ static void cdj_link_census(CdjLinkState *link)
     qemu_log_mask(LOG_UNIMP,
                   "%s: census t%.1f armed=%lu sent=%lu bail=%lu short=%lu "
                   "rx=%lu ack=%lu gate=%lu moderead=%lu modereg=%lu "
-                  "wbytes=%lu queued=%lu dropped=%lu watchdog=%lu\n",
+                  "wbytes=%lu queued=%lu dropped=%lu watchdog=%lu "
+                  "answered=%lu gapped=%lu\n",
                   link->name,
                   (double)now / NANOSECONDS_PER_SECOND, link->n_armed,
                   link->n_sent, link->n_bail, link->n_short, link->n_rx,
                   link->n_ack, link->n_gate, link->n_mode_read,
                   link->n_mode_reg, link->n_wbytes, link->n_queued,
-                  link->n_dropped, link->n_watchdog);
+                  link->n_dropped, link->n_watchdog, link->n_answered,
+                  link->n_gapped);
 }
 
 static void cdj_intc2_set(CdjLinkState *link, bool raise)
@@ -1725,6 +1735,9 @@ static void cdj_link_transmit(CdjLinkState *link)
                   buffer[9], buffer[8], buffer[11], buffer[10],
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
     cdj_link_census(link);
+    if (link->rx_peer && cdj_link_rx_handover_on_answer()) {
+        cdj_link_rx_answered(link->rx_peer);
+    }
 
     if (cdj_link_tx_ns() > 0 && link->tx_timer) {
         /* In flight: START stays set until the frame is out. */
@@ -1802,7 +1815,8 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
             }
             link->n_armed++;
             link->control = value;
-            if (!link->transmit && link->rx_pending) {
+            if (!link->transmit && link->rx_pending
+                && !cdj_link_rx_handover_on_answer()) {
                 cdj_link_rx_next(link);
             }
             /*
@@ -1840,7 +1854,8 @@ static void cdj_link_write(void *opaque, hwaddr offset, uint64_t value,
             cdj_intc2_set(link, false);
         }
         if (!link->transmit && link->rx_pending
-            && !(link->status & link->rx_status)) {
+            && !(link->status & link->rx_status)
+            && !cdj_link_rx_handover_on_answer()) {
             cdj_link_rx_next(link);
         }
         return;
@@ -2201,8 +2216,9 @@ static void cdj_link_status_fresh(uint8_t *frame, unsigned len)
  * board, because the GUI's socket then backed up behind a receive MAIN had
  * not re-armed.  The FIFO takes the frame off the socket at once and hands
  * it to the guest when the previous one has been acknowledged in the
- * status register (or the receive re-armed), oldest dropped when 64 wait,
- * with a 50 ms watchdog in case a frame is never acknowledged.  What this
+ * status register (or the receive re-armed) and CDJ_LINK_RX_GAP_US has
+ * passed since it went in, oldest dropped when 64 wait, with a 50 ms
+ * watchdog in case a frame is never acknowledged.  What this
  * buys is measured on the SOURCE key: MAIN's status answers and the card's
  * lists reach the GUI at the rate the GUI asks, which is what the GUI's
  * browse loop needs to finish.  CDJ_LINK_RX_QUEUE=0 restores the overwrite.
@@ -2217,6 +2233,104 @@ static bool cdj_link_rx_queue_enabled(void)
         enabled = !(env && *env == '0');
     }
     return enabled;
+}
+
+/*
+ * CDJ_LINK_RX_GAP_US -- the least guest time between two frames going into
+ * the buffer.  Default 2000 (2 ms); 0 restores the old immediacy.
+ *
+ * The GUI's frames reach this board in bursts -- the simulator runs ahead
+ * and behind, and TCP batches -- while on the wire they are spaced by the
+ * GUI's own cycle: 15-20 a second at rest, 140 a second when it is asking
+ * for something (trackload-47/48), i.e. never closer than 7 ms.  MAIN's
+ * receive ISR (0x2a3f4c) acknowledges, re-arms and wakes GuiCom_RcvTASK
+ * within microseconds, so on the wire the task has always read a frame long
+ * before the next one lands; here two frames of a burst went into the buffer
+ * 0.1 ms apart and the task read the second twice, or the first not at all
+ * (trackload-42: an injected LOAD read twice, "MusicID多重要求", the load
+ * failed; trackload-45: 93 of 8263 deliveries closer than 0.5 ms to the one
+ * before).  The gap keeps the bursts but spaces the deliveries: a frame that
+ * would land less than the gap after the previous one waits in the FIFO and
+ * a timer hands it over when the gap is up.  2 ms is well under the GUI's
+ * fastest cycle and well over the task's latency.
+ */
+static int64_t cdj_link_rx_gap_ns(void)
+{
+    static int64_t gap = -1;
+
+    if (gap < 0) {
+        const char *env = getenv("CDJ_LINK_RX_GAP_US");
+
+        gap = (env && *env ? strtoll(env, NULL, 10) : 2000) * 1000LL;
+        if (gap < 0) {
+            gap = 0;
+        }
+    }
+    return gap;
+}
+
+/*
+ * CDJ_LINK_RX_HANDOVER=ack|answer -- what lets the next queued frame into the
+ * buffer.  Default: ack, i.e. the ISR's acknowledge (or its re-arm), spaced
+ * by the gap above.
+ *
+ * "ack" was the first FIFO: the frame after the current one went in as soon
+ * as the ISR wrote the status register back.  That is microseconds after the
+ * interrupt, inside the ISR's own loop (0x2a3f4c re-reads the status and
+ * services the new frame at once), long before GuiCom_RcvTASK -- woken by
+ * that ISR with wup_tsk, 0x2a4030 -- has run.  Two frames then produce two
+ * wake-ups but one buffer content, and the task (0x2133d0: tslp_tsk, then
+ * 0x21345a examines whatever is at 0xa4500000 while bit 2 of 0xfff10048
+ * stands) reads the second frame twice.  Measured in trackload-42-final: a
+ * status poll delivered at t=164.9897, the injected LOAD at t=164.9899, and
+ * MAIN's console took the load twice ("LOAD_WORK中のｴﾝﾀｰﾛｰﾄﾞ", "MusicID多重
+ * 要求") and failed it; trackload-45-final, same recipe, had 106 ms between
+ * the two frames and one load.  93 of 8263 deliveries in that run were
+ * closer than 0.5 ms to the one before: every one a request that may be
+ * read twice or, if it was the first of the pair, not at all.
+ *
+ * On the wire this cannot happen.  The GUI sends a request, waits for MAIN's
+ * status record, and only then sends the next one, so the next frame is
+ * never in the buffer before MAIN has answered the current one -- and MAIN
+ * answers after GuiCom_RcvTASK has processed it (the transmit at 0x2a3cf6
+ * clears its own frame-pending flag 0x7db353c).  "answer" therefore hands the
+ * next frame over when MAIN's transmit half sends, whatever it sends, or after
+ * the 50 ms watchdog if it never does; the ISR's acknowledge no longer moves
+ * the queue -- and neither does the re-arm, because the ISR re-arms the
+ * receive itself (0x2a3ff4, before the wake-up): trackload-47-launch, with
+ * the acknowledge alone disarmed, handed 713 of 749 queued frames over on
+ * that arm, inside the ISR's loop.  So in this mode only MAIN's transmit and
+ * the watchdog move the queue.
+ *
+ * Measured, and that is why it is not the default: MAIN does not answer
+ * frames, it sends a status record on its own cycle, about 16 a second
+ * whatever the GUI sends (3-launch 17/s, 45 16/s, 47 13/s, 48 16/s).  Paced
+ * by those, the FIFO fell behind the GUI (trackload-48-launch2: 45 497
+ * frames queued, 39 788 dropped, 4 909 handed over by the 50 ms watchdog),
+ * the GUI asked again and again (57 000 frames for 6 301 records), and a
+ * record sent while GuiCom_RcvTASK was still reading the buffer replaced the
+ * frame under it -- the task's CRC-error count 0x489bc88 reached 298, against
+ * 1 with the gap.  Kept for the A/B; the gap is the model of the wire.
+ */
+static bool cdj_link_rx_handover_on_answer(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *env = getenv("CDJ_LINK_RX_HANDOVER");
+
+        enabled = env && !strcmp(env, "answer");
+    }
+    return enabled;
+}
+
+/* MAIN answered: the receive half may take the next waiting frame. */
+static void cdj_link_rx_answered(CdjLinkState *rx)
+{
+    if (rx->rx_pending) {
+        rx->n_answered++;
+        cdj_link_rx_next(rx);
+    }
 }
 
 /* The last request handed to the guest: type, cursor, KIND (type-1 words). */
@@ -2347,9 +2461,9 @@ static void cdj_link_deliver(CdjLinkState *link, const uint8_t *frame,
 
     link->status |= link->rx_status;
     link->rx_pending = true;
+    link->rx_delivered_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     if (link->rx_watchdog) {
-        timer_mod(link->rx_watchdog,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50 * SCALE_MS);
+        timer_mod(link->rx_watchdog, link->rx_delivered_ns + 50 * SCALE_MS);
     }
     if (link->flag) {
         cdj_link_flag_rx(link->flag, cdj_link_flag_pending());
@@ -2369,6 +2483,37 @@ static void cdj_link_deliver(CdjLinkState *link, const uint8_t *frame,
     cdj_intc2_set(link, true);
 }
 
+/*
+ * The buffer is free: hand the oldest waiting frame over -- unless the gap
+ * since the last delivery is not up yet, in which case a timer does it.
+ */
+static void cdj_link_rx_release(CdjLinkState *link)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t due = link->rx_delivered_ns + cdj_link_rx_gap_ns();
+    unsigned slot;
+
+    if (link->rx_pending || !link->queue_count) {
+        return;
+    }
+    if (now < due) {
+        if (link->rx_gap && !timer_pending(link->rx_gap)) {
+            link->n_gapped++;
+            timer_mod(link->rx_gap, due);
+        }
+        return;
+    }
+    slot = link->queue_head;
+    link->queue_head = (slot + 1) % CDJ_LINK_RX_QUEUE_MAX;
+    link->queue_count--;
+    cdj_link_deliver(link, link->queue[slot], link->queue_len[slot]);
+}
+
+static void cdj_link_rx_gap_timer(void *opaque)
+{
+    cdj_link_rx_release(opaque);
+}
+
 /* The guest acknowledged (or re-armed): hand over the next frame waiting. */
 static void cdj_link_rx_next(CdjLinkState *link)
 {
@@ -2376,13 +2521,7 @@ static void cdj_link_rx_next(CdjLinkState *link)
     if (link->rx_watchdog) {
         timer_del(link->rx_watchdog);
     }
-    if (link->queue_count) {
-        unsigned slot = link->queue_head;
-
-        link->queue_head = (slot + 1) % CDJ_LINK_RX_QUEUE_MAX;
-        link->queue_count--;
-        cdj_link_deliver(link, link->queue[slot], link->queue_len[slot]);
-    }
+    cdj_link_rx_release(link);
 }
 
 static void cdj_link_rx_watchdog(void *opaque)
@@ -2415,7 +2554,9 @@ static void cdj_link_receive(void *opaque, const uint8_t *data, int size)
     link->rx_filled = 0;
 
     if (cdj_link_rx_queue_enabled() && frame <= sizeof(link->queue[0])) {
-        if (link->rx_pending || link->queue_count) {
+        if (link->rx_pending || link->queue_count
+            || qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+               < link->rx_delivered_ns + cdj_link_rx_gap_ns()) {
             unsigned slot;
 
             if (link->queue_count == CDJ_LINK_RX_QUEUE_MAX) {
@@ -2430,6 +2571,7 @@ static void cdj_link_receive(void *opaque, const uint8_t *data, int size)
             link->queue_len[slot] = frame;
             link->queue_count++;
             link->n_queued++;
+            cdj_link_rx_release(link);      /* arms the gap timer if that is all */
             return;
         }
         cdj_link_deliver(link, link->rx, frame);
@@ -2510,6 +2652,8 @@ static CdjLinkState *cdj_link_init(MemoryRegion *system, CdjIntc2State *intc2,
     } else {
         link->rx_watchdog = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          cdj_link_rx_watchdog, link);
+        link->rx_gap = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    cdj_link_rx_gap_timer, link);
     }
     link->base = base;
     link->intc2_bit = intc2_bit;
@@ -3832,16 +3976,18 @@ static void cdj_link_board_init(MemoryRegion *system, struct intc_desc *intc)
      * 0x2a3cf6 stages at 0xa4500800 before arming it.  They take separate
      * chardevs (-serial 0 in, -serial 1 out).
      */
-    cdj_link_init(system, intc2, flag,
+    CdjLinkState *rx = cdj_link_init(system, intc2, flag,
                   "cdj2000.link-rx", LINK_RX_BASE,
                   LINK_RX_BASE + 0x1000, 1u << 0,
                   LINK_RX_BUFFER, LINK_RX_LENGTH, false, NULL,
                   intc->irqs[CDJ_INTC_LINK_RX], serial_hd(0));
-    cdj_link_init(system, intc2, NULL, "cdj2000.link-tx", LINK_TX_BASE,
+    CdjLinkState *tx = cdj_link_init(system, intc2, NULL,
+                  "cdj2000.link-tx", LINK_TX_BASE,
                   LINK_TX_BASE + 0x1000, 1u << 5,
                   LINK_TX_BUFFER, LINK_TX_LENGTH, true, NULL,
-                  intc->irqs[CDJ_INTC_LINK_TX], serial_hd(1))
-        ->done_irq = intc->irqs[CDJ_INTC_LINK_DONE];
+                  intc->irqs[CDJ_INTC_LINK_TX], serial_hd(1));
+    tx->done_irq = intc->irqs[CDJ_INTC_LINK_DONE];
+    tx->rx_peer = rx;           /* MAIN's answers pace the receive FIFO */
     cdj_console_init(system, serial_hd(2), intc->irqs[CDJ_INTC_SCIF_RX],
                      intc->irqs[CDJ_INTC_SCIF_TX]);
 }

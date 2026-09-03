@@ -160,12 +160,28 @@ python -m tools.cdj_main.monitor "1,2,GU"      # MAIN's own service monitor
 python -m tools.cdj_main.caution --live        # decode the caution store
 python -m tools.cdj_main.gui_handshake         # measure the link handshake
 python -m tools.cdj_gui.decode_link_dump run/main-link-dump.bin   # what MAIN's link handed the GUI
+python -m tools.cdj_main.link_exchanges run/vm-main.log --dump run/main-link-dump.bin   # every request against MAIN's answers
 ```
 
 `decode_link_dump` reads a `BFIN_MAIN_LINK_DUMP` (every record the simulator
 handed the GUI firmware) and prints the status-word changes, every payload with
 its list rows or player-state strings, and which announced payload lengths
 were never delivered -- the shape of a frame the link lost.
+
+`link_exchanges` reads MAIN's own log (`boot_vm --main-output`), pairs every
+request the GUI sent (a delivered frame with bit 15 of word 1 set) with the
+payloads MAIN sent before the next request, and prints a table per request
+class -- type, cursor, words 3..5 -- of how often it was asked, how often a
+payload answered it, which (length and command word), how fast, and how many
+times the GUI asked again meanwhile; then the classes MAIN never answered
+with a payload, and the frames delivered less than 0.5 ms after the one
+before, which is the shape of a request the firmware read twice or not at
+all. With `--dump` one payload of every answer signature is decoded from the
+GUI's dump. On `trackload-45-final` it says, for instance, that the NXS
+GUI's type-9 player-state request is answered by MAIN 4.33 with 224 bytes
+under command `0x0009` (not the `0x19` layout the GUI tools build), that the
+type-7 encoder-LED commands never get a payload, and that 93 of 8263 frames
+went in back to back (see `CDJ_LINK_RX_GAP_US`).
 
 `caution` turns MAIN's internal codes into the `E-nnnn` numbers the player would
 show: `E-7010` is the audio DSP, `E-7020` the USB device, `E-7001` the disc
@@ -422,6 +438,13 @@ The board itself takes a long list of its own, all read with `getenv` in
 `CDJ_DSP_ABSENT`, `CDJ_USB_ABSENT`, `CDJ_ATAPI_ABSENT`, `CDJ_BUS_TRACE`,
 `CDJ_LINK_TRACE` (arm, acknowledge and gate lines with virtual-clock stamps,
 and the header words of every request delivered), `CDJ_LINK_TX_US` (off),
+`CDJ_LINK_RX_GAP_US` (the least guest time between two GUI frames going into
+MAIN's receive buffer, default 2000: the simulator delivers frames in bursts
+and two of them 0.1 ms apart made GuiCom_RcvTASK read the second twice --
+an injected LOAD taken twice failed the load in `trackload-42-final`; 0
+restores the burst) and `CDJ_LINK_RX_HANDOVER=answer` (hand the next queued
+frame over only when MAIN transmits; measured worse in `trackload-48-launch2`
+and kept for the A/B),
 `CDJ_NO_PANEL` and `CDJ_NO_USB_POWER` (the two input bits of GPIO
 `0xfff10060` the board holds high: the panel-present bit and the USB power
 switch's sense line, whose absence made MAIN raise caution `0x92` "USB Error"
