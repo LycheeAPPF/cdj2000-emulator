@@ -99,6 +99,7 @@
 #define DMAC_CH_CHCR    0xc
 #define CHCR_DE         0x0001      /* start */
 #define CHCR_TE         0x0002      /* transfer ended — what the boot polls */
+#define CHCR_IE         0x0004      /* interrupt enable: the request is TE && IE */
 /*
  * TCR's unit is not fixed: it is whatever CHCR's transfer-size field selects,
  * and the firmware states it twice over rather than leaving it to a datasheet.
@@ -217,6 +218,7 @@ enum {
     CDJ_INTC_SDHI,
     CDJ_INTC_SDHI_DMA,
     CDJ_INTC_DSP_DMA,
+    CDJ_INTC_DMA5,
     CDJ_INTC_ATA,
     CDJ_INTC_NR_SOURCES,
 };
@@ -269,11 +271,27 @@ enum {
 #define PANEL_FRAME_MARK 0x8f
 #define PANEL_DMA_RX_IRQ 0x33                       /* INTEVT 0x660, ch3 */
 #define PANEL_DMA_TX_IRQ 0x34                       /* INTEVT 0x680, ch4 */
+/*
+ * Channel 5 is the audio path's channel: tsk_DJcontTxDspPCM fills the DSP's
+ * PCM buffer with it (0x1c212a programs SAR/DAR/TCR and sets DE|IE, run
+ * trackload-32: ch5 SAR 0xa450baf0 DAR 0xac0c81e0 TCR 0x930) and then sleeps
+ * (tslp_tsk, 0x1c190a..0x1c1912) until the channel's completion interrupt wakes
+ * it.  The DJcont init at 0x1c119c registers that handler, 0x1c2158, for irq
+ * 0x35 with the 20-byte record at 0xa40668fc, so the vector is the channel's
+ * own -- irq 0x30 + n like the panel channels -- and not the DSP boot
+ * channel's 0x3d.  Before this was modelled every window-bound transfer raised
+ * 0x7a0: the boot download's handler (0x1c7ba2) ran 300 times against a level
+ * it never cleared, the sender was never woken, and the first PCM buffer was
+ * the last thing MAIN gave the DSP.
+ */
+#define DMA5_IRQ         0x35                       /* INTEVT 0x6a0, ch5 */
+#define DMA5_CHANNEL     5
 #define INTC2_DMA_STATUS 0xffd4004c
 #define INTC2_DMA_RX     0x0002
 #define INTC2_DMA_TX     0x0004
 #define INTEVT_PANEL_RX  (PANEL_DMA_RX_IRQ * 0x20)
 #define INTEVT_PANEL_TX  (PANEL_DMA_TX_IRQ * 0x20)
+#define INTEVT_DMA5      (DMA5_IRQ * 0x20)
 #define PANEL_PRIO       4
 
 /*
@@ -514,6 +532,8 @@ typedef struct {
     bool sdhi_dma_pending;
     qemu_irq dsp_dma_irq;
     bool dsp_dma_pending;
+    qemu_irq dma5_irq;                  /* channel 5's own completion vector */
+    bool dma5_pending;
     qemu_irq panel_tx_irq;
     QEMUTimer *panel_timer;
     bool panel_present;
@@ -845,8 +865,19 @@ static void cdj_dmac_run(CdjDmacState *dmac, unsigned index)
          * and SD channels already use.  The DSP's own handler (0x1c7ba2 ->
          * 0x1c7b6e) clears CHCR bits 2, 0 and 1 in that order and then sets
          * cflgDspDmaEnd, so it acknowledges exactly the same way.
+         *
+         * Which vector is the channel's, not the endpoint's: the boot download
+         * runs on channel 8 and its handler is registered for irq 0x3d, the
+         * PCM sender runs on channel 5 and its wake-up handler for irq 0x35
+         * (see DMA5_IRQ).  A channel-5 completion delivered on 0x7a0 storms the
+         * boot handler and leaves the sender asleep for ever.
          */
-        if (dmac->dsp_dma_irq && !dmac->dsp_dma_pending) {
+        if (index == DMA5_CHANNEL) {
+            if (dmac->dma5_irq && !dmac->dma5_pending) {
+                dmac->dma5_pending = true;
+                qemu_set_irq(dmac->dma5_irq, 1);
+            }
+        } else if (dmac->dsp_dma_irq && !dmac->dsp_dma_pending) {
             dmac->dsp_dma_pending = true;
             qemu_set_irq(dmac->dsp_dma_irq, 1);
         }
@@ -924,10 +955,24 @@ static void cdj_dmac_write(void *opaque, hwaddr offset, uint64_t value,
                     dmac->sdhi_dma_pending = false;
                     qemu_set_irq(dmac->sdhi_dma_irq, 0);
                 }
-                if (dmac->dsp_dma_pending && channel->role == CDJ_DMA_DSP) {
+                if (dmac->dsp_dma_pending && channel->role == CDJ_DMA_DSP
+                    && index != DMA5_CHANNEL) {
                     dmac->dsp_dma_pending = false;
                     qemu_set_irq(dmac->dsp_dma_irq, 0);
                 }
+            }
+            /*
+             * Channel 5's handler (0x1c2158) acknowledges differently: it
+             * clears IE, not TE, and leaves TE for the sender to clear when it
+             * re-arms the channel.  The request is TE && IE, so either bit
+             * going down takes the line with it -- left on TE alone the level
+             * re-entered the handler 300 times before the trace gave up
+             * (trackload-33) and the tasks never ran again.
+             */
+            if (dmac->dma5_pending && index == DMA5_CHANNEL
+                && (!(value & CHCR_TE) || !(value & CHCR_IE))) {
+                dmac->dma5_pending = false;
+                qemu_set_irq(dmac->dma5_irq, 0);
             }
             channel->chcr = value;
             if ((value & CHCR_DE) && (dmac->dmaor & 1)) {
@@ -1020,7 +1065,7 @@ static const MemoryRegionOps cdj_intc2_dma_ops = {
 
 static void cdj_dmac_init(MemoryRegion *system, qemu_irq panel_rx,
                           qemu_irq panel_tx, qemu_irq sdhi_dma,
-                          qemu_irq dsp_dma)
+                          qemu_irq dsp_dma, qemu_irq dma5)
 {
     CdjDmacState *dmac = g_new0(CdjDmacState, 1);
 
@@ -1032,6 +1077,7 @@ static void cdj_dmac_init(MemoryRegion *system, qemu_irq panel_rx,
     dmac->panel_tx_irq = panel_tx;
     dmac->sdhi_dma_irq = sdhi_dma;
     dmac->dsp_dma_irq = dsp_dma;
+    dmac->dma5_irq = dma5;
     dmac->panel_present = !getenv("CDJ_NO_PANEL");
     dmac->panel_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_dmac_panel_done,
                                      dmac);
@@ -3868,6 +3914,7 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
         INTC_VECT(CDJ_INTC_SDHI, INTEVT_SDHI),
         INTC_VECT(CDJ_INTC_SDHI_DMA, INTEVT_SDHI_DMA),
         INTC_VECT(CDJ_INTC_DSP_DMA, INTEVT_DSP_DMA),
+        INTC_VECT(CDJ_INTC_DMA5, INTEVT_DMA5),
         INTC_VECT(CDJ_INTC_ATA, INTEVT_ATA),
     };
     /*
@@ -3916,6 +3963,8 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
     intc->sources[CDJ_INTC_SDHI_DMA].prio = SDHI_PRIO;
     /* The DSP's DMA vector is registered by the driver, not through INT2PRI. */
     intc->sources[CDJ_INTC_DSP_DMA].prio = DSP_PRIO;
+    /* Likewise channel 5's: its record at 0xa40668fc says level 4. */
+    intc->sources[CDJ_INTC_DMA5].prio = PANEL_PRIO;
     cpu->env.intc_handle = intc;
 
     cdj_sdhi_init(system, intc->irqs[CDJ_INTC_SDHI]);
@@ -3944,7 +3993,8 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
     cdj_dmac_init(system, intc->irqs[CDJ_INTC_PANEL_RX],
                   intc->irqs[CDJ_INTC_PANEL_TX],
                   intc->irqs[CDJ_INTC_SDHI_DMA],
-                  intc->irqs[CDJ_INTC_DSP_DMA]);
+                  intc->irqs[CDJ_INTC_DSP_DMA],
+                  intc->irqs[CDJ_INTC_DMA5]);
 
     /*
      * CDJ_TMU_FREQ multiplies the peripheral clock.  The firmware has several
