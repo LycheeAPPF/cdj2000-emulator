@@ -304,6 +304,29 @@ one-row answers the GUI gives up on after ~5 s (m1).
 Switching **away** from the card works: the USB key with no stick shows
 the platter 1.5-3.5 s after the key, three of three.
 
+**Loading a track.** The track list of a playlist is one 896-byte link
+frame, and until 2026-09-03 both link models threw anything over 512 bytes
+away -- the board without reporting the completion, which left MAIN's sender
+dead for the rest of the run (`runs/nxs-swap/twoboard-10-load`: the answer
+announced in 9 545 status records, never delivered). Both carry 4096 bytes
+now, the protocol's own limit. What the browse keys of the NXS GUI do on this
+MAIN is measured in `runs/nxs-swap/NOTE-trackload-2026-09-03.md`: the select
+encoder (`rotary 7`) moves the left column, the pane follows, and no key was
+found that sends the "enter" request. So the requests are injected instead:
+`tools/cdj_main/link_inject.py` sits between the GUI (`BFIN_MAIN_LINK=
+127.0.0.1:5990`) and MAIN and sends, at given seconds after the GUI connected,
+an ENTER (`type 1 cursor 3, words 7 1 N` -- row N of MAIN's current list
+becomes the list) or a LOAD (`type 7 cursor 1, words 0 N` -- the track at
+index N of the current list). From the library screen, `--inject 90:1:3:7:1:0
+--inject 110:1:3:7:1:0 --inject 130:1:3:7:1:0 --inject 155:7:1:0:0` opens
+PLAYLIST, its first folder, that folder's first playlist -- the track list
+draws -- and loads its first track: TRACK 01, overview waveform, and after a
+second load the duration, BPM and key of the track (`trackload-12-load`,
+frames t165-t250). MAIN's own console (`CDJ_DEBUG_CONSOLE=70`, the file
+`TEMP/vm-console.txt`, Shift-JIS) narrates it: `BlackFin → ロード要求`,
+`♪WAVE[0,400]`, `♪CUE(U/S)[3]`; arm it after the library is up, at 5 s it
+broke the card switch. There is no audio path: PLAY changes nothing.
+
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold
 reaches MAIN -- `0x04c084d4` goes to 1 -- but the GUI never learns of it): the

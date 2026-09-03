@@ -81,7 +81,9 @@ If you are here to build on it, that is exactly what it is for.
   start: its library -- categories, folders, playlists from the rekordbox
   export -- is on the screen with the player screen, at 33-35 s. Switching
   to it later, from another source, mostly is not (see "Switching to a
-  medium" in RUNNING.md).
+  medium" in RUNNING.md). Opening a playlist and loading a track from it
+  works when the requests are injected on the link (see "Loading a track"
+  in RUNNING.md).
 
 ## What does not
 
@@ -101,8 +103,13 @@ Be clear about this: **the player is not usable as a player.**
   never learns of the key (see "Switching to a medium" in RUNNING.md). Give
   a freshly inserted card ~25 s before its key. The card at launch is seven
   of seven.
-* **No track loading.** The library lists come from the card; selecting a
-  track in them has not been driven, and there is no audio path.
+* **A track loads, but does not play.** The library lists come from the
+  card, a playlist's track list with them (896-byte link frames, the ceiling
+  was 512), and a load request brings the track up as TRACK 01 with its
+  overview waveform, duration, BPM and key -- driven by injecting the browse
+  and load requests with `tools/cdj_main/link_inject.py`, because no key of
+  the NXS GUI has been found that sends the "enter" request. There is no
+  audio path, so PLAY does nothing and the time display stays blank.
 * **No audio at all.** The DSP is a register model with a position counter and
   no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
