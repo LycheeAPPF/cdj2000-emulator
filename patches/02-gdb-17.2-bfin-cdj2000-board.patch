@@ -4186,7 +4186,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  
 diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/bfin/dv-bfin_ppi.c gdb-17.2/sim/bfin/dv-bfin_ppi.c
 --- a/sim/bfin/dv-bfin_ppi.c	2026-05-10 16:32:31.000000000 +0200
-+++ b/sim/bfin/dv-bfin_ppi.c	2026-09-02 14:38:31.702719200 +0200
++++ b/sim/bfin/dv-bfin_ppi.c	2026-09-03 11:50:13.066949600 +0200
 @@ -25,10 +25,49 @@
  #include "sim-main.h"
  #include "devices.h"
@@ -4295,7 +4295,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
    return bfin_gui_update (ppi->gui_state, source, nr_bytes);
  }
  
-@@ -232,8 +287,2398 @@
+@@ -232,8 +287,2513 @@
    ppi->color = bfin_gui_color (color);
  }
  
@@ -4432,8 +4432,22 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +     then fails the checksum at 0xb7f6be, and after ten of those the GUI puts
 +     E-8709: COMMUNICATION ERROR on screen.  link_framed stays 0 against a peer
 +     that sends no header, in which case the old flat-stream path is used.  */
-+#define BFIN_LINK_FRAME_MAX 512
-+#define BFIN_LINK_SIZES 8
++  /* The longest frame kept.  The firmware validates an announced payload
++     against 1..2048 halfwords (0xb7f8d2), so 4096 bytes is the protocol's own
++     ceiling, and dv-bfin_dma.c reads a receive in chunks of at most 4096
++     bytes while take() pairs a frame with a receive of exactly its length --
++     so this must not be raised without changing that.  It was 512 until the
++     first playlist's track list: MAIN sends that answer as one 896-byte
++     frame, which split() below threw away together with the whole staging
++     buffer, without a word (twoboard-10-load, 2026-09-02).  */
++#define BFIN_LINK_FRAME_MAX 4096
++  /* Frames are kept per exact length, and a browse session has many: the
++     list answers are variable-length UTF-16 rows, so every page of a track
++     list is a new length.  Eight slots were full after the seven lengths of
++     the library screens and a ninth length was dropped without a word;
++     split() now recycles a slot whose ring has been read out, and says so on
++     stderr when it cannot.  */
++#define BFIN_LINK_SIZES 16
 +  /* BFIN_LINK_DEPTH=<n>: how many unread frames of one length the model keeps.
 +     One -- the default, and bit-for-bit the behaviour every run before r162 was
 +     measured on -- means MAIN's next answer overwrites the one the firmware has
@@ -4519,6 +4533,13 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +  unsigned long link_rx_repeat;   /* 64-byte records this model repeated */
 +  unsigned long link_rx_changed;  /* fresh ones whose bytes differ from the last */
 +  unsigned long link_rx_payload;  /* records of every other length */
++  unsigned long link_rx_recycled; /* a read-out slot given to a new length */
++  unsigned long link_rx_noslot;   /* dropped: every slot held unread frames */
++  /* Halfwords 29 and 30 of the newest 64-byte record as MAIN sent it -- not
++     the copy this model carries onto later records -- so take() knows which
++     payload length MAIN itself still calls its current answer.  */
++  unsigned link_wire_w29, link_wire_w30;
++  unsigned long link_rx_repeat_payload;   /* payloads handed over again */
 +  double link_census_next;
 +  /* An announcement and the payload it announces are one transaction, and this
 +     model does not keep them together: the 64-byte and 224-byte slots advance
@@ -5070,6 +5091,34 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +
 +/* How many unread frames of one length to keep -- see the struct comment.  */
 +
++/* BFIN_LINK_REPEAT_ANNOUNCED=0 -- switch off the repeat below.
++
++   A payload slot holds MAIN's newest answer of that length, and take() used
++   to refuse it once it had been handed over: a payload is one transmission,
++   not a level.  But MAIN's status record keeps announcing its last answer
++   after the answer went over, and the firmware then arms the receive for it
++   again -- and on the wire a fetch poll brings that answer back.  Refusing
++   left the firmware arming for ever: trackload-6 (2026-09-03) armed the
++   announced 48-byte receive 45 277 times and was handed 42, with MAIN
++   answering every poll with a status record; the SD key never got past that
++   loop.  So while MAIN's own newest record announces exactly this length, the
++   newest payload of that length is handed over again, counted as
++   `repeat_payload=` in BFIN_LINK_RX_CENSUS.  On by default.  */
++
++static int
++bfin_sport_link_repeat_announced (void)
++{
++  static int cached = -1;
++
++  if (cached < 0)
++    {
++      const char *env = getenv ("BFIN_LINK_REPEAT_ANNOUNCED");
++
++      cached = !(env && *env == '0');
++    }
++  return cached;
++}
++
 +static unsigned
 +bfin_sport_link_depth (void)
 +{
@@ -5188,6 +5237,9 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +  fflush (stderr);
 +}
 +
++static int bfin_sport_link_slot_unread (struct bfin_sport *sport,
++					unsigned slot);
++
 +static void
 +bfin_sport_link_split (struct bfin_sport *sport)
 +{
@@ -5209,10 +5261,20 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +	       | ((unsigned) head[7] << 24);
 +      if (length == 0 || length > BFIN_LINK_FRAME_MAX)
 +	{
++	  static int warned;
++
 +	  /* Unusable length -- resynchronise on the next magic rather than
-+	     wedging on a byte we cannot interpret.  */
++	     wedging on a byte we cannot interpret.  Said once: this is where
++	     a frame longer than BFIN_LINK_FRAME_MAX vanishes.  */
 +	  sport->link_rx_flush++;
 +	  sport->link_in_len = 0;
++	  if (!warned++)
++	    {
++	      fprintf (stderr, "link: unusable frame length %u (max %d) -- "
++		       "staging buffer flushed, t%.1f\n", length,
++		       BFIN_LINK_FRAME_MAX, bfin_sim_seconds ());
++	      fflush (stderr);
++	    }
 +	  return;
 +	}
 +      if (sport->link_in_len < 8 + length)
@@ -5240,6 +5302,42 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +	}
 +      if (slot == BFIN_LINK_SIZES)
 +	slot = free_slot;
++      if (slot == BFIN_LINK_SIZES)
++	{
++	  /* Every slot holds a length.  Recycle one whose ring has nothing
++	     unread -- never the 64-byte slot, whose newest entry take() and
++	     peek_status() repeat whether or not it is fresh -- and drop the
++	     frame, said once, only while all of them hold unread frames.  */
++	  unsigned s;
++
++	  for (s = 0; s < BFIN_LINK_SIZES; s++)
++	    if (sport->link_frame_len[s] != sizeof (sport->link_last)
++		&& !bfin_sport_link_slot_unread (sport, s))
++	      break;
++	  if (s < BFIN_LINK_SIZES)
++	    {
++	      sport->link_frame_len[s] = 0;
++	      sport->link_frame_put[s] = 0;
++	      sport->link_frame_get[s] = 0;
++	      memset (sport->link_frame_fresh[s], 0,
++		      sizeof (sport->link_frame_fresh[s]));
++	      sport->link_rx_recycled++;
++	      slot = s;
++	    }
++	  else
++	    {
++	      static int warned;
++
++	      sport->link_rx_noslot++;
++	      if (!warned++)
++		{
++		  fprintf (stderr, "link: no slot for a %u-byte frame -- all "
++			   "%d lengths hold unread frames; dropped, t%.1f\n",
++			   length, BFIN_LINK_SIZES, bfin_sim_seconds ());
++		  fflush (stderr);
++		}
++	    }
++	}
 +      if (slot < BFIN_LINK_SIZES)
 +	{
 +	  unsigned depth = bfin_sport_link_depth ();
@@ -5281,6 +5379,11 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +	      && sport->link_frame_get[slot] % depth == put)
 +	    sport->link_frame_get[slot] = (put + 1) % depth;
 +	  memcpy (sport->link_frame[slot][put], head + 8, length);
++	  if (length == sizeof (sport->link_last))
++	    {
++	      sport->link_wire_w29 = head[8 + 58] | (head[8 + 59] << 8);
++	      sport->link_wire_w30 = head[8 + 60] | (head[8 + 61] << 8);
++	    }
 +	  sport->link_frame_len[slot] = length;
 +	  sport->link_frame_fresh[slot][put] = 1;
 +	  sport->link_frame_put[slot] = (put + 1) % depth;
@@ -5468,11 +5571,14 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +  sport->link_census_next = now + every;
 +  fprintf (stderr, "link: rx census t%.1f bytes=%lu resync=%lu flush=%lu "
 +	   "stall=%lu arrived=%lu lost=%lu fresh=%lu changed=%lu repeat=%lu "
-+	   "hold=%lu payload=%lu\n", now, sport->link_rx_bytes,
++	   "hold=%lu payload=%lu recycled=%lu noslot=%lu repeat_payload=%lu\n",
++	   now, sport->link_rx_bytes,
 +	   sport->link_rx_resync, sport->link_rx_flush, sport->link_rx_stall,
 +	   sport->link_rx_arrived, sport->link_rx_lost, sport->link_rx_fresh,
 +	   sport->link_rx_changed, sport->link_rx_repeat,
-+	   sport->link_hold_total, sport->link_rx_payload);
++	   sport->link_hold_total, sport->link_rx_payload,
++	   sport->link_rx_recycled, sport->link_rx_noslot,
++	   sport->link_rx_repeat_payload);
 +  fflush (stderr);
 +}
 +
@@ -5525,9 +5631,18 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +	     that case the newest entry is the one on the wire.  */
 +	  if (nr_bytes != sizeof (sport->link_last))
 +	    {
-+	      if (c >= 0)
-+		bfin_link_census[c].stale++;
-+	      return 0;
++	      /* MAIN's own newest record still announces exactly this length:
++		 the payload is its current answer, the one a fetch poll on the
++		 wire brings back.  See BFIN_LINK_REPEAT_ANNOUNCED.  */
++	      if (!bfin_sport_link_repeat_announced ()
++		  || sport->link_wire_w29 == 0
++		  || sport->link_wire_w30 * 2 != nr_bytes)
++		{
++		  if (c >= 0)
++		    bfin_link_census[c].stale++;
++		  return 0;
++		}
++	      sport->link_rx_repeat_payload++;
 +	    }
 +	  entry = (sport->link_frame_put[slot] + depth - 1) % depth;
 +	  /* This record is not a transmission, it is the wire still carrying

@@ -1519,8 +1519,9 @@ static unsigned cdj_link_frame_len(CdjLinkState *link)
  *
  * Every frame carries an 8-byte "CDJL" + little-endian length header, because
  * the wire here is a TCP socket and the thing it stands in for is not.  MAIN
- * mixes 64-byte status records with 224-byte payload records; a peer reading a
- * flat byte stream cannot tell where one ends, and a single 224-byte frame read
+ * mixes 64-byte status records with payload records of 48 to 896 bytes (see
+ * LINK_FRAME_MAX); a peer reading a flat byte stream cannot tell where one
+ * ends, and a single 224-byte frame read
  * as three-and-a-half 64-byte ones leaves it 32 bytes out of phase for the rest
  * of the run -- every record fails its checksum from then on and the GUI puts
  * E-8709 on screen.  The header is skipped by a peer that does not know it (the
@@ -1591,15 +1592,46 @@ static void cdj_link_tx_complete(void *opaque)
     }
 }
 
+/*
+ * The longest frame the model carries.  The GUI's receiver validates an
+ * announced payload length against 1..2048 halfwords (0xb7f8d2), so 4096
+ * bytes is the protocol's own ceiling; the simulator's DMA model reads a
+ * receive in chunks of at most 4096 bytes and pairs a frame with a receive of
+ * exactly its length, so this must not be raised without changing that.
+ *
+ * It was 512 until the first playlist's track list.  MAIN announces that
+ * answer as 448 halfwords -- 896 bytes, its rows are UTF-16 titles -- and a
+ * frame past the buffer was dropped *without* the completion below, which
+ * leaves the transmit-in-progress flag 0x7db3541 set: MAIN never transmits
+ * again.  twoboard-10-load (2026-09-02): the -D log's last "sent" at
+ * t=118.6, 12 160 requests delivered after it, none answered, the status
+ * record announcing 448 halfwords for the rest of the run.
+ */
+#define LINK_FRAME_MAX 4096
+
 static void cdj_link_transmit(CdjLinkState *link)
 {
     unsigned frame = cdj_link_frame_len(link);
     CdjLinkState *owner = link->owner ? link->owner : link;
-    uint8_t buffer[8 + 512];
+    uint8_t buffer[8 + LINK_FRAME_MAX];
 
-    if (!frame || frame > sizeof(buffer) - 8 || !link->buffer) {
+    if (!frame || !link->buffer) {
         link->n_bail++;
         cdj_link_census(link);
+        return;
+    }
+    if (frame > LINK_FRAME_MAX) {
+        /*
+         * Dropped, but completed: without the completion the sender is dead
+         * for the rest of the run, which is how the 512-byte buffer hid the
+         * track list.  Nothing went on the wire, so complete at once.
+         */
+        link->n_bail++;
+        warn_report_once("cdj2000: %s: a %u-byte frame exceeds LINK_FRAME_MAX "
+                         "(%u); dropped, completion reported", link->name,
+                         frame, (unsigned)LINK_FRAME_MAX);
+        cdj_link_census(link);
+        cdj_link_tx_complete(link);
         return;
     }
     memcpy(buffer, "CDJL", 4);

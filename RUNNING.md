@@ -159,7 +159,13 @@ so a mask is only usable against the run it was made for.
 python -m tools.cdj_main.monitor "1,2,GU"      # MAIN's own service monitor
 python -m tools.cdj_main.caution --live        # decode the caution store
 python -m tools.cdj_main.gui_handshake         # measure the link handshake
+python -m tools.cdj_gui.decode_link_dump run/main-link-dump.bin   # what MAIN's link handed the GUI
 ```
+
+`decode_link_dump` reads a `BFIN_MAIN_LINK_DUMP` (every record the simulator
+handed the GUI firmware) and prints the status-word changes, every payload with
+its list rows or player-state strings, and which announced payload lengths
+were never delivered -- the shape of a frame the link lost.
 
 `caution` turns MAIN's internal codes into the `E-nnnn` numbers the player would
 show: `E-7010` is the audio DSP, `E-7020` the USB device, `E-7001` the disc
@@ -374,10 +380,15 @@ The board itself takes a long list of its own, all read with `getenv` in
 `emulator/qemu/`: `CDJ_INPUT_PORT`, `CDJ_PANEL_KEYS`, `CDJ_SD_INSERT`,
 `CDJ_DSP_ABSENT`, `CDJ_USB_ABSENT`, `CDJ_ATAPI_ABSENT`, `CDJ_BUS_TRACE`,
 `CDJ_LINK_TRACE` (arm, acknowledge and gate lines with virtual-clock stamps,
-and the header words of every request delivered), `CDJ_LINK_TX_US` (off) and
-more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
+and the header words of every request delivered), `CDJ_LINK_TX_US` (off),
+`CDJ_NO_PANEL` and `CDJ_NO_USB_POWER` (the two input bits of GPIO
+`0xfff10060` the board holds high: the panel-present bit and the USB power
+switch's sense line, whose absence made MAIN raise caution `0x92` "USB Error"
+every 50 polls) and more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
 `BFIN_GUI_COLOR`, `BFIN_PPI_DMA_DELAY`, `BFIN_SPORT_TX_OUTPUT`,
-`BFIN_SPORT_RX_US` (off), and the time-base knobs above: `BFIN_TIME_BASE`,
+`BFIN_SPORT_RX_US` (off), `BFIN_LINK_REPEAT_ANNOUNCED` (on: a payload MAIN's
+record still announces is handed over again when the firmware arms for it),
+and the time-base knobs above: `BFIN_TIME_BASE`,
 `BFIN_CCLK_HZ`, `BFIN_PPI_FPS`, `BFIN_SPORT_RETRY_US`, `BFIN_WALL_LAG_MS`,
 `BFIN_STATS`, `BFIN_EXIT_AFTER_WALL`, `BFIN_EXIT_AFTER_TICKS`,
 `BFIN_MEM_FAST`. Each is documented where it is read.
