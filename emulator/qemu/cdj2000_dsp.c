@@ -129,6 +129,9 @@ static uint64_t cdj_dsp_mailbox_read(void *opaque, hwaddr offset, unsigned size)
         fprintf(stderr, "cdj2000-dsp: mailbox read  +0x%04x = 0x%08x\n",
                 (unsigned)(DSP_MAILBOX_OFFSET + offset), (uint32_t)value);
     }
+    if (DSP_MAILBOX_OFFSET + (offset & ~3ull) == CDJ_DSP_MAIL_UP && value) {
+        cdj_dsp_model_up_seen(dsp->model, dsp->ram, CDJ_DSP_WINDOW_SIZE);
+    }
     return value;
 }
 

@@ -108,10 +108,16 @@ Be clear about this: **the player is not usable as a player.**
   was 512), and a load request brings the track up as TRACK 01 with its
   overview waveform, duration, BPM and key -- driven by injecting the browse
   and load requests with `tools/cdj_main/link_inject.py`, because no key of
-  the NXS GUI has been found that sends the "enter" request. There is no
-  audio path, so PLAY does nothing and the time display stays blank.
-* **No audio at all.** The DSP is a register model with a position counter and
-  no signal path.
+  the NXS GUI has been found that sends the "enter" request. With
+  `CDJ_DSP_ACK=1` the DSP model also answers the load's handshake, MAIN
+  streams the whole file into the DSP window over DMAC channel 5 (the
+  player loads a track into the DSP's 32 MB SDRAM) and reports the load
+  complete; the time display stays blank because the DSP's position report
+  is not modelled, and there is no audio path, so PLAY changes nothing
+  audible.
+* **No audio at all.** The DSP (a Pioneer custom LSI, D710E001, with no
+  public instruction set) is modelled from MAIN's side: it takes the request
+  words MAIN polls and keeps two buffer levels, and has no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
   **Selecting `USB` shows the `Wait` platter and leaves it there**: the GUI
   routes a source whose media state MAIN reports as zero to the platter

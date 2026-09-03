@@ -90,6 +90,14 @@ void cdj_dsp_model_firmware(CdjDspModel *model, uint8_t *window,
                             size_t length, uint32_t offset, unsigned bytes);
 
 /*
+ * MAIN read the mailbox's "up" word and found it set.  The firmware pages are
+ * staged through the same window region the control block lives in (+0x7800
+ * onwards), so at this point the block still holds the last page's bytes; a
+ * DSP that has just booted has initialised its own memory instead.
+ */
+void cdj_dsp_model_up_seen(CdjDspModel *model, uint8_t *window, size_t length);
+
+/*
  * MAIN raised the request word.  The model reads the command out of the window
  * and writes its answer back into the same window; returning true means it
  * answered and the device should acknowledge.

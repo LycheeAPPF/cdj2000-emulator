@@ -325,7 +325,25 @@ second load the duration, BPM and key of the track (`trackload-12-load`,
 frames t165-t250). MAIN's own console (`CDJ_DEBUG_CONSOLE=70`, the file
 `TEMP/vm-console.txt`, Shift-JIS) narrates it: `BlackFin → ロード要求`,
 `♪WAVE[0,400]`, `♪CUE(U/S)[3]`; arm it after the library is up, at 5 s it
-broke the card switch. There is no audio path: PLAY changes nothing.
+broke the card switch.
+
+The load itself is a handshake with the audio DSP, and the built-in DSP
+model answers it only with `CDJ_DSP_ACK=1` (off by default; see the comments
+in `emulator/qemu/cdj2000_dsp_model.c` for every word and the run that
+measured it). With it MAIN writes the load's parameters, the stream format
+and header into the DSP window, reads the file from the card and streams it
+into the DSP over DMAC channel 5 -- the whole track, the way the player loads
+into the DSP's 32 MB of SDRAM -- and reports the load complete when the last
+buffer is in: `Musicﾛｰﾄﾞ要求完了通知受理 PL→全`, NOW LOADING ends, the
+tempo field shows the track's BPM (`trackload-36-levels`, ~130 s of guest
+time for a 3:17 WAV). Without the switch the load stays pending behind NOW
+LOADING, or stops with `E-8302` once the model answers some words but not
+others. `CDJ_DSP_TRACE=1` prints every acknowledged request with its
+parameters, a per-second census of the control block's changed words and the
+two buffer levels. Still blank: the time fields of the status record (words
+5..8 read `0xbbbb`), because the position the DSP reports in its slot table
+at window+0x7ce0 is not modelled yet (a guessed one, `trackload-38-memplay`,
+changed nothing there). There is no audio path.
 
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold
@@ -407,7 +425,15 @@ and the header words of every request delivered), `CDJ_LINK_TX_US` (off),
 `CDJ_NO_PANEL` and `CDJ_NO_USB_POWER` (the two input bits of GPIO
 `0xfff10060` the board holds high: the panel-present bit and the USB power
 switch's sense line, whose absence made MAIN raise caution `0x92` "USB Error"
-every 50 polls) and more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
+every 50 polls), `CDJ_DSP_ACK` (the DSP model zeroes its control block once
+MAIN has seen it up and answers the request words a track load and its PCM
+stream write there; off, an experiment -- see "Loading a track"),
+`CDJ_DSP_TRACE` (firmware pages, mailbox, every acknowledged request, a
+per-second census of the control block), `CDJ_DMAC_TRACE` (every DMA start
+with channel, SAR, DAR, TCR, CHCR and role), `CDJ_SDHI_TRACE` (every SD
+command; walking the card image's FAT for the block addresses says which
+file a read was -- `runs/nxs-swap/trackload-39-final/fatmap.py` does that)
+and more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
 `BFIN_GUI_COLOR`, `BFIN_PPI_DMA_DELAY`, `BFIN_SPORT_TX_OUTPUT`,
 `BFIN_SPORT_RX_US` (off), `BFIN_LINK_REPEAT_ANNOUNCED` (on: a payload MAIN's
 record still announces is handed over again when the firmware arms for it),
