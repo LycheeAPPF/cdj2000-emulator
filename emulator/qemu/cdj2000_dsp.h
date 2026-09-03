@@ -58,6 +58,7 @@
  * So 0xac0cfff4 is the DSP saying "I am running", and it is the whole of what
  * bring-up state 5 waits for.  Offsets are relative to the window base.
  */
+#define CDJ_DSP_MAIL_EVENT    0xffe8      /* the DSP's event word, see cdj_dsp_event */
 #define CDJ_DSP_MAIL_REQ      0xffec
 #define CDJ_DSP_MAIL_BASE     0xfff0
 #define CDJ_DSP_MAIL_UP       0xfff4
@@ -107,8 +108,27 @@ bool cdj_dsp_model_doorbell(CdjDspModel *model, uint8_t *window, size_t length);
 /* Virtual time has passed: advance whatever the model keeps running. */
 void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length);
 
+/*
+ * The DSP's interrupt line to MAIN.  The device raises `irq` (irq 0x7f,
+ * INTEVT 0xfe0) and tells the board through `pending` so that the two status
+ * bits MAIN tests -- bit 24 of 0xffd4005c in the vector stub 0x26260c, bit 4
+ * of GPIO 0xfff10040 in the poll 0x1c7ce4 -- follow the line.  MAIN's handler
+ * 0x1c09a0 reads the event word at window+0xffe8, takes bytes 2 and 3 as the
+ * event code and acknowledges with bit 2 of the control register, which
+ * lowers the line again.
+ */
+typedef void (*CdjDspPendingFn)(void *opaque, bool raised);
+
 /* The device side, called from the board. */
-void cdj_dsp_init(MemoryRegion *system, Chardev *external);
+void cdj_dsp_init(MemoryRegion *system, Chardev *external, qemu_irq irq,
+                  CdjDspPendingFn pending, void *pending_opaque);
+
+/*
+ * Post an event to MAIN: the word goes to window+0xffe8 and the line goes up
+ * until MAIN acknowledges.  `code` lands in bytes 2 and 3 the way 0x1c09a0
+ * reads them (byte 2 high, byte 3 low).  For the model.
+ */
+void cdj_dsp_event(unsigned code);
 
 /* True when a DMA endpoint is the DSP's window — used to pick the DMA role. */
 bool cdj_dsp_is_window(hwaddr address);

@@ -74,6 +74,19 @@ struct CdjDspModel {
     bool control_cleared;               /* CDJ_DSP_ACK: block zeroed once MAIN saw "up" */
     unsigned stream_buffer;             /* CDJ_DSP_ACK: buffer the last data header named, 1 or 2 */
 
+    /* CDJ_DSP_SLOT_REPORT: the slot table entry MAIN reads after an event. */
+    bool slot_report;
+    unsigned slot_loaded_state;         /* CDJ_DSP_SLOT_REPORT=<n>: the state written after the load */
+    bool saw_load_end;                  /* +0x7ba0 = 4 seen: the load's closing sequence */
+    unsigned slot_state;                /* what the entries say: 0 none, 2 loaded, 3 playing */
+
+    /* CDJ_DSP_EVENT_PROBE: post event codes to MAIN on a schedule. */
+    int64_t probe_start_ns;
+    int64_t probe_interval_ns;
+    int64_t probe_last_ns;
+    unsigned probe_code;
+    unsigned probe_last_code;
+
     /*
      * CDJ_DSP_TRACE: a copy of the control block as last reported, so each
      * second's report names only the words that changed since the previous one.
@@ -192,6 +205,48 @@ CdjDspModel *cdj_dsp_model_new(Chardev *external)
      */
     model->absent = getenv("CDJ_DSP_ABSENT") != NULL;
     model->ack_control = getenv("CDJ_DSP_ACK") != NULL;
+    model->slot_report = getenv("CDJ_DSP_SLOT_REPORT") != NULL;
+    model->slot_loaded_state = model->slot_report
+        ? (unsigned)strtoul(getenv("CDJ_DSP_SLOT_REPORT"), NULL, 0) : 0;
+    if (model->slot_report && (model->slot_loaded_state == 0
+                               || model->slot_loaded_state == 3)) {
+        model->slot_loaded_state = 2;
+    }
+    /*
+     * CDJ_DSP_EVENT_PROBE=<start s>[:<interval s>[:<first>-<last>]] -- from
+     * <start> seconds of guest time on, post the event codes <first>..<last>
+     * (default 1..13, DspTASK's table has 13 entries) one every <interval>
+     * seconds (default 4) and leave it to the console and the census to say
+     * what MAIN made of each.  The codes' meaning is not known; this is how
+     * it gets measured.  See cdj_dsp_event in cdj2000_dsp.c for the line.
+     *
+     * trackload-50-eventprobe (185:4, after a load): every code acknowledged
+     * within a millisecond; the player task reported an error stop five
+     * times ("ｴﾗｰ停止通知をﾌﾞﾟﾚｰﾔｰﾀｽｸから受理した", GUI: E-8302 CANNOT PLAY
+     * TRACK (C611), waveform cleared) and codes 5, 6, 7 and 10 were each
+     * followed by the player commands 2 then 1 in +0x7ba0.  A code without
+     * its parameters is an error to MAIN; which one carries the position is
+     * the next measurement.
+     */
+    {
+        const char *probe = getenv("CDJ_DSP_EVENT_PROBE");
+
+        if (probe && *probe) {
+            double start = 0, interval = 4;
+            unsigned first = 1, last = 13;
+
+            sscanf(probe, "%lf:%lf:%u-%u", &start, &interval, &first, &last);
+            if (interval <= 0) {
+                interval = 4;
+            }
+            model->probe_start_ns = (int64_t)(start * 1e9);
+            model->probe_interval_ns = (int64_t)(interval * 1e9);
+            model->probe_code = first;
+            model->probe_last_code = last;
+            fprintf(stderr, "cdj2000-dsp: event probe: codes %u..%u from t=%.1f "
+                    "every %.1f s\n", first, last, start, interval);
+        }
+    }
     if (external) {
         qemu_chr_fe_init(&model->external, external, &error_abort);
         model->have_external = true;
@@ -472,6 +527,60 @@ static void cdj_dsp_model_census(CdjDspModel *model, uint8_t *window,
  */
 
 /*
+ * CDJ_DSP_SLOT_REPORT -- an experiment on the slot table below and the event
+ * line.  trackload-50/51b measured that a bare event (any code 1..13, no
+ * parameters, the table empty) makes MAIN's player task issue the player
+ * commands 1 and 2 within 100 ms and, five times in run 50, report an error
+ * stop ("ｴﾗｰ停止通知をﾌﾟﾚｰﾔｰﾀｽｸから受理した", GUI: E-8302 CANNOT PLAY TRACK
+ * (C611)); the DspTASK's record poster 0x1c7c62 was never called, so the
+ * event is handled by the player task itself, which is also what copies the
+ * slot entry (0x1b39cc: +96.. and state +128 into its deck record).  So the
+ * event presumably says "read the table".  With CDJ_DSP_SLOT_REPORT=<state>
+ * the model, once MAIN has closed the load (command 4 then 2 in +0x7ba0),
+ * writes that state and position 0 into the first four entries and raises
+ * one event; PLAY (3) makes it state 3 and another event.  What MAIN then
+ * shows -- time fields, or E-8302 again -- is the measurement.
+ * trackload-52-slotreport, state 2: MAIN answered the event with the player
+ * commands 1, 2, 1 and reported an error stop ("ｴﾗｰ停止通知", E-8302) --
+ * the same as a bare event during a load, and unlike a bare event after
+ * one (trackload-51b: commands 1 and 2, no error).  trackload-53, state 1:
+ * the same error stop.  So the entry is read, a non-zero state with position
+ * 0 is not what a loaded deck looks like, and the next step is the reader
+ * (0x1b39cc..0x1b3a60 and what it does with its deck record), not a fourth
+ * guess.
+ */
+#define DSP_SLOT_TABLE          0x7ce0
+#define DSP_SLOT_SIZE           (33 * 4)
+#define DSP_SLOT_ENTRIES        4
+#define DSP_SLOT_POS_FINE       96      /* /294 -> sectors (0x1a1174) */
+#define DSP_SLOT_POS_COARSE     100     /* *2, 0x1be946 */
+#define DSP_SLOT_POS_THIRD      104
+#define DSP_SLOT_STATE          128     /* 2 or 3 = running (0x1b3a02) */
+
+static void cdj_dsp_model_slot_report(CdjDspModel *model, uint8_t *window,
+                                      size_t length, unsigned state,
+                                      int64_t now)
+{
+    unsigned i;
+
+    if (length < DSP_SLOT_TABLE + DSP_SLOT_ENTRIES * DSP_SLOT_SIZE) {
+        return;
+    }
+    for (i = 0; i < DSP_SLOT_ENTRIES; i++) {
+        uint8_t *entry = window + DSP_SLOT_TABLE + i * DSP_SLOT_SIZE;
+
+        stl_le_p(entry + DSP_SLOT_POS_FINE, 0);
+        stl_le_p(entry + DSP_SLOT_POS_COARSE, 0);
+        stl_le_p(entry + DSP_SLOT_POS_THIRD, 0);
+        stl_le_p(entry + DSP_SLOT_STATE, state);
+    }
+    model->slot_state = state;
+    fprintf(stderr, "cdj2000-dsp: slot entries 0..%u: state %u, position 0; "
+            "event 1 raised t=%.3f\n", DSP_SLOT_ENTRIES - 1, state, now / 1e9);
+    cdj_dsp_event(1);
+}
+
+/*
  * The slot table at +0x7ce0 (132-byte entries, index * 33 * 4: 0x19fffe..,
  * 0x1a0048.., 0x1b39cc.., 0x1be974..) is where MAIN reads the DSP's position:
  * 0x1be946 combines word +100 * 2 and word +96 / 294 into half-sector units
@@ -556,9 +665,28 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
             if (req->clear_result) {
                 stl_le_p(window + req->offset + 4, 0);
             }
+            if (req->offset == 0x7ba0 && model->slot_report) {
+                if (word == 4) {
+                    model->saw_load_end = true;
+                } else if (word == 2 && model->saw_load_end
+                           && model->slot_state == 0) {
+                    cdj_dsp_model_slot_report(model, window, length,
+                                              model->slot_loaded_state, now);
+                } else if (word == 3 && model->slot_state != 0
+                           && model->slot_state != 3) {
+                    cdj_dsp_model_slot_report(model, window, length, 3, now);
+                }
+            }
         }
     }
     cdj_dsp_model_census(model, window, length, now);
+    if (model->probe_interval_ns && model->running && !model->absent
+        && model->probe_code <= model->probe_last_code
+        && now >= model->probe_start_ns
+        && now - model->probe_last_ns >= model->probe_interval_ns) {
+        model->probe_last_ns = now;
+        cdj_dsp_event(model->probe_code++);
+    }
     if (model->transport != CDJ_DSP_PLAYING || elapsed_ms <= 0) {
         return;
     }

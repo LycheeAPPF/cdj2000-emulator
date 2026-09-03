@@ -219,6 +219,7 @@ enum {
     CDJ_INTC_SDHI_DMA,
     CDJ_INTC_DSP_DMA,
     CDJ_INTC_DMA5,
+    CDJ_INTC_DSP_EVENT,
     CDJ_INTC_ATA,
     CDJ_INTC_NR_SOURCES,
 };
@@ -398,6 +399,9 @@ enum {
 #define USB_POWER_SENSE_BIT 0x0010
 
 #define INTC2_STATUS    0xffd40050
+#define INTC2_STATUS_SIZE       0x10
+#define INTC2_STATUS2_OFFSET    0x0c        /* 0xffd4005c */
+#define INTC2_DSP_EVENT_BIT     (1u << 24)  /* tested by the DSP stub 0x26260c */
 #define LINK_RX_IRQ    0x50
 #define LINK_TX_IRQ  0x55
 #define INTEVT_LINK_RX   (LINK_RX_IRQ * 0x20)     /* 0xa00 */
@@ -1322,14 +1326,17 @@ static void cdj_bus_trace_init(MemoryRegion *system)
 }
 
 /*
- * The INTC2 status word the link handlers test before doing anything.  Only
- * this one register of the controller is modelled; the mask and priority
- * registers around it stay trapped, because the CPU-side masking is done by
- * sh_intc and SR.IMASK instead.
+ * The INTC2 status word the link handlers test before doing anything, and
+ * the second one at +0xc (0xffd4005c) that the DSP's vector stub 0x26260c
+ * tests for bit 24 before it calls the DSP handler 0x1c09a0 (its neighbour
+ * 0x2625f6 tests bit 19 there for another device).  The mask and priority
+ * registers around them stay trapped, because the CPU-side masking is done
+ * by sh_intc and SR.IMASK instead.
  */
 typedef struct {
     MemoryRegion iomem;
     uint32_t status;
+    uint32_t status2;           /* 0xffd4005c */
 } CdjIntc2State;
 
 /*
@@ -1346,8 +1353,45 @@ typedef struct {
     MemoryRegion iomem;
     bool panel_present;
     bool usb_power;
+    bool dsp_event;             /* the DSP's interrupt line, GPIO 0xfff10040 bit 4 */
     uint16_t reg[SOC_BLOCK_SIZE / 2];
 } CdjLinkFlagState;
+
+/*
+ * The DSP's interrupt to MAIN, as MAIN sees it: irq 0x7f (INTEVT 0xfe0, the
+ * RTOS record at 0xa409f4d4), bit 24 of the second INTC2 status word, which
+ * the stub 0x26260c tests before calling the handler 0x1c09a0, and bit 4 of
+ * GPIO 0xfff10040, which 0x1c7ce4 polls (and acknowledges with bit 2 of the
+ * DSP control register when it finds it set).  The handler reads the event
+ * word at window+0xffe8, stores bytes 2 and 3 as the event code, sets the
+ * same ACK bit and set_flg()s the DSP task.  The device raises and lowers
+ * the line (cdj2000_dsp.c); this is where the line's two status bits live.
+ */
+#define DSP_EVENT_REG   0xfff10040
+#define DSP_EVENT_BIT   0x0010
+
+typedef struct {
+    CdjIntc2State *intc2;
+    CdjLinkFlagState *flag;
+} CdjDspEventSink;
+
+static CdjDspEventSink cdj_dsp_event_sink;
+
+static void cdj_dsp_event_pending(void *opaque, bool raised)
+{
+    CdjDspEventSink *sink = opaque;
+
+    if (sink->intc2) {
+        if (raised) {
+            sink->intc2->status2 |= INTC2_DSP_EVENT_BIT;
+        } else {
+            sink->intc2->status2 &= ~INTC2_DSP_EVENT_BIT;
+        }
+    }
+    if (sink->flag) {
+        sink->flag->dsp_event = raised;
+    }
+}
 
 static uint64_t cdj_link_flag_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -1366,6 +1410,9 @@ static uint64_t cdj_link_flag_read(void *opaque, hwaddr offset, unsigned size)
             value |= USB_POWER_SENSE_BIT;
         }
         return value;
+    }
+    if (offset == DSP_EVENT_REG - SOC_BLOCK_BASE && flag->dsp_event) {
+        return flag->reg[offset >> 1] | DSP_EVENT_BIT;
     }
     if (size <= 2) {
         return flag->reg[offset >> 1];
@@ -2611,6 +2658,9 @@ static uint64_t cdj_intc2_read(void *opaque, hwaddr offset, unsigned size)
 {
     CdjIntc2State *intc2 = opaque;
 
+    if (offset == INTC2_STATUS2_OFFSET) {
+        return intc2->status2;
+    }
     return offset ? 0 : intc2->status;
 }
 
@@ -3137,6 +3187,9 @@ static void cdj_debug_console_init(void)
 #define DSP_DMA_IRQ     0x3d
 #define INTEVT_DSP_DMA  (DSP_DMA_IRQ * 0x20)    /* 0x7a0 */
 #define DSP_PRIO        4
+/* The DSP's own interrupt to MAIN; see CdjDspEventSink. */
+#define DSP_EVENT_IRQ   0x7f
+#define INTEVT_DSP_EVENT (DSP_EVENT_IRQ * 0x20)  /* 0xfe0 */
 
 /*
  * The disc drive.  irq 0x60 with ISR 0x109180, read out of the RTOS thunk
@@ -3961,8 +4014,10 @@ static void cdj_link_board_init(MemoryRegion *system, struct intc_desc *intc)
     CdjLinkFlagState *flag = g_new0(CdjLinkFlagState, 1);
 
     memory_region_init_io(&intc2->iomem, NULL, &cdj_intc2_ops, intc2,
-                          "cdj2000.intc2-status", 4);
+                          "cdj2000.intc2-status", INTC2_STATUS_SIZE);
     memory_region_add_subregion(system, INTC2_STATUS, &intc2->iomem);
+    cdj_dsp_event_sink.intc2 = intc2;
+    cdj_dsp_event_sink.flag = flag;
 
     flag->panel_present = !getenv("CDJ_NO_PANEL");
     flag->usb_power = !getenv("CDJ_NO_USB_POWER");
@@ -4061,6 +4116,7 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
         INTC_VECT(CDJ_INTC_SDHI_DMA, INTEVT_SDHI_DMA),
         INTC_VECT(CDJ_INTC_DSP_DMA, INTEVT_DSP_DMA),
         INTC_VECT(CDJ_INTC_DMA5, INTEVT_DMA5),
+        INTC_VECT(CDJ_INTC_DSP_EVENT, INTEVT_DSP_EVENT),
         INTC_VECT(CDJ_INTC_ATA, INTEVT_ATA),
     };
     /*
@@ -4111,6 +4167,7 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
     intc->sources[CDJ_INTC_DSP_DMA].prio = DSP_PRIO;
     /* Likewise channel 5's: its record at 0xa40668fc says level 4. */
     intc->sources[CDJ_INTC_DMA5].prio = PANEL_PRIO;
+    intc->sources[CDJ_INTC_DSP_EVENT].prio = DSP_PRIO;
     cpu->env.intc_handle = intc;
 
     cdj_sdhi_init(system, intc->irqs[CDJ_INTC_SDHI]);
@@ -4122,7 +4179,9 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
      */
     const char *dsp_chardev = getenv("CDJ_DSP_CHARDEV");
 
-    cdj_dsp_init(system, dsp_chardev ? qemu_chr_find(dsp_chardev) : NULL);
+    cdj_dsp_init(system, dsp_chardev ? qemu_chr_find(dsp_chardev) : NULL,
+                 intc->irqs[CDJ_INTC_DSP_EVENT], cdj_dsp_event_pending,
+                 &cdj_dsp_event_sink);
     /*
      * The USB controller sits on the external bus at physical 0x01000000, well
      * clear of CS0's 4 MiB of flash.  Without it USBFD_TSK's enable-and-poll at

@@ -356,7 +356,12 @@ time for a 3:17 WAV). Without the switch the load stays pending behind NOW
 LOADING, or stops with `E-8302` once the model answers some words but not
 others. `CDJ_DSP_TRACE=1` prints every acknowledged request with its
 parameters, a per-second census of the control block's changed words and the
-two buffer levels. Still blank: the time fields of the status record (words
+two buffer levels. The recipe that held (trackload-49..52, four of four): the
+card given at launch (`--sd`), the SD SOURCE key at 60 s (`--source-key sd
+--source-key-at 60` -- the card alone leaves the NXS GUI browsing LINK, and
+its cursor-3 polls then collide with the injected ENTERs, trackload-47/48),
+ENTERs at 90/110/130 and the LOAD at 155 s of the injector's clock; the
+receive gap (`CDJ_LINK_RX_GAP_US`) is what made it hold. Still blank: the time fields of the status record (words
 5..8 read `0xbbbb`), because the position the DSP reports in its slot table
 at window+0x7ce0 is not modelled yet (a guessed one, `trackload-38-memplay`,
 changed nothing there). There is no audio path.
@@ -452,7 +457,18 @@ every 50 polls), `CDJ_DSP_ACK` (the DSP model zeroes its control block once
 MAIN has seen it up and answers the request words a track load and its PCM
 stream write there; off, an experiment -- see "Loading a track"),
 `CDJ_DSP_TRACE` (firmware pages, mailbox, every acknowledged request, a
-per-second census of the control block), `CDJ_DMAC_TRACE` (every DMA start
+per-second census of the control block, every event posted), `CDJ_DSP_EVENT_PROBE=<start s>[:<interval s>[:<first>-<last>]]`
+(post the DSP's event codes to MAIN on its interrupt line -- irq 0x7f, bit 24
+of 0xffd4005c, GPIO 0xfff10040 bit 4, the code in bytes 2/3 of window+0xffe8
+-- one every interval from the start second on, to measure what MAIN's
+player task makes of each; the line itself is always modelled, only the
+probe posts: trackload-50/51b measured that MAIN acknowledges every code
+within a millisecond and answers with the player commands 1 and 2, and that
+an event during a load stops the player with E-8302), `CDJ_DSP_SLOT_REPORT=<state>`
+(after the load's closing commands 4 and 2 write that state and position 0
+into the slot table at window+0x7ce0 and raise one event; state 2 got
+E-8302 in trackload-52 -- the entry is read, its vocabulary is still open),
+`CDJ_DMAC_TRACE` (every DMA start
 with channel, SAR, DAR, TCR, CHCR and role), `CDJ_SDHI_TRACE` (every SD
 command; walking the card image's FAT for the block addresses says which
 file a read was -- `runs/nxs-swap/trackload-39-final/fatmap.py` does that)
