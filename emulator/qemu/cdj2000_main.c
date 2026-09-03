@@ -364,6 +364,20 @@ enum {
  */
 #define PANEL_PRESENT_REG 0x0060
 #define PANEL_PRESENT_BIT 0x0002
+/*
+ * Bit 4 of the same register is the sense line of the USB power switch.
+ * MAIN polls it from 0x042918c0 (counter at 0x04fe34d4) and after 50 reads
+ * with the bit low calls the message function 0x04250e44 with (0x92, 5000):
+ * the caution the NXS GUI shows as "USB Error. Remove the device." (the
+ * stock 4.200 GUI has no table entry for 0x92 and stays silent).  A register
+ * file answers 0 there, so the poller fired for the whole run
+ * (runs/nxs-swap/main-watch146: 0x053560b8 written 0x92 from 0x042c0082
+ * without pause).  Holding the bit high from outside with
+ * CDJ_MAIN_POKE=0xfff10060=0x10 gave message code 0 in all 14 486 status
+ * records of twoboard-6, so the bit reads as set, like the panel bit;
+ * CDJ_NO_USB_POWER=1 restores the register-file reading for an A/B.
+ */
+#define USB_POWER_SENSE_BIT 0x0010
 
 #define INTC2_STATUS    0xffd40050
 #define LINK_RX_IRQ    0x50
@@ -1285,6 +1299,7 @@ typedef struct {
 typedef struct {
     MemoryRegion iomem;
     bool panel_present;
+    bool usb_power;
     uint16_t reg[SOC_BLOCK_SIZE / 2];
 } CdjLinkFlagState;
 
@@ -1295,8 +1310,16 @@ static uint64_t cdj_link_flag_read(void *opaque, hwaddr offset, unsigned size)
     if (offset + size > SOC_BLOCK_SIZE) {
         return 0;
     }
-    if (offset == PANEL_PRESENT_REG && flag->panel_present) {
-        return flag->reg[offset >> 1] | PANEL_PRESENT_BIT;
+    if (offset == PANEL_PRESENT_REG && (flag->panel_present || flag->usb_power)) {
+        uint64_t value = flag->reg[offset >> 1];
+
+        if (flag->panel_present) {
+            value |= PANEL_PRESENT_BIT;
+        }
+        if (flag->usb_power) {
+            value |= USB_POWER_SENSE_BIT;
+        }
+        return value;
     }
     if (size <= 2) {
         return flag->reg[offset >> 1];
@@ -3752,6 +3775,7 @@ static void cdj_link_board_init(MemoryRegion *system, struct intc_desc *intc)
     memory_region_add_subregion(system, INTC2_STATUS, &intc2->iomem);
 
     flag->panel_present = !getenv("CDJ_NO_PANEL");
+    flag->usb_power = !getenv("CDJ_NO_USB_POWER");
     memory_region_init_io(&flag->iomem, NULL, &cdj_link_flag_ops, flag,
                           "cdj2000.soc-block", SOC_BLOCK_SIZE);
     memory_region_add_subregion(system, SOC_BLOCK_BASE, &flag->iomem);
