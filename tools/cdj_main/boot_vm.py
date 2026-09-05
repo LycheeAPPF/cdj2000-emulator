@@ -391,7 +391,9 @@ def main() -> int:
                              "flag the firmware consumes")
     parser.add_argument("--trace", metavar="ADDR[,ADDR]",
                         help="hold gdb breakpoints here and report pc/r4/r5/pr "
-                             "per hit, repeats counted.  Needed for anything "
+                             "per hit, repeats counted; w:ADDR[:LEN] is a "
+                             "write watchpoint instead, reporting the storing "
+                             "instruction.  Needed for anything "
                              "only the two-board run reaches -- MAIN alone "
                              "never receives a GUI request.  Mutually "
                              "exclusive with --poke: there is one gdb stub and "
@@ -557,15 +559,23 @@ def main() -> int:
     stop_trace = threading.Event()
     tracer = None
     trace_hits: dict[tuple[int, ...], list] = {}
-    trace_at = [int(item, 0) for item in args.trace.split(",")] if args.trace else []
-    if trace_at:
+    trace_at = []
+    trace_watch = []
+    for item in (args.trace.split(",") if args.trace else []):
+        if item.startswith("w:"):
+            parts = item[2:].split(":")
+            trace_watch.append((int(parts[0], 0), int(parts[1], 0) if len(parts) > 1 else 4))
+        else:
+            trace_at.append(int(item, 0))
+    if trace_at or trace_watch:
         tracer = threading.Thread(
             target=caution.trace_thread,
             args=(PORT + 3, trace_at, args.trace_max, stop_trace, trace_hits,
-                  args.trace_cap),
+                  args.trace_cap, trace_watch),
             daemon=True)
         tracer.start()
-        print("# trace: " + ", ".join("0x%08x" % a for a in trace_at))
+        print("# trace: " + ", ".join("0x%08x" % a for a in trace_at)
+              + "".join(" w:0x%08x:%d" % w for w in trace_watch))
     stop_frames = threading.Event()
     sampler = None
     sampler_report: dict = {}
