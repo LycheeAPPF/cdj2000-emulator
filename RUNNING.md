@@ -361,10 +361,50 @@ card given at launch (`--sd`), the SD SOURCE key at 60 s (`--source-key sd
 --source-key-at 60` -- the card alone leaves the NXS GUI browsing LINK, and
 its cursor-3 polls then collide with the injected ENTERs, trackload-47/48),
 ENTERs at 90/110/130 and the LOAD at 155 s of the injector's clock; the
-receive gap (`CDJ_LINK_RX_GAP_US`) is what made it hold. Still blank: the time fields of the status record (words
+receive gap (`CDJ_LINK_RX_GAP_US`) is what made it hold. That recipe is a
+tool:
+
+```
+python -m tools.cdj_main.twoboard trackload-60 --card runs/nxs-swap/rbstick1g.img
+python -m tools.cdj_main.twoboard play-1 --card CARD --keys keys.txt --env CDJ_DSP_ACK=1 \
+    --bootvm-arg=--trace=0x41bd304 --dry-run
+```
+
+`twoboard` starts MAIN (`boot_vm`, the card's work copy at launch, the SD key
+at 60 s), the injecting proxy (`link_inject`, the four requests above unless
+`--inject` or `--no-inject` says otherwise) and the GUI (`run_headless`),
+presses panel keys from a `SECONDS ARGS` file through `panel_control`, and
+leaves logs, frames, request dump, MAIN console and a README with every
+command line in a fresh directory under `runs/nxs-swap/` -- an existing one is
+refused, so runs never overwrite each other. `--env` is MAIN board environment
+(`CDJ_*`), `--gui-env` the simulator's, `--bootvm-arg` anything else for
+`boot_vm`; the gdb stub stays free for `--trace` because nothing is polled
+unless `--poll-words` asks. Still blank: the time fields of the status record (words
 5..8 read `0xbbbb`), because the position the DSP reports in its slot table
 at window+0x7ce0 is not modelled yet (a guessed one, `trackload-38-memplay`,
 changed nothing there). There is no audio path.
+
+**The update file is not what the emulator boots.** The board loads
+`firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
+`C2KMAIN.UPD` by `tools.cdj_gui.main_unpack` -- into its NOR flash model (a
+CFI02 device in RAM, so the settings sectors the firmware erases and rewrites
+never reach the file). A modified image is tested by putting it there; nothing
+in the emulator exercises the updater. What the device itself checks on an
+update file is host-side arithmetic: Motorola S-records with per-record
+checksums, a little-endian CRC-16/XMODEM trailer over the container, the two
+LZSS-packed application regions at 0x10000 and 0x40000 with their additive
+checksums, and the model/version header at image offset 0x700 (`PIONEER`,
+`CDJ-2000`, `4.33`, `20150209`). `main_unpack` verifies the first three on the
+way in; the CDJ2000-revival repository's `build_main_patch.py` re-emits all of
+them and refuses to patch unless the stock file round-trips byte for byte. The
+updater task that reads the file (`UpDtae_TASK`, "*** Update END ! ***") lives
+in the application image but names no file -- the 4.33 image contains neither
+`.UPD` nor `C2K` in any encoding -- so its trigger and its medium handling are
+open. Running it in the emulator would need a USB mass-storage or SD image
+carrying the file, the menu path that starts it, and the flash model taking
+the rewrite; that is a project of its own, and the decision here is not to
+build it: the file's acceptance is proven on the host (unpack what was built,
+compare with what was booted), the firmware change itself in the emulator.
 
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold
