@@ -79,13 +79,19 @@ struct CdjDspModel {
     unsigned slot_loaded_state;         /* CDJ_DSP_SLOT_REPORT=<n>: the state written after the load */
     bool saw_load_end;                  /* +0x7ba0 = 4 seen: the load's closing sequence */
     unsigned slot_state;                /* what the entries say: 0 none, 2 loaded, 3 playing */
+    unsigned slot_event;                /* CDJ_DSP_SLOT_EVENT: the event posted with a report */
+    int64_t slot_pos_ms;                /* the position the entries report */
+    int64_t slot_period_ns;             /* CDJ_DSP_SLOT_PERIOD_MS: repeat while playing */
+    int64_t slot_last_ns;               /* when the position was last advanced */
 
     /* CDJ_DSP_EVENT_PROBE: post event codes to MAIN on a schedule. */
     int64_t probe_start_ns;
     int64_t probe_interval_ns;
     int64_t probe_last_ns;
-    unsigned probe_code;
-    unsigned probe_last_code;
+    unsigned probe_list[32];            /* the codes, in posting order */
+    unsigned probe_count;
+    unsigned probe_next;                /* index of the next code to post */
+    unsigned report_id;                 /* CDJ_DSP_REPORT_ID: +0x7cd4, bumped before every event */
 
     /*
      * CDJ_DSP_TRACE: a copy of the control block as last reported, so each
@@ -212,6 +218,10 @@ CdjDspModel *cdj_dsp_model_new(Chardev *external)
                                || model->slot_loaded_state == 3)) {
         model->slot_loaded_state = 2;
     }
+    model->slot_event = getenv("CDJ_DSP_SLOT_EVENT")
+        ? (unsigned)strtoul(getenv("CDJ_DSP_SLOT_EVENT"), NULL, 0) : 0x100;
+    model->slot_period_ns = (int64_t)(getenv("CDJ_DSP_SLOT_PERIOD_MS")
+        ? strtol(getenv("CDJ_DSP_SLOT_PERIOD_MS"), NULL, 0) : 500) * 1000000;
     /*
      * CDJ_DSP_EVENT_PROBE=<start s>[:<interval s>[:<first>-<last>]] -- from
      * <start> seconds of guest time on, post the event codes <first>..<last>
@@ -228,23 +238,81 @@ CdjDspModel *cdj_dsp_model_new(Chardev *external)
      * its parameters is an error to MAIN; which one carries the position is
      * the next measurement.
      */
+    /*
+     * CDJ_DSP_REPORT_ID=<n>: the word at +0x7cd4 is an ID the DSP reports and
+     * MAIN only reads (the census never saw MAIN write it).  The player task's
+     * event dispatcher (0x1b36c4, 0x1b3700, 0x1b3790) drops a class 1, 2 or 5
+     * event when its copy at [0x4835ac8+60] equals that word, and the class
+     * handler 0x1bd304 captures the word and compares again after the worker
+     * task has answered (0x1bd43a).  trackload-55: with the word 0 every
+     * class 1/2/5 event was dropped (handlers never hit), class 3 ran and
+     * timed out after 6 s.  trackload-56, the word written 1 before the first
+     * event: that event ran the handler through to the worker task's answer
+     * and the update path 0x1bd440 -- MAIN then reported a track change to
+     * none ("曲変化(TrNo=-1)", the table being empty) and the status record's
+     * time fields went from blank to 00:00 -- and every later event was
+     * dropped again, MAIN having copied the 1.  So the word is a report
+     * sequence number: with this switch the model writes <n>+1, <n>+2, ...
+     * there before each event it posts.
+     */
+    if (getenv("CDJ_DSP_REPORT_ID")) {
+        model->report_id = (unsigned)strtoul(getenv("CDJ_DSP_REPORT_ID"), NULL, 0);
+    }
     {
         const char *probe = getenv("CDJ_DSP_EVENT_PROBE");
 
         if (probe && *probe) {
             double start = 0, interval = 4;
-            unsigned first = 1, last = 13;
+            unsigned first = 1, last = 13, i;
+            const char *codes = NULL;
+            char *end = NULL;
 
-            sscanf(probe, "%lf:%lf:%u-%u", &start, &interval, &first, &last);
+            /*
+             * <start>[:<interval>[:<codes>]] -- <codes> is either a range
+             * <first>-<last> or a comma-separated list, each entry in C
+             * notation (0x100 is class 1 parameter 0: byte 2 of the event word
+             * is the class the player task switches on at 0x1b36a4, byte 3
+             * the parameter it passes on).  trackload-54 was meant to post
+             * such a list and posted 1..13 again because this parser did not
+             * exist; the run is marked invalid in its README.
+             */
+            start = strtod(probe, &end);
+            if (end && *end == ':') {
+                interval = strtod(end + 1, &end);
+            }
+            if (end && *end == ':') {
+                codes = end + 1;
+            }
             if (interval <= 0) {
                 interval = 4;
             }
             model->probe_start_ns = (int64_t)(start * 1e9);
             model->probe_interval_ns = (int64_t)(interval * 1e9);
-            model->probe_code = first;
-            model->probe_last_code = last;
-            fprintf(stderr, "cdj2000-dsp: event probe: codes %u..%u from t=%.1f "
-                    "every %.1f s\n", first, last, start, interval);
+            model->probe_count = 0;
+            if (codes && strchr(codes, ',')) {
+                while (*codes && model->probe_count < ARRAY_SIZE(model->probe_list)) {
+                    model->probe_list[model->probe_count++] =
+                        (unsigned)strtoul(codes, &end, 0);
+                    if (end == codes) {
+                        break;
+                    }
+                    codes = (*end == ',') ? end + 1 : end;
+                }
+            } else {
+                if (codes) {
+                    sscanf(codes, "%u-%u", &first, &last);
+                }
+                for (i = first; i <= last
+                     && model->probe_count < ARRAY_SIZE(model->probe_list); i++) {
+                    model->probe_list[model->probe_count++] = i;
+                }
+            }
+            fprintf(stderr, "cdj2000-dsp: event probe: %u codes from t=%.1f "
+                    "every %.1f s:", model->probe_count, start, interval);
+            for (i = 0; i < model->probe_count; i++) {
+                fprintf(stderr, " 0x%x", model->probe_list[i]);
+            }
+            fprintf(stderr, "\n");
         }
     }
     if (external) {
@@ -549,6 +617,7 @@ static void cdj_dsp_model_census(CdjDspModel *model, uint8_t *window,
  * (0x1b39cc..0x1b3a60 and what it does with its deck record), not a fourth
  * guess.
  */
+#define DSP_REPORT_ID_WORD      0x7cd4  /* read at 0x1b36c6, 0x1bd330; never written by MAIN */
 #define DSP_SLOT_TABLE          0x7ce0
 #define DSP_SLOT_SIZE           (33 * 4)
 #define DSP_SLOT_ENTRIES        4
@@ -557,11 +626,32 @@ static void cdj_dsp_model_census(CdjDspModel *model, uint8_t *window,
 #define DSP_SLOT_POS_THIRD      104
 #define DSP_SLOT_STATE          128     /* 2 or 3 = running (0x1b3a02) */
 
+/* Post an event, the report ID bumped first when CDJ_DSP_REPORT_ID is set. */
+static void cdj_dsp_model_post(CdjDspModel *model, uint8_t *window,
+                               size_t length, unsigned code, int64_t now)
+{
+    if (model->report_id && length >= DSP_REPORT_ID_WORD + 4) {
+        model->report_id++;
+        stl_le_p(window + DSP_REPORT_ID_WORD, model->report_id);
+        fprintf(stderr, "cdj2000-dsp: report ID +0x%x = 0x%x t=%.3f\n",
+                DSP_REPORT_ID_WORD, model->report_id, now / 1e9);
+    }
+    cdj_dsp_event(code);
+}
+
+/*
+ * The position units are a guess to be measured against the time display:
+ * +96 is divided by 294 at 0x1a1174 and 294 * 75 = 22050, so it is taken as
+ * 22050ths of a second; +100 is doubled at 0x1be946 and is written as CD
+ * sectors (75 a second); +104 stays 0.
+ */
 static void cdj_dsp_model_slot_report(CdjDspModel *model, uint8_t *window,
                                       size_t length, unsigned state,
                                       int64_t now)
 {
     unsigned i;
+    uint32_t fine = (uint32_t)(model->slot_pos_ms * 22050 / 1000);
+    uint32_t coarse = (uint32_t)(model->slot_pos_ms * 75 / 1000);
 
     if (length < DSP_SLOT_TABLE + DSP_SLOT_ENTRIES * DSP_SLOT_SIZE) {
         return;
@@ -569,15 +659,24 @@ static void cdj_dsp_model_slot_report(CdjDspModel *model, uint8_t *window,
     for (i = 0; i < DSP_SLOT_ENTRIES; i++) {
         uint8_t *entry = window + DSP_SLOT_TABLE + i * DSP_SLOT_SIZE;
 
-        stl_le_p(entry + DSP_SLOT_POS_FINE, 0);
-        stl_le_p(entry + DSP_SLOT_POS_COARSE, 0);
+        stl_le_p(entry + DSP_SLOT_POS_FINE, fine);
+        stl_le_p(entry + DSP_SLOT_POS_COARSE, coarse);
         stl_le_p(entry + DSP_SLOT_POS_THIRD, 0);
         stl_le_p(entry + DSP_SLOT_STATE, state);
     }
+    if (state == 3 && model->slot_state != 3) {
+        model->slot_last_ns = now;
+    }
     model->slot_state = state;
-    fprintf(stderr, "cdj2000-dsp: slot entries 0..%u: state %u, position 0; "
-            "event 1 raised t=%.3f\n", DSP_SLOT_ENTRIES - 1, state, now / 1e9);
-    cdj_dsp_event(1);
+    if (model->slot_pos_ms == 0 || (model->slot_pos_ms / 1000) % 10 == 0) {
+        fprintf(stderr, "cdj2000-dsp: slot entries 0..%u: state %u, position "
+                "%" PRId64 " ms (+96 %u, +100 %u); event 0x%x (0 = none) t=%.3f\n",
+                DSP_SLOT_ENTRIES - 1, state, model->slot_pos_ms, fine, coarse,
+                model->slot_event, now / 1e9);
+    }
+    if (model->slot_event) {
+        cdj_dsp_model_post(model, window, length, model->slot_event, now);
+    }
 }
 
 /*
@@ -681,11 +780,18 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
     }
     cdj_dsp_model_census(model, window, length, now);
     if (model->probe_interval_ns && model->running && !model->absent
-        && model->probe_code <= model->probe_last_code
+        && model->probe_next < model->probe_count
         && now >= model->probe_start_ns
         && now - model->probe_last_ns >= model->probe_interval_ns) {
         model->probe_last_ns = now;
-        cdj_dsp_event(model->probe_code++);
+        cdj_dsp_model_post(model, window, length,
+                           model->probe_list[model->probe_next++], now);
+    }
+    if (model->slot_state == 3 && model->slot_period_ns && model->running
+        && now - model->slot_last_ns >= model->slot_period_ns) {
+        model->slot_pos_ms += (now - model->slot_last_ns) / 1000000;
+        model->slot_last_ns = now;
+        cdj_dsp_model_slot_report(model, window, length, 3, now);
     }
     if (model->transport != CDJ_DSP_PLAYING || elapsed_ms <= 0) {
         return;

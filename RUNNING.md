@@ -380,9 +380,12 @@ refused, so runs never overwrite each other. `--env` is MAIN board environment
 (`CDJ_*`), `--gui-env` the simulator's, `--bootvm-arg` anything else for
 `boot_vm`; the gdb stub stays free for `--trace` because nothing is polled
 unless `--poll-words` asks. Still blank: the time fields of the status record (words
-5..8 read `0xbbbb`), because the position the DSP reports in its slot table
-at window+0x7ce0 is not modelled yet (a guessed one, `trackload-38-memplay`,
-changed nothing there). There is no audio path.
+5..8 read `0xbbbb` while a track is loaded, 0 once it is unloaded). The slot
+table at window+0x7ce0 can now carry a state and an advancing position
+(`CDJ_DSP_SLOT_REPORT`, trackload-59), but MAIN's player task reads it only
+on its own command path (the copy at 0x1b39cc), which a PLAY in the
+emulator does not take; what makes the real DSP's position visible is still
+open. There is no audio path.
 
 **The update file is not what the emulator boots.** The board loads
 `firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
@@ -497,17 +500,29 @@ every 50 polls), `CDJ_DSP_ACK` (the DSP model zeroes its control block once
 MAIN has seen it up and answers the request words a track load and its PCM
 stream write there; off, an experiment -- see "Loading a track"),
 `CDJ_DSP_TRACE` (firmware pages, mailbox, every acknowledged request, a
-per-second census of the control block, every event posted), `CDJ_DSP_EVENT_PROBE=<start s>[:<interval s>[:<first>-<last>]]`
-(post the DSP's event codes to MAIN on its interrupt line -- irq 0x7f, bit 24
-of 0xffd4005c, GPIO 0xfff10040 bit 4, the code in bytes 2/3 of window+0xffe8
--- one every interval from the start second on, to measure what MAIN's
-player task makes of each; the line itself is always modelled, only the
-probe posts: trackload-50/51b measured that MAIN acknowledges every code
-within a millisecond and answers with the player commands 1 and 2, and that
-an event during a load stops the player with E-8302), `CDJ_DSP_SLOT_REPORT=<state>`
-(after the load's closing commands 4 and 2 write that state and position 0
-into the slot table at window+0x7ce0 and raise one event; state 2 got
-E-8302 in trackload-52 -- the entry is read, its vocabulary is still open),
+per-second census of the control block, every event posted), `CDJ_DSP_EVENT_PROBE=<start s>[:<interval s>[:<codes>]]`
+(post DSP event codes to MAIN on its interrupt line -- irq 0x7f, bit 24 of
+0xffd4005c, GPIO 0xfff10040 bit 4, the code in bytes 2/3 of window+0xffe8:
+byte 2 is the class the player task switches on, byte 3 a parameter --
+one every interval from the start second on; `<codes>` is a range
+`<first>-<last>` (default 1..13) or a list `0x100,0x200,...`. Measured:
+every code is acknowledged within a millisecond (trackload-50/51b); class
+1, 2 and 5 events are dropped unless the report number below has changed
+(trackload-55); a class-1 event with a new number is "segment finished" --
+MAIN pops its segment queue, finds nothing, unloads the track and its time
+fields turn from blank to 00:00 (trackload-56/57); class 3 makes MAIN write
+window+0x7ba4 = 1 and wait 6 s for the DSP to clear it, then E-8302 000F
+(trackload-55)), `CDJ_DSP_REPORT_ID=<n>` (the DSP's report sequence number
+at window+0x7cd4, which MAIN compares with its copy before handling a class
+1/2/5 event and copies afterwards; the model writes n+1, n+2, ... there
+before each event it posts), `CDJ_DSP_SLOT_REPORT=<state>` (after the
+load's closing commands 4 and 2 write that state into the four slot-table
+entries at window+0x7ce0 with the position words +96/+100 -- 22050ths of a
+second and CD sectors, the reader divides +96 by 294 -- then post the event
+`CDJ_DSP_SLOT_EVENT` (default 0x100, 0 = none); PLAY makes it state 3, and
+from then on the position advances and the entries are rewritten every
+`CDJ_DSP_SLOT_PERIOD_MS` (500); state 2 plus the event got E-8302 in
+trackload-52/57 -- the entry is read, its vocabulary is still open),
 `CDJ_DMAC_TRACE` (every DMA start
 with channel, SAR, DAR, TCR, CHCR and role), `CDJ_SDHI_TRACE` (every SD
 command; walking the card image's FAT for the block addresses says which
