@@ -80,9 +80,14 @@ struct CdjDspModel {
     bool saw_load_end;                  /* +0x7ba0 = 4 seen: the load's closing sequence */
     unsigned slot_state;                /* what the entries say: 0 none, 2 loaded, 3 playing */
     unsigned slot_event;                /* CDJ_DSP_SLOT_EVENT: the event posted with a report */
+    unsigned play_event;                /* CDJ_DSP_PLAY_EVENT: the event posted with each periodic state-3 report */
     int64_t slot_pos_ms;                /* the position the entries report */
     int64_t slot_period_ns;             /* CDJ_DSP_SLOT_PERIOD_MS: repeat while playing */
     int64_t slot_last_ns;               /* when the position was last advanced */
+    int64_t consume_rate;               /* CDJ_DSP_CONSUME: level units per second while playing */
+    int64_t consume_carry_ms;
+    int64_t consumed;                   /* total units taken since PLAY */
+    int64_t consume_report_ns;
 
     /* CDJ_DSP_EVENT_PROBE: post event codes to MAIN on a schedule. */
     int64_t probe_start_ns;
@@ -220,6 +225,23 @@ CdjDspModel *cdj_dsp_model_new(Chardev *external)
     }
     model->slot_event = getenv("CDJ_DSP_SLOT_EVENT")
         ? (unsigned)strtoul(getenv("CDJ_DSP_SLOT_EVENT"), NULL, 0) : 0x100;
+    model->play_event = getenv("CDJ_DSP_PLAY_EVENT")
+        ? (unsigned)strtoul(getenv("CDJ_DSP_PLAY_EVENT"), NULL, 0) : 0;
+    /*
+     * CDJ_DSP_CONSUME=<units per second>: playback as the stream worker sees
+     * it.  The time the GUI shows is [0x4832214] (the deck's position word,
+     * -1 = blank, 0x2cd378 reads it into the status record's word 5 at
+     * 0x216a0c); only the stream worker's position function (0x1a8e60..,
+     * writers 0x1a8f00 and 0x1a979c) sets it, and trackload-65/66 measured
+     * that with nothing consumed that function never runs -- the worker
+     * waits for the fill levels to drop.  A data transfer books 40 units
+     * for 9408 bytes of 16-bit stereo PCM (2352 frames, 53.3 ms), so real
+     * time is 750 units a second.  While the slot state is 3 the model takes
+     * that many out of both levels and adds them to +0x81a0/+0x8180, the
+     * per-buffer status words the worker reads next to the levels.
+     */
+    model->consume_rate = getenv("CDJ_DSP_CONSUME")
+        ? strtol(getenv("CDJ_DSP_CONSUME"), NULL, 0) : 0;
     model->slot_period_ns = (int64_t)(getenv("CDJ_DSP_SLOT_PERIOD_MS")
         ? strtol(getenv("CDJ_DSP_SLOT_PERIOD_MS"), NULL, 0) : 500) * 1000000;
     /*
@@ -650,6 +672,8 @@ static void cdj_dsp_model_slot_report(CdjDspModel *model, uint8_t *window,
                                       int64_t now)
 {
     unsigned i;
+    unsigned event = (state == 3 && model->slot_state == 3)
+                     ? model->play_event : model->slot_event;
     uint32_t fine = (uint32_t)(model->slot_pos_ms * 22050 / 1000);
     uint32_t coarse = (uint32_t)(model->slot_pos_ms * 75 / 1000);
 
@@ -672,10 +696,10 @@ static void cdj_dsp_model_slot_report(CdjDspModel *model, uint8_t *window,
         fprintf(stderr, "cdj2000-dsp: slot entries 0..%u: state %u, position "
                 "%" PRId64 " ms (+96 %u, +100 %u); event 0x%x (0 = none) t=%.3f\n",
                 DSP_SLOT_ENTRIES - 1, state, model->slot_pos_ms, fine, coarse,
-                model->slot_event, now / 1e9);
+                event, now / 1e9);
     }
-    if (model->slot_event) {
-        cdj_dsp_model_post(model, window, length, model->slot_event, now);
+    if (event) {
+        cdj_dsp_model_post(model, window, length, event, now);
     }
 }
 
@@ -792,6 +816,35 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
         model->slot_pos_ms += (now - model->slot_last_ns) / 1000000;
         model->slot_last_ns = now;
         cdj_dsp_model_slot_report(model, window, length, 3, now);
+    }
+    if (model->consume_rate > 0 && model->slot_state == 3 && elapsed_ms > 0
+        && window && length >= 0x81a8) {
+        int64_t units;
+
+        model->consume_carry_ms += elapsed_ms;
+        units = model->consume_carry_ms * model->consume_rate / 1000;
+        if (units > 0) {
+            static const unsigned levels[] = { DSP_LEVEL_BUFFER1, DSP_LEVEL_BUFFER2 };
+            static const unsigned status[] = { 0x81a0, 0x8180 };
+            unsigned i;
+
+            model->consume_carry_ms -= units * 1000 / model->consume_rate;
+            for (i = 0; i < 2; i++) {
+                int32_t level = (int32_t)ldl_le_p(window + levels[i]);
+
+                stl_le_p(window + levels[i], level > units ? level - units : 0);
+                stl_le_p(window + status[i], ldl_le_p(window + status[i]) + units);
+            }
+            model->consumed += units;
+            if (now - model->consume_report_ns >= 5 * 1000000000LL) {
+                model->consume_report_ns = now;
+                fprintf(stderr, "cdj2000-dsp: consumed %" PRId64 " units so far; "
+                        "levels +0x7cd0=%u +0x7ccc=%u, status +0x81a0=%u t=%.3f\n",
+                        model->consumed, ldl_le_p(window + DSP_LEVEL_BUFFER1),
+                        ldl_le_p(window + DSP_LEVEL_BUFFER2),
+                        ldl_le_p(window + 0x81a0), now / 1e9);
+            }
+        }
     }
     if (model->transport != CDJ_DSP_PLAYING || elapsed_ms <= 0) {
         return;

@@ -384,8 +384,17 @@ unless `--poll-words` asks. Still blank: the time fields of the status record (w
 table at window+0x7ce0 can now carry a state and an advancing position
 (`CDJ_DSP_SLOT_REPORT`, trackload-59), but MAIN's player task reads it only
 on its own command path (the copy at 0x1b39cc), which a PLAY in the
-emulator does not take; what makes the real DSP's position visible is still
-open. There is no audio path.
+emulator does not take. Where the time really comes from was traced with
+write watchpoints (`boot_vm --trace w:ADDR[:LEN]`, trackload-61..66): the
+status record's word 5 is written at 0x216a24 -- 0xbbbb when 0x2cd378()
+returns -1 -- and 0x2cd378 reads the deck's position word 0x4832214, which
+only the stream worker's position function (0x1a8e60.., writers 0x1a8f00 and
+0x1a979c, reading the DSP's per-buffer status at +0x81a0 and the fill
+levels) ever sets. That function never runs in the emulator: the worker
+stays in its load state waiting for the DSP, and neither consumption alone
+(`CDJ_DSP_CONSUME`, trackload-67) nor a class-0 event (trackload-69) wakes
+it into playback. The DSP's playback-start signal is the open question.
+There is no audio path.
 
 **The update file is not what the emulator boots.** The board loads
 `firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
@@ -523,7 +532,14 @@ second and CD sectors, the reader divides +96 by 294 -- then post the event
 from then on the position advances and the entries are rewritten every
 `CDJ_DSP_SLOT_PERIOD_MS` (500); state 2 plus the event got E-8302 in
 trackload-52/57 -- the entry is read, its vocabulary is still open),
-`CDJ_DMAC_TRACE` (every DMA start
+`CDJ_DSP_PLAY_EVENT=<code>` (the event posted with each periodic state-3
+report instead; default none -- class 0 code 1 there made MAIN re-stream
+in a loop and stop with E-8302 C611, trackload-69), `CDJ_DSP_CONSUME=<units
+per second>` (while the slot state is 3 the DSP consumes: both fill levels
++0x7cd0/+0x7ccc go down and the per-buffer status words +0x81a0/+0x8180 go
+up by that many units -- 40 units book one 9408-byte PCM transfer of 53.3 ms,
+so 750 is real time; trackload-67 measured that MAIN does not poll the
+levels: nothing happened until an event came), `CDJ_DMAC_TRACE` (every DMA start
 with channel, SAR, DAR, TCR, CHCR and role), `CDJ_SDHI_TRACE` (every SD
 command; walking the card image's FAT for the block addresses says which
 file a read was -- `runs/nxs-swap/trackload-39-final/fatmap.py` does that)
