@@ -1,4 +1,6 @@
 from tools.cdj_gui.main_unpack import decode_srecords
+import pytest
+
 from tools.cdj_main.make_upd import HEADER_SIZE, build, check, crc16, header
 
 
@@ -27,3 +29,13 @@ def test_round_trip_through_the_decoder():
 def test_short_image_is_padded_with_erased_flash():
     upd = build(b"\x12\x34", "4.34", end=64)
     assert decode_srecords(upd[HEADER_SIZE:-2]) == b"\x12\x34" + b"\xff" * 62
+
+
+def test_the_flag_that_programs_the_boot_rom_is_refused():
+    # Header byte 0x1f = '1' makes the application's programmer (0x2d6116) and
+    # the loader's (0x20f6e) write flash from address 0 instead of 0x40000 --
+    # the boot ROM and the recovery loader included.
+    with pytest.raises(ValueError):
+        header("4.34", flag="1")
+    with pytest.raises(ValueError):
+        build(b"4", "4.34", end=64, flag="1")

@@ -592,7 +592,8 @@ The updater is the application's (`UpDtae_TASK`, state machine 0x2d68b2),
 not the loader's: the boot ROM's second stage only unpacks the loader at flash
 0x10000 when the packed application's checksum fails, so the loader is the
 recovery path.  The task runs only in the boot mode the panel reports: with
-payload byte 16 bit 2 and byte 19 bit 1 (the SD SOURCE key) down at power-on,
+payload byte 16 bit 2 and byte 19 bit 1 -- the RELOOP/EXIT and USB keys, by
+the firmware's own service-mode name table -- down at power-on,
 0x28d3cc sets GuiCom mode 2 with sub-mode 1 and the task looks for
 `C2KGUI.UPD`, `C2KDRIV.UPD`, `C2KMAIN.UPD` and `C2KPANL.UPD` in the stick's
 root for three seconds after its start (the mount lands at 3.5 s, in time).
@@ -618,6 +619,31 @@ carries every erase and program, `flash-after.bin` is the flash when the
 console has printed `*** Update END ! ***`, and `--firmware flash-after.bin`
 boots it.  Programming runs at about 6 KB/s of guest time (every word is an
 unlock sequence and a status poll), so the 2.4 MB take some seven minutes.
+
+**The recovery path** (runs update-21..24).  When the packed application's
+checksum is wrong -- `--firmware` an image with one 64 KiB sector inside it
+blanked, the shape of an update that lost power -- the boot ROM's second
+stage unpacks the loader at flash 0x10000 instead, and the debug console
+(`CDJ_DEBUG_CONSOLE=1`, the third serial port) shows its banner, `Cente
+USBH-MSC sample program` with a `login:` prompt that wants nothing.  The
+loader mounts the stick with its own USB stack ("UHMS[0]: drive C:") but
+runs its updater only in the same key mode as the application: with no keys
+it idles for ever (its mode word 0x46a9c24 reads 1, the updater wants 2),
+with `CDJ_PANEL_FRAME=...040000020000` it erases 0x40000..0x3dffff and
+programs the file in under two minutes of guest time, five times faster than
+the application's updater, and prints the same `*** Update END ! ***`.  The
+flash afterwards is the stock image byte for byte except the marker the UPD
+carried, with the ROM and loader untouched.  Both updaters read the header's
+flag byte 0x1f: `'0'` programs from 0x40000, `'1'` from address 0 -- the ROM
+and the loader included -- which is why `make_upd` refuses to write anything
+but `'0'`.
+
+Two board bugs stood in the loader's way and are fixed: it ticks from TMU4
+in the second timer unit (0xffdc0000), whose interrupts the board had not
+routed (INT2PRI1, INTEVT 0xe00/0xe20/0xe40), and it runs the panel DMA on
+channels 4/5 where the application uses 3/4, so completions now arrive on
+the vector of the channel that ran them (DMINT0..3 = 0x640..0x6a0) instead
+of on a vector fixed per role.
 
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold

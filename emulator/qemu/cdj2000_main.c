@@ -166,14 +166,29 @@
  */
 #define TMU_BASE        0xffd80000
 /*
- * A second three-channel timer block.  It must be modelled even before its
- * interrupts are routed: the firmware read-modify-writes TSTR, so against a
- * trap that reads back zero it loses the channel it started a moment earlier.
+ * A second three-channel timer block, TMU3..TMU5.  The application only
+ * counts on it (TCOR3 is read for elapsed time), but the *loader* -- the
+ * recovery image the boot ROM unpacks from flash 0x10000 when the packed
+ * application's checksum fails -- has no use for TMU0 at all: its RTOS tick
+ * is TMU4 (0x401dfac: TCOR4 0x34bc, TCR4 0x20, TSTR2 bit 1, the same 1 ms as
+ * the application's TMU0) and TMU5 is a 10 ms companion (TCOR5 0x20f58).
+ * The loader writes their levels into INT2PRI1[20:16] and [12:8] (both 4) and
+ * clears INT2MSKR bit 1, the TMU3-5 group; their INTEVT codes are 0xe00,
+ * 0xe20 and 0xe40 (SH7764 manual table 13.3).  Without those lines routed
+ * the loader boots to its "Cente USBH-MSC sample program" banner, sees the
+ * stick, and never issues the bus reset its attach handler schedules through
+ * a delay (update-21): every dly_tsk waits on a tick that never comes.
  */
 #define TMU2_BASE       0xffdc0000
 #define TMU_FREQ        54000000
 #define TMU0_IRQ        0x2c
 #define INTEVT_TMU0     (TMU0_IRQ * 0x20)   /* 0x580 */
+#define TMU3_IRQ        0x70
+#define TMU4_IRQ        0x71
+#define TMU5_IRQ        0x72
+#define INTEVT_TMU3     (TMU3_IRQ * 0x20)   /* 0xe00 */
+#define INTEVT_TMU4     (TMU4_IRQ * 0x20)   /* 0xe20 */
+#define INTEVT_TMU5     (TMU5_IRQ * 0x20)   /* 0xe40 */
 
 /*
  * The SoC's own interrupt controller is an SH7780-style INTC2 at 0xffd40000,
@@ -195,6 +210,7 @@
  *   GUI link arm     INT2PRI4[15:8]   4   0x2a39aa-0x2a39b4
  *   GUI link mode    INT2PRI4[7:0]    4   0x2a3a70-0x2a3a7e
  *   second channel   INT2PRI5[7:0]    4   0x2a3a48-0x2a3a50, 0x2a3b0c-0x2a3b1a
+ *   TMU4/5, loader   INT2PRI1[20:16], [12:8]  4   0x401dfe6-0x401dffc (loader only)
  *
  * That ordering is what real hardware does and it matters: the tick outranks a
  * link ISR and preempts it.  With the levels the other way round a link ISR
@@ -236,6 +252,9 @@ enum {
     CDJ_INTC_ATA,
     CDJ_INTC_USB,
     CDJ_INTC_USB_DMA,
+    CDJ_INTC_TMU3,
+    CDJ_INTC_TMU4,
+    CDJ_INTC_TMU5,
     CDJ_INTC_NR_SOURCES,
 };
 
@@ -563,6 +582,21 @@ typedef struct {
 
     /* The panel side: see the PANEL comment above. */
     qemu_irq panel_rx_irq;
+    /*
+     * A completion is raised on the vector of the channel it ran on, DMINT
+     * (index - 2), not on a vector fixed per role: the application runs the
+     * panel receive on index 3 and its transmit on index 4 (0x660, 0x680),
+     * the loader on 4 and 5 (0x680, 0x6a0) -- and with the vectors fixed the
+     * loader's receive completion arrived on 0x660, where it has no handler,
+     * and the unacknowledged level re-entered the empty stub forever
+     * (update-22).  channel_irq[] is that mapping; the *_line fields
+     * remember which line a pending completion is holding up.
+     */
+    qemu_irq channel_irq[DMAC_CHANNELS];
+    qemu_irq panel_rx_line;
+    qemu_irq panel_tx_line;
+    unsigned panel_rx_index;
+    unsigned panel_tx_index;
     qemu_irq sdhi_dma_irq;
     bool sdhi_dma_pending;
     qemu_irq dsp_dma_irq;
@@ -622,8 +656,9 @@ static bool cdj_sdhi_dma_write(unsigned nr_bytes, const uint8_t *buffer);
  *
  *     <seconds>:<payload byte>:<hex mask>
  *
- * against the virtual clock, e.g. "35:19:02" for the SD SOURCE key at 35 s
- * (payload byte 19 bit 1, from the decoder at 0x28e44a).  CDJ_PANEL_HOLD_MS
+ * against the virtual clock, e.g. "35:19:04" for the SD SOURCE key at 35 s
+ * (payload byte 19 bit 2, from the decoder at 0x28e44a; bit 1 is USB, the
+ * firmware's own name table in tools/cdj_main/panel_control.py).  CDJ_PANEL_HOLD_MS
  * sets how long each stays down; the default is long enough for several frames.
  */
 #define PANEL_KEYS_MAX 16
@@ -788,9 +823,14 @@ static void cdj_dmac_panel_done(void *opaque)
         channel->armed = false;
         /* The device side is a fixed register; only the memory side advances. */
         cdj_dmac_complete(channel, channel->sar + channel->tcr, channel->dar);
-        dmac->panel_tx_pending = true;
-        if (dmac->panel_tx_irq) {
-            qemu_set_irq(dmac->panel_tx_irq, 1);
+        /* The request is TE && IE: a channel run without IE completes quietly. */
+        if (channel->chcr & CHCR_IE) {
+            dmac->panel_tx_pending = true;
+            dmac->panel_tx_index = index;
+            dmac->panel_tx_line = dmac->channel_irq[index];
+            if (dmac->panel_tx_line) {
+                qemu_set_irq(dmac->panel_tx_line, 1);
+            }
         }
     }
     for (index = 0; index < DMAC_CHANNELS; index++) {
@@ -818,9 +858,13 @@ static void cdj_dmac_panel_done(void *opaque)
                           channel->dar, dmac->panel_exchanges);
         }
         cdj_dmac_complete(channel, channel->sar, channel->dar + channel->tcr);
-        dmac->panel_rx_pending = true;
-        if (dmac->panel_rx_irq) {
-            qemu_set_irq(dmac->panel_rx_irq, 1);
+        if (channel->chcr & CHCR_IE) {
+            dmac->panel_rx_pending = true;
+            dmac->panel_rx_index = index;
+            dmac->panel_rx_line = dmac->channel_irq[index];
+            if (dmac->panel_rx_line) {
+                qemu_set_irq(dmac->panel_rx_line, 1);
+            }
         }
     }
 }
@@ -1005,12 +1049,16 @@ static void cdj_dmac_write(void *opaque, hwaddr offset, uint64_t value,
                 if (channel->role == CDJ_DMA_PANEL_RX
                     && dmac->panel_rx_pending) {
                     dmac->panel_rx_pending = false;
-                    qemu_set_irq(dmac->panel_rx_irq, 0);
+                    if (dmac->panel_rx_line) {
+                        qemu_set_irq(dmac->panel_rx_line, 0);
+                    }
                 }
                 if (channel->role == CDJ_DMA_PANEL_TX
                     && dmac->panel_tx_pending) {
                     dmac->panel_tx_pending = false;
-                    qemu_set_irq(dmac->panel_tx_irq, 0);
+                    if (dmac->panel_tx_line) {
+                        qemu_set_irq(dmac->panel_tx_line, 0);
+                    }
                 }
                 if (dmac->sdhi_dma_pending
                     && channel->sar == SDHI_DATA_PORT_P4) {
@@ -1128,8 +1176,10 @@ static uint64_t cdj_intc2_dma_read(void *opaque, hwaddr offset, unsigned size)
 {
     CdjDmacState *dmac = opaque;
 
-    return (dmac->panel_rx_pending ? INTC2_DMA_RX : 0)
-         | (dmac->panel_tx_pending ? INTC2_DMA_TX : 0);
+    /* Bit n is DMINTn, i.e. board index n + 2: the application's receive on
+     * index 3 is bit 1 (INTC2_DMA_RX), its transmit on index 4 bit 2. */
+    return (dmac->panel_rx_pending ? 1u << (dmac->panel_rx_index - 2) : 0)
+         | (dmac->panel_tx_pending ? 1u << (dmac->panel_tx_index - 2) : 0);
 }
 
 static void cdj_intc2_dma_write(void *opaque, hwaddr offset, uint64_t value,
@@ -1185,6 +1235,11 @@ static CdjDmacState *cdj_dmac_init(MemoryRegion *system, qemu_irq panel_rx,
     dmac->dsp_dma_irq = dsp_dma;
     dmac->dma5_irq = dma5;
     dmac->usbh_dma_irq = usbh_dma;
+    /* DMINT0..3 by board index; 0x780/0x7a0 (DMINT4/5) have no user yet. */
+    dmac->channel_irq[2] = usbh_dma;
+    dmac->channel_irq[3] = panel_rx;
+    dmac->channel_irq[4] = panel_tx;
+    dmac->channel_irq[5] = dma5;
     dmac->panel_present = !getenv("CDJ_NO_PANEL");
     dmac->panel_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_dmac_panel_done,
                                      dmac);
@@ -4258,6 +4313,9 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
         INTC_VECT(CDJ_INTC_ATA, INTEVT_ATA),
         INTC_VECT(CDJ_INTC_USB, INTEVT_USB),
         INTC_VECT(CDJ_INTC_USB_DMA, INTEVT_USB_DMA),
+        INTC_VECT(CDJ_INTC_TMU3, INTEVT_TMU3),
+        INTC_VECT(CDJ_INTC_TMU4, INTEVT_TMU4),
+        INTC_VECT(CDJ_INTC_TMU5, INTEVT_TMU5),
     };
     /*
      * enum_ids are MSB-field first: sh_intc_write shifts a field's mask by
@@ -4269,6 +4327,8 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
      */
     static struct intc_prio_reg prio_registers[] = {
         { 0xffd40000, 0, 32, 8, { CDJ_INTC_TMU0, 0, 0, 0 } },
+        /* INT2PRI1: TUNI3, TUNI4, TUNI5, reserved -- the loader's tick. */
+        { 0xffd40004, 0, 32, 8, { CDJ_INTC_TMU3, CDJ_INTC_TMU4, CDJ_INTC_TMU5, 0 } },
         { 0xffd40008, 0, 32, 8, { CDJ_INTC_SCIF_RX, 0, 0, 0 } },
         { 0xffd40010, 0, 32, 8, { 0, 0, CDJ_INTC_LINK_RX, CDJ_INTC_LINK_TX } },
         { 0xffd40014, 0, 32, 8, { 0, 0, 0, CDJ_INTC_LINK_DONE } },
@@ -4367,7 +4427,8 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
     tmu012_init(system, TMU_BASE, TMU012_FEAT_TOCR | TMU012_FEAT_3CHAN,
                 freq, intc->irqs[CDJ_INTC_TMU0], NULL, NULL, NULL);
     tmu012_init(system, TMU2_BASE, TMU012_FEAT_3CHAN,
-                freq, NULL, NULL, NULL, NULL);
+                freq, intc->irqs[CDJ_INTC_TMU3], intc->irqs[CDJ_INTC_TMU4],
+                intc->irqs[CDJ_INTC_TMU5], NULL);
 }
 
 #ifdef _WIN32
@@ -4473,6 +4534,22 @@ static void cdj2000_main_init(MachineState *machine)
     if (loaded < 0) {
         error_report("cdj2000-main: cannot load '%s'", firmware);
         exit(1);
+    }
+    /*
+     * A blank NOR part reads 0xff, and the ROM loader leaves whatever the
+     * image does not cover at zero.  The application erases the settings
+     * sectors at 0x3e0000 itself before it uses them, so it never noticed;
+     * the loader's recovery run does not touch them and dumped zeros where
+     * the part would give 0xff (update-24).  Fill the remainder as a second
+     * ROM blob so both firmwares see a blank part from reset onwards.
+     */
+    if (loaded < ROM_SIZE) {
+        void *blank = g_malloc(ROM_SIZE - loaded);
+
+        memset(blank, 0xff, ROM_SIZE - loaded);
+        rom_add_blob_fixed("cdj2000.flash-blank", blank, ROM_SIZE - loaded,
+                           ROM_BASE + loaded);
+        g_free(blank);
     }
 
     reset = g_new0(CdjResetState, 1);

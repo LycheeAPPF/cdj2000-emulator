@@ -272,7 +272,12 @@ def cpu_seconds(names=("qemu-system-sh4", "cdj-run")) -> dict[str, float]:
             ["wmic", "process", "where",
              " or ".join("name like '%s%%'" % name for name in names),
              "get", "Name,UserModeTime,KernelModeTime", "/format:csv"],
-            capture_output=True, text=True, timeout=5,
+            # wmic answers in the console code page, and a German error text
+            # ("ungueltig" with its umlaut, 0x81 in cp850) once QEMU has been
+            # killed from outside is not cp1252: decode leniently, or the
+            # reader thread dies and the poll row reads -1 for the rest of
+            # the run (update-23).
+            capture_output=True, text=True, errors="replace", timeout=5,
             creationflags=subprocess.CREATE_NO_WINDOW).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
