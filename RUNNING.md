@@ -556,27 +556,68 @@ cursor moves. Pitch, jog, cue and loop are not in the model's position yet
 (it only runs, at nominal speed), and beat grid and phase meter are the next
 things to trace from the GUI side. There is no audio path.
 
-**The update file is not what the emulator boots.** The board loads
-`firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
-`C2KMAIN.UPD` by `tools.cdj_gui.main_unpack` -- into its NOR flash model (a
-CFI02 device in RAM, so the settings sectors the firmware erases and rewrites
-never reach the file). A modified image is tested by putting it there; nothing
-in the emulator exercises the updater. What the device itself checks on an
-update file is host-side arithmetic: Motorola S-records with per-record
-checksums, a little-endian CRC-16/XMODEM trailer over the container, the two
-LZSS-packed application regions at 0x10000 and 0x40000 with their additive
-checksums, and the model/version header at image offset 0x700 (`PIONEER`,
-`CDJ-2000`, `4.33`, `20150209`). `main_unpack` verifies the first three on the
-way in; a patcher for that file has to re-emit all of them, and should refuse
-to patch unless the stock file round-trips byte for byte first. The
-updater task that reads the file (`UpDtae_TASK`, "*** Update END ! ***") lives
-in the application image but names no file -- the 4.33 image contains neither
-`.UPD` nor `C2K` in any encoding -- so its trigger and its medium handling are
-open. Running it in the emulator would need a USB mass-storage or SD image
-carrying the file, the menu path that starts it, and the flash model taking
-the rewrite; that is a project of its own, and the decision here is not to
-build it: the file's acceptance is proven on the host (unpack what was built,
-compare with what was booted), the firmware change itself in the emulator.
+**The update file is not what the emulator boots, but the emulator can take
+it.** The board loads `firmware/main-firmware.bin` -- the address-zero flash
+image, decoded from `C2KMAIN.UPD` by `tools.cdj_gui.main_unpack` -- into its
+NOR flash model: a CFI02 device in RAM with the geometry the firmware's own
+erase commands describe (63 sectors of 64 KiB and eight of 8 KiB at the top),
+so the settings sectors the firmware erases and rewrites never reach the file.
+A modified image is tested by putting it there. The other way in is the
+player's own: a firmware update from a USB stick, and that runs end to end,
+see "A firmware update" below.
+
+## A firmware update
+
+The type-A socket is the SH7764's own USB 2.0 host/function module at P4
+0xfe400000 (hardware manual section 21; `emulator/qemu/cdj2000_usbh.c`),
+not the chip at 0x01000000, which is the type-B function controller.  The
+module is a QEMU host controller with one root port, so a stick is QEMU's
+`usb-storage` on a raw disk image -- `boot_vm --usb-stick IMAGE` adds
+`-drive if=none,id=usbstick,format=raw,file=IMAGE -device
+usb-storage,drive=usbstick,removable=on` -- and the descriptors, the bulk-only
+transport and the SCSI commands are QEMU's.  What the board models is the
+register contract the Cente USBH driver relies on: pipes, the FIFO ports, the
+DCP's setup/data/status stages, the transaction counter (the counted packet
+puts a SHTNAK pipe to NAK, which is what lets the driver reload it for the
+CSW), BRDY/NRDY/BEMP/BCHG/SACK/SIGN, USBI on INTEVT 0xc60 with its level from
+INT2PRI12, and the DMAC side door: bulk reads of a maximum packet or more go
+through DMAC channel 0 reading the D0FIFO burst port at 0xfe400180 (TCR in
+32-byte units), which the board's DMAC hands to the module and completes on
+DMINT0 (INTEVT 0x640).  `CDJ_USBH_TRACE=1` prints every register access,
+packet and DMA; the board registers two ports because QEMU slips a full-speed
+hub in front of a device plugged into a bus with a single free port, and the
+driver then enumerated the hub (update-3).
+
+The updater is the application's (`UpDtae_TASK`, state machine 0x2d68b2),
+not the loader's: the boot ROM's second stage only unpacks the loader at flash
+0x10000 when the packed application's checksum fails, so the loader is the
+recovery path.  The task runs only in the boot mode the panel reports: with
+payload byte 16 bit 2 and byte 19 bit 1 (the SD SOURCE key) down at power-on,
+0x28d3cc sets GuiCom mode 2 with sub-mode 1 and the task looks for
+`C2KGUI.UPD`, `C2KDRIV.UPD`, `C2KMAIN.UPD` and `C2KPANL.UPD` in the stick's
+root for three seconds after its start (the mount lands at 3.5 s, in time).
+`CDJ_PANEL_FRAME=00000000000000000000000000000000040000020000` is those two
+keys held.  A file is taken only if its header version (bytes 0x13, 0x15,
+0x16) is greater than the running 4.33 (0x2d58e4), and its CRC-16/XMODEM
+trailer must match.  The MAIN file is programmed by 0x2d6116: the
+application area 0x40000..0x3dffff is erased in 64 KiB sectors and the
+S-records above 0x40000 are written word by word; the boot ROM and loader
+are carried in the file but not touched.  The GUI, drive and panel files go
+to their boards over the link and the panel UART, which needs the other
+boards running.
+
+`tools/cdj_main/make_upd.py IMAGE OUT.UPD --version 4.35` builds a file the
+updater accepts from any flash image -- header, S-records (all-zero records
+omitted, as the original converter did), CRC -- and rebuilds the stock
+`C2KMAIN.UPD` byte for byte from the stock image.  The recipe, run
+update-19: a 64 MiB FAT32 stick made with `make_sd_image` from a directory
+holding the file, `boot_vm --no-gui --no-peer --seconds 900 --firmware
+IMAGE --usb-stick STICK --qemu-arg=-trace --qemu-arg=pflash_* --pmemsave
+0,0x400000,flash-after.bin` with the panel frame above; the -D log then
+carries every erase and program, `flash-after.bin` is the flash when the
+console has printed `*** Update END ! ***`, and `--firmware flash-after.bin`
+boots it.  Programming runs at about 6 KB/s of guest time (every word is an
+unlock sequence and a status poll), so the 2.4 MB take some seven minutes.
 
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold
@@ -653,6 +694,9 @@ twice during this work before the rule was learnt.
 The board itself takes a long list of its own, all read with `getenv` in
 `emulator/qemu/`: `CDJ_INPUT_PORT`, `CDJ_PANEL_KEYS`, `CDJ_SD_INSERT`,
 `CDJ_DSP_ABSENT`, `CDJ_USB_ABSENT`, `CDJ_ATAPI_ABSENT`, `CDJ_BUS_TRACE`,
+`CDJ_USBH_TRACE` (the USB host module: registers, packets, DMA),
+`CDJ_PANEL_SCIF_TRACE`, `CDJ_DMAC_TRACE`, `CDJ_WATCH` (writes to a word, with
+the PC), `CDJ_PANEL_FRAME` (the panel's 22 payload bytes, held),
 `CDJ_LINK_TRACE` (arm, acknowledge and gate lines with virtual-clock stamps,
 and the header words of every request delivered), `CDJ_LINK_TX_US` (off),
 `CDJ_LINK_RX_GAP_US` (the least guest time between two GUI frames going into

@@ -132,17 +132,13 @@ Be clear about this: **the player is not usable as a player.**
 * **No audio at all.** The DSP (a Pioneer custom LSI, D710E001, with no
   public instruction set) is modelled from MAIN's side: it takes the request
   words MAIN polls and keeps two buffer levels, and has no signal path.
-* No USB passthrough: a real stick on the host does not appear as a source.
-  **Selecting `USB` shows the `Wait` platter and leaves it there**: the GUI
-  routes a source whose media state MAIN reports as zero to the platter
-  screen, and without a USB host MAIN reports zero for ever. Measured: the
-  platter appears six seconds after the key and turns at about 2.4 frames a
-  second, and the GUI's browse requests switch to the USB source a minute
-  later; MAIN meanwhile answers the GUI's ~60 requests a second in one burst
-  every 3.000 s. This is the two boards' link protocol, not emulation speed:
-  the GUI board runs at 2-5 MIPS throughout. `CDJ_USB_ABSENT=1` is not the
-  answer -- it adds the `E-7020: USB-B DEVICE ERROR` caution and the platter
-  stays. See "What the SOURCE key costs" in RUNNING.md for what was tried.
+* A USB stick is a disk image on the SoC's own USB host module
+  (`boot_vm --usb-stick IMAGE`, QEMU's `usb-storage`): MAIN enumerates it,
+  mounts its FAT32 and reads it, and with the two update keys held at power-on
+  its updater takes a `C2KMAIN.UPD` from the stick's root and rewrites the
+  flash model -- `tools/cdj_main/make_upd.py` builds such a file from any
+  flash image. See "A firmware update" in RUNNING.md. No host passthrough of a
+  real stick, and the USB source in the browser has not been exercised.
 * No link between players.
 
 Most inputs, measured properly against a control run, are proven no-ops on the

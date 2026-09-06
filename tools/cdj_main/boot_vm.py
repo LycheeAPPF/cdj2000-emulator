@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -322,6 +323,11 @@ def main() -> int:
     parser.add_argument("--sd", default=os.environ.get("CDJ_SD_IMAGE"),
                         help="FAT32 card image; build one with "
                              "tools.cdj_main.make_sd_image")
+    parser.add_argument("--usb-stick", default=os.environ.get("CDJ_USB_STICK"),
+                        help="raw disk image plugged into the type-A socket as "
+                             "a USB memory stick (QEMU's usb-storage on the "
+                             "SoC's USB module); a firmware update needs the "
+                             ".UPD files in its root")
     parser.add_argument("--source-key", choices=sorted(SOURCE_KEYS),
                         default=None,
                         help="press a SOURCE key on the panel; defaults to "
@@ -378,6 +384,19 @@ def main() -> int:
     # intact -- the ten-second GuiCom deadline and the GUI's three-tick receive
     # timeout both lose under that.  tools.cdj_main.caution --live --trace runs
     # MAIN alone, where stopping it costs nothing.
+    parser.add_argument("--firmware", default=None, metavar="IMAGE",
+                        help="the MAIN flash image to boot instead of "
+                             "firmware/main-firmware.bin, e.g. a --pmemsave "
+                             "dump taken after an update")
+    parser.add_argument("--qemu-arg", action="append", metavar="ARG",
+                        help="an extra argument for qemu-system-sh4, repeatable "
+                             "(--qemu-arg=-trace --qemu-arg=pflash_* logs the "
+                             "flash model's commands into the -D log)")
+    parser.add_argument("--pmemsave", default=None, metavar="START,SIZE,FILE",
+                        help="before quitting, save SIZE bytes of guest physical "
+                             "memory from START to FILE through the monitor -- "
+                             "0,0x400000,flash.bin is the NOR flash after a "
+                             "firmware update")
     parser.add_argument("--caution", action="store_true",
                         help="read MAIN's caution store back as well and decode "
                              "it -- which device failed, what is pending behind "
@@ -516,7 +535,8 @@ def main() -> int:
         print(f"# MAIN stderr -> {args.stderr}")
     board = subprocess.Popen(
         [
-            str(QEMU), "-M", "cdj2000-main", "-bios", str(FIRMWARE / "main-firmware.bin"),
+            str(QEMU), "-M", "cdj2000-main",
+            "-bios", str(args.firmware or FIRMWARE / "main-firmware.bin"),
             "-display", "none", "-no-reboot", "-d", "unimp", "-D", str(main_log),
             "-serial", f"tcp:127.0.0.1:{PORT},server,nowait",
             "-serial", f"tcp:127.0.0.1:{PORT + 2},server,nowait",
@@ -528,11 +548,18 @@ def main() -> int:
             # Reading is the monitor's job; writing is the stub's.  It is always
             # offered and costs nothing until something connects.
             "-gdb", f"tcp:127.0.0.1:{PORT + 3}",
+            *(args.qemu_arg or []),
             # The card is inserted a while after reset on purpose: the poller at
             # 0x1ff164 arms its mount gate only while the slot is empty, and the
             # gate itself comes from the panel -- payload byte 17 bit 2 is the
             # slot switch, so the frame below is what "a card is in" means.
             *(["-drive", f"if=sd,format=raw,file={args.sd}"] if args.sd else []),
+            # The stick is there from reset: the loader's updater waits only
+            # three seconds for a drive letter (0x040215f4) before it hands
+            # over to the application.
+            *(["-drive", f"if=none,id=usbstick,format=raw,file={args.usb_stick}",
+               "-device", "usb-storage,drive=usbstick,removable=on"]
+              if args.usb_stick else []),
         ],
         env=dict(env, CDJ_TMU_FREQ=os.environ.get("CDJ_TMU_FREQ", "54000000"),
                  CDJ_SD_INSERT=os.environ.get("CDJ_SD_INSERT",
@@ -812,6 +839,24 @@ def main() -> int:
                     print(f"    L{depth} 0x{address:08x} = {cells}")
         if args.caution:
             caution.report(words)
+        if args.pmemsave:
+            # The monitor splits its line on spaces, so the dump goes through
+            # a path without any and is moved afterwards.
+            start, size, path = args.pmemsave.split(",", 2)
+            staging = TEMP / f"pmemsave{suffix}.bin"
+            mon.sendall(f"pmemsave {int(start, 0):#x} {int(size, 0):#x} "
+                        f"{staging.as_posix()}\n".encode())
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                if staging.exists() and staging.stat().st_size >= int(size, 0):
+                    break
+            time.sleep(0.5)
+            if staging.exists():
+                shutil.move(str(staging), path)
+                print(f"# pmemsave {start} {size} -> {path}")
+            else:
+                print(f"# pmemsave failed: {staging} was not written")
         mon.sendall(b"quit\n")
         time.sleep(1.5)
     finally:

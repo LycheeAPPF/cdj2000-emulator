@@ -54,6 +54,7 @@
 #include "cdj2000_dsp.h"
 #include "cdj2000_input.h"
 #include "cdj2000_usb.h"
+#include "cdj2000_usbh.h"
 
 /*
  * CS0 carries an AMD-command-set NOR flash, not a plain ROM.  During boot the
@@ -68,7 +69,19 @@
  */
 #define ROM_BASE        0x00000000
 #define ROM_SIZE        (4 * MiB)       /* the image is 2 653 536 bytes */
-#define FLASH_SECTOR    (4 * KiB)       /* 0x3f4000, the erased sector, is 4 KiB aligned */
+/*
+ * A 32 Mbit top-boot part: 63 sectors of 64 KiB and eight of 8 KiB at the top.
+ * The geometry is the firmware's, read off its erase commands: the settings
+ * area is erased at 0x3f0000, 0x3f2000, 0x3f4000 and 0x3f6000 (8 KiB apart),
+ * and the updater (0x2d68b2 via 0x2d6116) erases 0x40000, 0x50000, ...,
+ * 0x3d0000 before it programs the application region (update-18).  With
+ * uniform 4 KiB sectors those erases cleared a sixteenth of each sector and
+ * a rewritten image could never turn a 0 bit back into a 1.
+ */
+#define FLASH_MAIN_SECTOR   (64 * KiB)
+#define FLASH_MAIN_SECTORS  63
+#define FLASH_BOOT_SECTOR   (8 * KiB)
+#define FLASH_BOOT_SECTORS  8
 #define SDRAM_BASE      0x04000000
 #define SDRAM_SIZE      (64 * MiB)
 
@@ -221,8 +234,25 @@ enum {
     CDJ_INTC_DMA5,
     CDJ_INTC_DSP_EVENT,
     CDJ_INTC_ATA,
+    CDJ_INTC_USB,
+    CDJ_INTC_USB_DMA,
     CDJ_INTC_NR_SOURCES,
 };
+
+/*
+ * The SoC's USB module (the type-A socket; cdj2000_usbh.c) interrupts on
+ * USBI, INTEVT 0xc60, level from INT2PRI12[15:8] at 0xffd400b0 (manual
+ * section 13.3.9) -- the loader's usbh_load (0x0400b2c8) writes 0x800 there
+ * and unmasks bit 17 of INT2MSKCR1 (0xffd400d4).  Its bulk transfers go
+ * through DMAC channel 0 (block 0xff608020), whose completion is DMINT0,
+ * INTEVT 0x640, level from INT2PRI3[23:16] (0x0400b47c writes 0x40000 to
+ * 0xffd4000c); the driver's vector record at 0xa400231c says irq 0x32,
+ * handler 0x0400b34e, level 4.
+ */
+#define USB_IRQ         0x63
+#define INTEVT_USB      (USB_IRQ * 0x20)        /* 0xc60 */
+#define USB_DMA_IRQ     0x32
+#define INTEVT_USB_DMA  (USB_DMA_IRQ * 0x20)    /* 0x640 */
 
 /*
  * The PANEL board.
@@ -505,6 +535,7 @@ enum {
     CDJ_DMA_PANEL_RX,
     CDJ_DMA_PANEL_TX,
     CDJ_DMA_DSP,                /* one end is the audio DSP's shared window */
+    CDJ_DMA_USBH,               /* one end is a USB module FIFO burst port */
 };
 
 typedef struct {
@@ -538,6 +569,9 @@ typedef struct {
     bool dsp_dma_pending;
     qemu_irq dma5_irq;                  /* channel 5's own completion vector */
     bool dma5_pending;
+    qemu_irq usbh_dma_irq;              /* DMINT0, the USB driver's channel */
+    bool usbh_dma_pending;
+    unsigned usbh_dma_channel;
     qemu_irq panel_tx_irq;
     QEMUTimer *panel_timer;
     bool panel_present;
@@ -801,14 +835,38 @@ static void cdj_dmac_run(CdjDmacState *dmac, unsigned index)
 
     channel->role = cdj_dmac_role(channel);
     if (getenv("CDJ_DMAC_TRACE")) {
-        fprintf(stderr, "cdj2000-dmac: ch%u SAR %#010x DAR %#010x TCR %#x "
-                        "CHCR %#010x role %d\n", index, channel->sar,
+        fprintf(stderr, "cdj2000-dmac %.3f: ch%u SAR %#010x DAR %#010x TCR %#x "
+                        "CHCR %#010x role %d\n",
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9, index, channel->sar,
                 channel->dar, channel->tcr, channel->chcr, channel->role);
     }
     if (channel->role == CDJ_DMA_PANEL_RX || channel->role == CDJ_DMA_PANEL_TX) {
         channel->armed = true;
         timer_mod(dmac->panel_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PANEL_XFER_NS);
+        return;
+    }
+
+    /*
+     * The USB module's FIFO burst ports.  The Cente driver programs the
+     * channel before it points the FIFO at a pipe (0x0400b3a0, then
+     * 0x0400c81a), so the copy cannot run here: the module does it as packets
+     * arrive and reports back through cdj_dmac_usbh_done.  TCR counts 32-byte
+     * units on this channel (the driver passes length >> 5).
+     */
+    if ((source & ~0xffull) == CDJ_USBH_BASE + 0x100
+        || (destination & ~0xffull) == CDJ_USBH_BASE + 0x100) {
+        bool to_fifo = (destination & ~0xffull) == CDJ_USBH_BASE + 0x100;
+        hwaddr port = to_fifo ? destination : source;
+
+        channel->role = CDJ_DMA_USBH;
+        dmac->usbh_dma_channel = index;
+        if (!cdj_usbh_dma_start(port - CDJ_USBH_BASE, to_fifo,
+                                to_fifo ? source : destination,
+                                channel->tcr * 32, index)) {
+            warn_report_once("cdj2000-dmac: ch%u aims at the USB module's "
+                             "FIFO but no module is present", index);
+        }
         return;
     }
 
@@ -978,6 +1036,12 @@ static void cdj_dmac_write(void *opaque, hwaddr offset, uint64_t value,
                 dmac->dma5_pending = false;
                 qemu_set_irq(dmac->dma5_irq, 0);
             }
+            /* The USB driver's channel: either bit going down ends it. */
+            if (dmac->usbh_dma_pending && index == dmac->usbh_dma_channel
+                && (!(value & CHCR_TE) || !(value & CHCR_IE))) {
+                dmac->usbh_dma_pending = false;
+                qemu_set_irq(dmac->usbh_dma_irq, 0);
+            }
             channel->chcr = value;
             if ((value & CHCR_DE) && (dmac->dmaor & 1)) {
                 cdj_dmac_run(dmac, index);
@@ -1007,13 +1071,20 @@ static const MemoryRegionOps cdj_dmac_ops = {
 typedef struct {
     MemoryRegion iomem;
     uint16_t reg[PANEL_SCIF_SIZE / 2];
+    bool trace;                     /* CDJ_PANEL_SCIF_TRACE */
 } CdjPanelScifState;
 
 static uint64_t cdj_panel_scif_read(void *opaque, hwaddr offset, unsigned size)
 {
     CdjPanelScifState *scif = opaque;
+    uint64_t value = offset + size <= PANEL_SCIF_SIZE ? scif->reg[offset >> 1] : 0;
 
-    return offset + size <= PANEL_SCIF_SIZE ? scif->reg[offset >> 1] : 0;
+    if (scif->trace) {
+        fprintf(stderr, "cdj2000-panel-scif %.3f: read  %#04" HWADDR_PRIx
+                " (%u) = %#06" PRIx64 "\n",
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9, offset, size, value);
+    }
+    return value;
 }
 
 static void cdj_panel_scif_write(void *opaque, hwaddr offset, uint64_t value,
@@ -1021,6 +1092,11 @@ static void cdj_panel_scif_write(void *opaque, hwaddr offset, uint64_t value,
 {
     CdjPanelScifState *scif = opaque;
 
+    if (scif->trace) {
+        fprintf(stderr, "cdj2000-panel-scif %.3f: write %#04" HWADDR_PRIx
+                " (%u) = %#06" PRIx64 "\n",
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9, offset, size, value);
+    }
     if (offset + size <= PANEL_SCIF_SIZE) {
         scif->reg[offset >> 1] = value;
     }
@@ -1037,6 +1113,7 @@ static void cdj_panel_scif_init(MemoryRegion *system)
 {
     CdjPanelScifState *scif = g_new0(CdjPanelScifState, 1);
 
+    scif->trace = getenv("CDJ_PANEL_SCIF_TRACE") != NULL;
     memory_region_init_io(&scif->iomem, NULL, &cdj_panel_scif_ops, scif,
                           "cdj2000.panel-scif", PANEL_SCIF_SIZE);
     memory_region_add_subregion(system, PANEL_SCIF_BASE, &scif->iomem);
@@ -1067,9 +1144,34 @@ static const MemoryRegionOps cdj_intc2_dma_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
-static void cdj_dmac_init(MemoryRegion *system, qemu_irq panel_rx,
-                          qemu_irq panel_tx, qemu_irq sdhi_dma,
-                          qemu_irq dsp_dma, qemu_irq dma5)
+/*
+ * A transfer the USB module ran on the DMAC's behalf has moved every byte.
+ * The channel completes as the SDHI's does -- the device end stays put, the
+ * memory end advances -- and the level stays up until the driver's handler
+ * clears TE or IE in CHCR.
+ */
+static void cdj_dmac_usbh_done(void *opaque, unsigned index, uint32_t nr_bytes)
+{
+    CdjDmacState *dmac = opaque;
+    CdjDmacChannel *channel = &dmac->channel[index];
+    hwaddr source = cdj_dma_phys(channel->sar);
+    hwaddr destination = cdj_dma_phys(channel->dar);
+
+    if ((destination & ~0xffull) == CDJ_USBH_BASE + 0x100) {
+        cdj_dmac_complete(channel, source + nr_bytes, channel->dar);
+    } else {
+        cdj_dmac_complete(channel, channel->sar, destination + nr_bytes);
+    }
+    if (dmac->usbh_dma_irq && !dmac->usbh_dma_pending) {
+        dmac->usbh_dma_pending = true;
+        qemu_set_irq(dmac->usbh_dma_irq, 1);
+    }
+}
+
+static CdjDmacState *cdj_dmac_init(MemoryRegion *system, qemu_irq panel_rx,
+                                   qemu_irq panel_tx, qemu_irq sdhi_dma,
+                                   qemu_irq dsp_dma, qemu_irq dma5,
+                                   qemu_irq usbh_dma)
 {
     CdjDmacState *dmac = g_new0(CdjDmacState, 1);
 
@@ -1082,6 +1184,7 @@ static void cdj_dmac_init(MemoryRegion *system, qemu_irq panel_rx,
     dmac->sdhi_dma_irq = sdhi_dma;
     dmac->dsp_dma_irq = dsp_dma;
     dmac->dma5_irq = dma5;
+    dmac->usbh_dma_irq = usbh_dma;
     dmac->panel_present = !getenv("CDJ_NO_PANEL");
     dmac->panel_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_dmac_panel_done,
                                      dmac);
@@ -1094,6 +1197,7 @@ static void cdj_dmac_init(MemoryRegion *system, qemu_irq panel_rx,
                              &dmac->iomem, 0, DMAC_SIZE);
     memory_region_add_subregion_overlap(system, P4ADDR(DMAC_BASE),
                                         &dmac->iomem_p4, 1);
+    return dmac;
 }
 
 static void cdj_cpu_reset(void *opaque)
@@ -4152,6 +4256,8 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
         INTC_VECT(CDJ_INTC_DMA5, INTEVT_DMA5),
         INTC_VECT(CDJ_INTC_DSP_EVENT, INTEVT_DSP_EVENT),
         INTC_VECT(CDJ_INTC_ATA, INTEVT_ATA),
+        INTC_VECT(CDJ_INTC_USB, INTEVT_USB),
+        INTC_VECT(CDJ_INTC_USB_DMA, INTEVT_USB_DMA),
     };
     /*
      * enum_ids are MSB-field first: sh_intc_write shifts a field's mask by
@@ -4168,6 +4274,10 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
         { 0xffd40014, 0, 32, 8, { 0, 0, 0, CDJ_INTC_LINK_DONE } },
         /* ATAPI_TSK writes its level here; field 0 is bits 31:24. */
         { 0xffd40018, 0, 32, 8, { CDJ_INTC_ATA, 0, 0, 0 } },
+        /* INT2PRI3: H-UDI, DMAC (DMINT0..), reserved, reserved. */
+        { 0xffd4000c, 0, 32, 8, { 0, CDJ_INTC_USB_DMA, 0, 0 } },
+        /* INT2PRI12: VDC2, reserved, USB, EtherC. */
+        { 0xffd400b0, 0, 32, 8, { 0, 0, CDJ_INTC_USB, 0 } },
     };
     struct intc_desc *intc = g_new0(struct intc_desc, 1);
     MemoryRegion *ccn = g_new(MemoryRegion, 1);
@@ -4229,11 +4339,19 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
      * 6 broken, which is `E-7001: DISC DRIVE ERROR`.
      */
     cdj_ata_init(system, intc->irqs[CDJ_INTC_ATA]);
-    cdj_dmac_init(system, intc->irqs[CDJ_INTC_PANEL_RX],
-                  intc->irqs[CDJ_INTC_PANEL_TX],
-                  intc->irqs[CDJ_INTC_SDHI_DMA],
-                  intc->irqs[CDJ_INTC_DSP_DMA],
-                  intc->irqs[CDJ_INTC_DMA5]);
+    CdjDmacState *dmac = cdj_dmac_init(system, intc->irqs[CDJ_INTC_PANEL_RX],
+                                       intc->irqs[CDJ_INTC_PANEL_TX],
+                                       intc->irqs[CDJ_INTC_SDHI_DMA],
+                                       intc->irqs[CDJ_INTC_DSP_DMA],
+                                       intc->irqs[CDJ_INTC_DMA5],
+                                       intc->irqs[CDJ_INTC_USB_DMA]);
+    /*
+     * The SoC's own USB module, host side: the type-A socket.  A stick is
+     * `-drive if=none,id=usbstick,file=... -device usb-storage,drive=usbstick`
+     * (boot_vm --usb-stick); with nothing plugged in the port is empty and
+     * the driver sees SE0, as on a player with an empty socket.
+     */
+    cdj_usbh_init(system, intc->irqs[CDJ_INTC_USB], cdj_dmac_usbh_done, dmac);
 
     /*
      * CDJ_TMU_FREQ multiplies the peripheral clock.  The firmware has several
@@ -4318,10 +4436,26 @@ static void cdj2000_main_init(MachineState *machine)
      * Word-wide device, so the unlock addresses are the usual 0x555/0x2aa and
      * the guest's byte addresses 0xaaa/0x554 land on them.
      */
-    pflash_cfi02_register(ROM_BASE, "cdj2000.flash", ROM_SIZE, NULL,
-                          FLASH_SECTOR, 1, 2,
-                          0x0001, 0x227e, 0x2220, 0x2200,
-                          0x555, 0x2aa, 0);
+    {
+        DeviceState *flash = qdev_new(TYPE_PFLASH_CFI02);
+
+        qdev_prop_set_uint32(flash, "num-blocks0", FLASH_MAIN_SECTORS);
+        qdev_prop_set_uint32(flash, "sector-length0", FLASH_MAIN_SECTOR);
+        qdev_prop_set_uint32(flash, "num-blocks1", FLASH_BOOT_SECTORS);
+        qdev_prop_set_uint32(flash, "sector-length1", FLASH_BOOT_SECTOR);
+        qdev_prop_set_uint8(flash, "width", 2);
+        qdev_prop_set_uint8(flash, "mappings", 1);
+        qdev_prop_set_uint8(flash, "big-endian", 0);
+        qdev_prop_set_uint16(flash, "id0", 0x0001);
+        qdev_prop_set_uint16(flash, "id1", 0x227e);
+        qdev_prop_set_uint16(flash, "id2", 0x2220);
+        qdev_prop_set_uint16(flash, "id3", 0x2200);
+        qdev_prop_set_uint16(flash, "unlock-addr0", 0x555);
+        qdev_prop_set_uint16(flash, "unlock-addr1", 0x2aa);
+        qdev_prop_set_string(flash, "name", "cdj2000.flash");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(flash), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(flash), 0, ROM_BASE);
+    }
 
     cdj_periph_init(system);
     cdj_bus_trace_init(system);

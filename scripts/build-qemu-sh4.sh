@@ -101,6 +101,7 @@ config CDJ2000_MAIN
     select PFLASH_CFI02
     select SD
     select IDE_MMIO
+    select USB
 EOF
 fi
 
@@ -109,7 +110,7 @@ fi
 # arrived with a device: SD with the card, IDE_MMIO with the disc drive.  The
 # loop is exact-match anchored, so IDE_MMIO is not mistaken for IDE_MMIO_FOO
 # and SD is not satisfied by SDHCI.
-for want in SD IDE_MMIO; do
+for want in SD IDE_MMIO USB; do
     if sed -n '/^config CDJ2000_MAIN/,/^$/p' "$kconfig" |
            grep -qx "    select $want"; then
         continue
