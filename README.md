@@ -137,8 +137,13 @@ Be clear about this: **the player is not usable as a player.**
   mounts its FAT32 and reads it, and with the two update keys held at power-on
   its updater takes a `C2KMAIN.UPD` from the stick's root and rewrites the
   flash model -- `tools/cdj_main/make_upd.py` builds such a file from any
-  flash image. See "A firmware update" in RUNNING.md. No host passthrough of a
-  real stick, and the USB source in the browser has not been exercised.
+  flash image. The recovery path works too: with a damaged application the
+  boot ROM runs the loader, which rewrites the application from the same
+  stick with the same keys. Two boards on the link in that mode also update
+  the GUI: MAIN streams a `C2KGUI.UPD` in 2 KiB link records and the 2000 GUI
+  firmware checks it, erases and programs its flash model. See "A firmware
+  update" in RUNNING.md. No host passthrough of a real stick, and the USB
+  source in the browser has not been exercised.
 * No link between players.
 
 Most inputs, measured properly against a control run, are proven no-ops on the

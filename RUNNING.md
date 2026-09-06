@@ -638,6 +638,38 @@ flag byte 0x1f: `'0'` programs from 0x40000, `'1'` from address 0 -- the ROM
 and the loader included -- which is why `make_upd` refuses to write anything
 but `'0'`.
 
+**The GUI update over the link** (runs update-26..28).  With the GUI board
+running -- the original 2000 firmware, `firmware/gui-boot-memory.elf` on
+`emulator/cdj2000-gui.hw`, connected as in the two-board recipe -- and a
+stick holding `C2KGUI.UPD`, the updater's index-1 path hands the file to the
+GuiCom engine (0x4212924/0x42154f0: message 0x6d8 with the buffer and the
+length, 0x1ec024) and MAIN streams it: status records with halfword 13 at
+0x102/0x105, one 16-byte opener, then 992 records of 2048 bytes -- a 4-byte
+header and 2044 bytes of file each (`decode_link_dump` shows them).  The
+file must be newer than what the GUI reports (0x2d58e4 compares the four
+header digits with 0x04c08614, the GUI's 4200), so the stock 4.200 file is
+dropped in state 6 with "nothing to do" (update-26) and a copy with the
+header bumped to 4.210 and the CRC-16/XMODEM recomputed over all but the
+last four bytes, stored big-endian in the last two, goes through
+(update-27): the GUI draws "GUI  Ver4.20 -> Ver4.21" with a progress bar,
+runs its checksum (0xb7f348) and its commit engine (0xb799c8: erase the
+part, program the image -- the routines `CDJ2000-revival/evidence/r228`
+read out of the firmware), reaches 100 % at t = 170 s and shows "Firmware
+update is complete. Turn the power off/on before using."; MAIN's updater
+goes 9 -> 0xf0 -> 0xff and prints `*** Update END ! ***`.  The simulator's
+flash is memory only; `BFIN_CFI_DUMP=<path>` (with `BFIN_EXIT_AFTER_WALL`
+so the simulator exits by itself) writes it out at the end.  Update-30's
+dump, 33 sector erases and 1 007 620 program commands later, is the stock
+image's sector 0 untouched followed by the *whole update body* -- boot
+stream and resource tail, contiguous, 0x1ec000 bytes -- at flash 0x10000,
+with not one byte differing.  That is the GUI's real flash layout, and it is
+not what `physical_flash_image()` assumed (stream at 0, gap behind it): the
+64 KiB in front of the stream are never touched by an update and are not in
+the file.  The resource tail sits at the same place either way, so the
+simulator's image worked all along.  The transfer is not always delivered:
+update-29's first 2048-byte record was announced and never handed to the
+firmware, and the run went nowhere -- a link-model stall to keep in mind.
+
 Two board bugs stood in the loader's way and are fixed: it ticks from TMU4
 in the second timer unit (0xffdc0000), whose interrupts the board had not
 routed (INT2PRI1, INTEVT 0xe00/0xe20/0xe40), and it runs the panel DMA on

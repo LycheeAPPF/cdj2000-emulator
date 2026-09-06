@@ -157,7 +157,22 @@ def crc16_xmodem(data: bytes) -> int:
 
 
 def physical_flash_image(update: GuiUpdate) -> bytes:
-    """Expand the compact updater body into the GUI's physical 2 MiB flash."""
+    """Expand the compact updater body into the GUI's physical 2 MiB flash.
+
+    What this returns puts the boot stream at flash 0 and a 64 KiB gap
+    between it and the resource tail.  **The GUI's own updater does not do
+    that** (run update-30, 2026-09-06, the 2000 firmware applying a
+    C2KGUI.UPD it received over the link, the simulator's flash dumped
+    afterwards): it programs the *whole body*, stream and tail contiguous,
+    at flash 0x10000, and never erases or writes 0x0..0xffff -- the 64 KiB
+    gap is in front of the stream, not behind it, and sector 0 holds
+    something the update file does not carry (on the board presumably the
+    first-stage loader the BF531 boot ROM parses; here whatever this image
+    put there).  The resource tail lands at the same offset either way
+    (0x10000 + stream length), which is why the simulator never noticed.
+    Kept as it is because the simulator loads the ELF and reads only the
+    tail from this image; a real flash dump would settle sector 0.
+    """
 
     flash_body = (
         update.body[: update.boot_stream_end]
