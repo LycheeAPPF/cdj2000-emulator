@@ -378,7 +378,78 @@ python -m tools.cdj_main.twoboard NAME --card CARD --keys keys.txt \
 
 and a keys file with `200 press 20.0` (BROWSE) before `230 press 16.0`
 (PLAY), MAIN 4.33 plus the proxy drive every visible element of the NXS
-phase meter. The 2000 MAIN's patch list for the beat part is the NXS
+phase meter.
+
+The beat grid and the cue markers on the waveform are two more payloads the
+NXS MAIN sends and MAIN 4.33 does not: command 0x20, the detail waveform
+(PWV3 entries of the track's ANLZ file, one byte a column at 150 a second),
+and command 0x21, four-byte marker records (type, then the time in
+milliseconds as bytes 1, 3, 2), both in 448-halfword parts with the part
+number in words 1/2 and the total in words 3/4 (NXS producers 0xa425bd60
+and 0xa425c3b8; the GUI's first-frame decoder 0x00d0fa64 and wire handler
+0x00d0fe00 stage them, the completion dispatch 0x00d0f1a8 hands them to
+the consumers 0x00d2f51c and 0x00d2c118).  The GUI asks for them with
+request types 0x20 and 0x21 when the status record's word 18 carries bit
+11 (detail waveform) or bit 15 (markers) -- MAIN 4.33 reads a type-0x20
+request as a cancel ("ｷｬﾝｾﾙできない") and answers with its last list.
+`--nxs-waveform FILE` and `--nxs-markers beat:BPM[:OFFSET[:TYPE[:BAR]]],
+cue:MS:TYPE,...` make the proxy answer those requests: the announcing
+status record and the part go out together, MAIN's own announcements are
+hidden while a transfer runs, every second typed request goes to MAIN to
+pace the GUI, and MAIN's answers to those pass through (held back and
+dropped, the GUI never completes the command, trackload-119; released in
+a burst afterwards, the time display froze, trackload-106).  The
+simulator's per-length frame slot must be deep enough to hold the parts
+(`--gui-env BFIN_LINK_DEPTH=64`; with the default depth of 1 the firmware
+saw every third part, trackload-103/105).  Drawing the detail waveform is
+gated on the record as well (0x00d2f418): word 18 bits 5..3, the source,
+must be neither 0 nor 4, and MAIN 4.33 sends 0 -- `--status-word
+18=0x08/0x38` supplies a 1.
+trackload-120/121: with the answers passing, the GUI takes all 34 detail-waveform parts and both marker parts, runs the consumers 0x00d2f51c (0x73c3 bytes) and 0x00d2c118 (0x674 bytes = 413 records) once each and asks for nothing more -- but draws neither: the draw gate 0x00d2f418 is never called (no code reference to it in the image; the widget handle DAT_00cd368c comes from its own factory), so the path from the filled tables to the screen is the open question.
+
+The DSP model's transport, from MAIN's writes into the window
+(`CDJ_DSP_TRACE`, trackload-96..118) and the DSP task that makes them
+(0x19fca2, Ghidra; it resolves the window as `0xac0c....`): the tempo
+slider is panel fields 2/3 and lands in +0x7bc0 as the playback rate,
+fixed point with 2^20 = 1.0 (0x0010020c = +0.05 %); +0x7ba0 is a state
+request (3 at PLAY, 2 at a pause, 4 for cue standby after a cue return and
+at the load's end, 5 at an unload; the task follows the DSP's answer in
++0x7bf8); +0x7c80 = 0x11 / 0x21 is a locate to the position in +0x7c84
+(stand there / run from there -- a CUE while playing sends 0x11, state 4,
+0x21; the PLAY after it state 2 and 0x21); +0x7c9c = slot * 16 + command
+with parameters in +0x7ca0..+0x7cac is the segment-slot interface: 0xc
+flushes the slot (before a cue return and before IN), 1 is loop IN and 2
+loop OUT with the point in +0x7ca8 as half frames (150 a second, the
+position reader's unit) plus +0x7ca4 in samples -- MAIN quantises them to
+the beat (7.805 s and 11.708 s = 16 and 24 beats at 123 BPM in
+trackload-120/121, identical in both runs) and the DSP plays the segment;
++0x7bc4 is the flag word the task
+rebuilds every pass from the deck's flag bytes (bit 31 = byte 0x690 in
+state 4), not a transport command.  With `CDJ_DSP_POSITION=1` the model
+follows the rate, the state requests, the locates and loops between the
+two points.
+trackload-120/121 (PLAY 230, pause 240, PLAY 247, CUE 255, PLAY 260, IN 268, OUT 272): the position stands at 9.6 s through the pause, resumes, returns to 0 and waits in standby, runs from the PLAY, and after IN/OUT loops between 7.805 s and 11.708 s; the NXS GUI's REMAIN follows all of it (result-overview.png).  Still open: the jog (panel field 6 plus the JOG TOUCH key 15.5
+changed neither the rate nor any command in trackload-96/98/102 -- the
+platter's pulses are not what that field carries), RELOOP/EXIT (not
+pressed yet), and the flag bytes behind +0x7bc4.
+
+The DSP itself is not a Pioneer custom part: `D710E001BZDHA275` is a TI
+Aureus DA710 with a TMS320C67x+ core (UHPI host port, McASP audio, EMIF
+SDRAM, a 768 KB internal ROM whose content is not public).  The program
+MAIN downloads at boot -- `main-unpacked.bin` 0x1010 (54192 bytes) and
+0xe3d0 (nine 32 KB pages and one of 24384) -- disassembles cleanly as
+little-endian C67x+ at load address 0x10000000 with the pip package
+`tms320c6x-disassembler`; the bytes and the listing are in
+`runs/nxs-swap/dsp/`.  A full virtualisation would need a C67x+
+interpreter plus the DA710 peripherals and the ROM; the listing's value
+now is the host-window protocol it implements (its header dispatcher at
+0x1004e1d8 tests the 0x03000100.. codes MAIN writes into +0x8140).
+
+Two tool limits met on the way: gdb write watchpoints on the DSP window
+(`--trace w:0xac0c7c9c:4`, the uncached alias MAIN uses -- the physical
+0x0c0c.... never fires) slow MAIN to a fifth once the streaming loop
+touches the window (trackload-118), and `BFIN_PEEK_WATCH` on a byte
+address double-faults the NXS GUI at boot (trackload-115/116). The 2000 MAIN's patch list for the beat part is the NXS
 producer set the revival named `NXS_MAIN_StatusSource_*`
 (`main-closure-review-c-port-classes.tsv`, class TRANSPLANT_NXS); the
 proxy is the stand-in until it exists.

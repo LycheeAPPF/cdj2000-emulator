@@ -110,7 +110,8 @@ Be clear about this: **the player is not usable as a player.**
   and load requests with `tools/cdj_main/link_inject.py` (which can also
   rewrite MAIN's status records: `--nxs-prefix` fills the NXS beat fields, and
   after the BROWSE key the NXS GUI's phase meter and beat countdowns draw
-  them; `--status-word`), because no key of
+  them; `--nxs-waveform` and `--nxs-markers` answer the GUI's requests for
+  the detail waveform and the beat/cue markers; `--status-word`), because no key of
   the NXS GUI has been found that sends the "enter" request. With
   `CDJ_DSP_ACK=1` the DSP model also answers the load's handshake, MAIN
   streams the whole file into the DSP window over DMAC channel 5 (the

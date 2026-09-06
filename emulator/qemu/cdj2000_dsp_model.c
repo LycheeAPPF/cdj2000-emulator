@@ -100,6 +100,10 @@ struct CdjDspModel {
     int64_t pos_ms;                     /* position of the deck, milliseconds */
     int64_t pos_last_ns;                /* last advance while playing */
     int64_t pos_print_ns;
+    bool pos_standby;                   /* +0x7ba0 = 4 (cue standby): 0x21 does not run */
+    int64_t loop_in_ms;                 /* segment slot 1: command 1 (IN) and 2 (OUT) */
+    int64_t loop_out_ms;
+    bool loop_on;                       /* both points set; 0xc (flush) clears */
     uint32_t pos_record;                /* +0x8120 of the last +0x8100 command: the record id the report names */
 
     /* CDJ_DSP_EVENT_PROBE: post event codes to MAIN on a schedule. */
@@ -208,6 +212,7 @@ typedef struct {
 static const DspAckWord dsp_ack_words[] = {
     { 0x7b80, DSP_ACK_COMMAND_LIMIT, true },
     { 0x7ba0, DSP_ACK_COMMAND_LIMIT, true },
+    { 0x7c80, DSP_ACK_COMMAND_LIMIT, false },   /* trackload-100: 0x11 after a CUE, else E-8302 000F */
     { 0x7c9c, INT32_MAX, false },
     { 0x7cb0, DSP_ACK_COMMAND_LIMIT, false },
     { 0x8100, DSP_ACK_COMMAND_LIMIT, false },
@@ -813,21 +818,50 @@ static void cdj_dsp_model_position_report(CdjDspModel *model, uint8_t *window,
     if (length < 0x7c60 || !model->control_cleared) {
         return;
     }
+    /*
+     * +0x7bc4 is not a transport word: MAIN's DSP task (0x19fca2, the
+     * writer at 0x1a0c68/0x1a0d6a) rebuilds it every pass from the deck's
+     * flag bytes for the state it is in -- bit 31 comes from byte 0x690 in
+     * state 4 only, bits 30..24 from 0x691/0x692/0x69b/0x69c../0x69f.  It
+     * looked like a play toggle in trackload-104..113 because those bytes
+     * change with the keys; the state requests below are the transport.
+     */
     if (model->pos_state == 3) {
-        model->pos_ms += (now - model->pos_last_ns) / SCALE_MS;
+        /*
+         * +0x7bc0 is the playback rate MAIN sets from the tempo slider,
+         * fixed point with 2^20 = 1.0 (trackload-100: 0x00100000 at rest,
+         * 0x0010020c = +0.05 % when the record's tempo word said 5).
+         * Elapsed guest time times that rate is the audio time played.
+         */
+        int64_t rate = ldl_le_p(window + 0x7bc0) & 0xffffff;
+        int64_t elapsed = (now - model->pos_last_ns) / SCALE_MS;
+
+        if (rate < 0x20000 || rate > 0x300000) {
+            rate = 0x100000;            /* nothing sensible there: nominal */
+        }
+        model->pos_ms += elapsed * rate >> 20;
         model->pos_last_ns = now;
+        if (model->loop_on && model->loop_out_ms > model->loop_in_ms
+            && model->pos_ms >= model->loop_out_ms) {
+            model->pos_ms = model->loop_in_ms
+                + (model->pos_ms - model->loop_in_ms)
+                % (model->loop_out_ms - model->loop_in_ms);
+        }
     }
     frames = (uint32_t)(model->pos_ms * 75 / 1000);
     samples = (uint32_t)((model->pos_ms * 44100 / 1000) % 588);
     stl_le_p(window + DSP_POS_STATUS, 0);
     stl_le_p(window + DSP_POS_SUBFRAME, samples);
+    /* +0x7bfc bits 1/2 reach MAIN's reader as [X-68] (0x19e6b0): a guess at
+       "running" / "standing" so a CUE while standing can set its point */
+    stl_le_p(window + 0x7bfc, model->pos_state == 3 ? 2 : model->pos_state == 2 ? 4 : 0);
     stl_le_p(window + DSP_POS_FRAMES, frames);
     stl_le_p(window + DSP_POS_VALID, model->pos_state ? model->pos_record : 0);
     if (model->pos_state == 3 && now - model->pos_print_ns >= 5 * 1000000000LL) {
         model->pos_print_ns = now;
         fprintf(stderr, "cdj2000-dsp: position %" PRId64 " ms = frame %u + %u "
-                "samples, state %u t=%.3f\n", model->pos_ms, frames, samples,
-                model->pos_state, now / 1e9);
+                "samples, state %u, rate 0x%06x t=%.3f\n", model->pos_ms, frames, samples,
+                model->pos_state, ldl_le_p(window + 0x7bc0) & 0xffffff, now / 1e9);
     }
 }
 
@@ -873,6 +907,74 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
             if (req->clear_result) {
                 stl_le_p(window + req->offset + 4, 0);
             }
+            if (req->offset == 0x7c80 && model->pos_report && length >= 0x7c88
+                && (word == 0x11 || word == 0x21)) {
+                /*
+                 * MAIN's DSP task 0x19fca2 (Ghidra, trackload-118) writes
+                 * +0x7c80 = msg[0xb] with msg[0xc] in +0x7c84 for the codes
+                 * 0x11/0x12/0x21/0x22: a locate.  A CUE while playing sends
+                 * 0x11 (stop there), then the state request 4, then 0x21;
+                 * the PLAY after it sends state 2 and 0x21 (trackload-104,
+                 * 113, 117).  So 0x11 = stand at the position, 0x21 = run
+                 * from it unless the deck is in cue standby.  The position
+                 * parameter was 0 in every run so far (the cue at the start);
+                 * CD frames like +0x7c10 is the assumption.
+                 */
+                uint32_t frames = ldl_le_p(window + 0x7c84);
+
+                model->pos_ms = (int64_t)frames * 1000 / 75;
+                model->pos_last_ns = now;
+                if (word == 0x21 && !model->pos_standby) {
+                    model->pos_state = 3;
+                } else {
+                    model->pos_state = 2;
+                }
+                fprintf(stderr, "cdj2000-dsp: +0x7c80 = 0x%x at frame %u -> position state %u "
+                        "at %" PRId64 " ms%s t=%.3f\n", word, frames, model->pos_state,
+                        model->pos_ms, model->pos_standby ? " (standby)" : "", now / 1e9);
+            }
+            if (req->offset == 0x7c9c && model->pos_report && length >= 0x7cb0) {
+                /*
+                 * +0x7c9c = msg[0x15] * 16 + msg[0x13] (the same task): the
+                 * segment slot in the high nibble and a slot command in the
+                 * low one, parameters msg[0x16..0x19] in +0x7ca0..+0x7cac.
+                 * 0xc arrived at the load, at a CUE and at loop IN with all
+                 * parameters 0 (trackload-113/117/118); command 1 followed
+                 * the IN with (1, 0x2c, 0, 1) and marks the slot's table
+                 * entry queued (state 2 at deck+0x2c0+0x54*slot).  Neither
+                 * moves the position -- an earlier reading of 0xc as a seek
+                 * sent the IN back to the start (trackload-117).
+                 */
+                /*
+                 * trackload-120: IN sent command 1 with (1, 264, 1170, 1) at
+                 * 7.8 s and OUT command 2 with (1, 102, 1756, 1) at 11.7 s --
+                 * word 3 is the position in half frames (150 a second, the
+                 * position reader's own unit), word 2 the samples into the
+                 * frame.  The DSP is expected to play the segment between
+                 * the two points on its own; the model wraps the position.
+                 */
+                uint32_t sub = ldl_le_p(window + 0x7ca4);
+                uint32_t half = ldl_le_p(window + 0x7ca8);
+                int64_t point_ms = (int64_t)half * 1000 / 150 + sub * 1000 / 44100;
+                const char *effect = "position untouched";
+
+                if ((word & 0xf) == 1) {
+                    model->loop_in_ms = point_ms;
+                    model->loop_on = false;
+                    effect = "loop IN";
+                } else if ((word & 0xf) == 2) {
+                    model->loop_out_ms = point_ms;
+                    model->loop_on = model->loop_out_ms > model->loop_in_ms;
+                    effect = model->loop_on ? "loop OUT, looping" : "loop OUT before IN, ignored";
+                } else if ((word & 0xf) == 0xc && model->loop_on) {
+                    model->loop_on = false;
+                    effect = "slot flushed, loop off";
+                }
+                fprintf(stderr, "cdj2000-dsp: +0x7c9c = 0x%x slot %u command %u (%u %u %u %u) "
+                        "= %" PRId64 " ms: %s t=%.3f\n", word, (word >> 4) & 0xf, word & 0xf,
+                        ldl_le_p(window + 0x7ca0), sub, half, ldl_le_p(window + 0x7cac),
+                        point_ms, effect, now / 1e9);
+            }
             if (req->offset == 0x8100 && word == 2 && model->pos_report
                 && length >= 0x8128) {
                 /*
@@ -888,24 +990,30 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
                  * to track 2 (5:31).  Only a 2 sets it.
                  */
                 model->pos_record = ldl_le_p(window + 0x8120);
-                fprintf(stderr, "cdj2000-dsp: +0x8100 = %d names record %u t=%.3f\n",
+                model->pos_ms = 0;
+                model->pos_state = 2;
+                fprintf(stderr, "cdj2000-dsp: +0x8100 = %d names record %u, position 0 t=%.3f\n",
                         word, model->pos_record, now / 1e9);
             }
-            if (req->offset == 0x7ba0 && model->pos_report) {
-                if (word == 4) {
-                    model->pos_state = 2;
-                    model->pos_ms = 0;
-                } else if (word == 3) {
+            if (req->offset == 0x7ba0 && model->pos_report && word >= 2 && word <= 6) {
+                /*
+                 * +0x7ba0 = msg[0] is a state request (the task copies it,
+                 * 5 and 6 as 5, and follows the DSP's answer in +0x7bf8):
+                 * 3 at PLAY from the load or from a pause, 2 at a pause
+                 * (PLAY while playing) and with 0x21 at the PLAY after a cue
+                 * return, 4 at the load's end and after a cue return, 5 at
+                 * an unload (trackload-104, 113, 117).
+                 */
+                model->pos_standby = word == 4;
+                if (word == 3) {
                     model->pos_state = 3;
                     model->pos_last_ns = now;
-                } else if (word == 5 && model->pos_state == 3) {
+                } else {
                     model->pos_state = 2;
                 }
-                if (word == 3 || word == 4 || word == 5) {
-                    fprintf(stderr, "cdj2000-dsp: +0x7ba0 = %d -> position state %u "
-                            "at %" PRId64 " ms t=%.3f\n", word, model->pos_state,
-                            model->pos_ms, now / 1e9);
-                }
+                fprintf(stderr, "cdj2000-dsp: +0x7ba0 = %d -> position state %u "
+                        "at %" PRId64 " ms%s t=%.3f\n", word, model->pos_state,
+                        model->pos_ms, model->pos_standby ? " (standby)" : "", now / 1e9);
             }
             if (req->offset == 0x7ba0 && model->slot_report) {
                 if (word == 4) {

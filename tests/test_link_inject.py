@@ -108,3 +108,75 @@ def test_status_word_patches_under_mask_with_crc():
     new = struct.unpack("<32H", prefix.rewrite(record))
     assert new[18] == 0x0024 and new[19] == 0x4000 and new[1] == 0
     assert new[31] == firmware_crc(struct.pack("<31H", *new[:31]))
+
+
+def test_marker_feed_answers_a_typed_request_with_announcement_and_part():
+    import struct
+    from tools.cdj_gui.main_packet import firmware_crc
+    from tools.cdj_main.link_inject import MarkerFeed, StatusPrefix, marker_record, MARKER_PART_HALFWORDS
+
+    assert marker_record(3, 0x123456) == bytes((3, 0x12, 0x56, 0x34))
+    feed = MarkerFeed("beat:120:0:1:2,cue:5000:7,at:10")
+    feed.waveform = bytes(0x400)
+    words = [0] * 32
+    words[7], words[8] = 3, (17 << 8) | 0
+    req20 = bytearray(48); struct.pack_into("<HH", req20, 2, 0x8020, 0x20)
+    req21 = bytearray(48); struct.pack_into("<HH", req21, 2, 0x8021, 0x21)
+    assert feed.answer(bytes(req20)) is None          # no record seen yet
+    feed.on_record(words, 12.0)
+    out = feed.answer(bytes(req20))                   # announcement + part 1 together
+    assert out is not None and len(out) == (8 + 64) + (8 + 896)
+    rec = struct.unpack("<32H", out[8:72])
+    assert (rec[29], rec[30]) == (1, MARKER_PART_HALFWORDS) and rec[31] == firmware_crc(out[8:70])
+    assert out[72:76] == b"CDJL" and out[80:82] == b"\x20\x00"
+    assert len(feed.queues[0x20]) == 1 and feed.transferring()
+    # MAIN's own announcement is cleared while the transfer runs
+    words[29], words[30] = 1, 136
+    assert feed.on_record(words, 12.5) is True and words[29] == 0 and feed.hidden == 1
+    assert feed.answer(bytes(48)) is None             # the zero poll goes to MAIN
+    assert feed.answer(bytes(req20)) is None          # every second typed request goes to MAIN
+    out = feed.answer(bytes(req20))                   # part 2
+    assert out[80:82] == b"\x20\x00" and not feed.queues[0x20] and feed.requested == 0
+    assert feed.answer(bytes(req20)) is None          # no 0x20 parts left
+    words[29], words[30] = 1, 136
+    assert feed.on_record(words, 13.0) is False and words[29] == 1   # not transferring: untouched
+    assert feed.answer(bytes(req21))[80:82] == b"\x21\x00"
+    browse = bytearray(48); browse[2] = 1; browse[3] = 0x80
+    assert feed.answer(bytes(browse)) is None
+    # through the prefix's frame parser, MAIN's payload frames pass during a transfer
+    prefix = StatusPrefix()
+    prefix.beat = False
+    prefix.markers = MarkerFeed("beat:120")
+    prefix.markers.waveform = bytes(0x800)
+    prefix.advance(50.0)
+    body = struct.pack("<31H", *words[:31])
+    status = b"CDJL" + struct.pack("<I", 64) + body + struct.pack("<H", firmware_crc(body))
+    prefix.feed(status)
+    assert prefix.markers.answer(bytes(req20)) is not None and prefix.markers.transferring()
+    payload = b"CDJL" + struct.pack("<I", 272) + bytes(272)
+    assert prefix.feed(payload) == payload
+    for _ in range(12):
+        prefix.markers.answer(bytes(req20))
+    assert not prefix.markers.transferring()
+
+
+def test_waveform_parts_precede_markers():
+    import struct
+    from tools.cdj_gui.main_packet import firmware_crc
+    from tools.cdj_main.link_inject import MarkerFeed, waveform_parts, MARKER_PART_HALFWORDS
+
+    entries = bytes(range(256)) * 8            # 2048 bytes -> 0x370 + 0x378 + rest
+    parts = waveform_parts(entries)
+    assert len(parts) == 3 and all(len(p) == MARKER_PART_HALFWORDS * 2 for p in parts)
+    head = struct.unpack("<7H", parts[0][:14])
+    assert head[:3] == (0x20, 1, 0) and head[3] | (head[4] << 16) == 2048
+    assert parts[0][14:14 + 0x370] == entries[:0x370]
+    assert struct.unpack("<3H", parts[1][:6]) == (0x20, 2, 0)
+    assert parts[1][6:6 + 0x378] == entries[0x370:0x370 + 0x378]
+    assert struct.unpack("<H", parts[2][-2:])[0] == firmware_crc(parts[2][:-2])
+    feed = MarkerFeed("cue:1000:3")
+    feed.waveform = entries
+    words = [0] * 32
+    words[7], words[8] = 0, (10 << 8)
+    feed.build(10000)
+    assert len(feed.queues[0x20]) == 3 and len(feed.queues[0x21]) == 1

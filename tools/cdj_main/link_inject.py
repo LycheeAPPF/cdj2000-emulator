@@ -53,6 +53,54 @@ the widgets); MAIN 4.33 sends those words as 0 (its builder starts at word
 The checksum in word 31 is redone (``firmware_crc`` over the first 62 bytes,
 the same routine as the requests).  Records with a blank time (minutes 99 or
 0xffff) or BPM 0 pass unchanged.
+
+``--nxs-markers`` delivers the marker payloads the NXS GUI draws on its
+waveforms and MAIN 4.33 never sends.  The NXS MAIN's producer 0xa425c3b8
+builds command 0x21 as 448 halfwords: word 0 = 0x21, words 1/2 = the part
+number (32-bit, from 1), words 3/4 = the total marker bytes (32-bit), words
+5..7 = three fields of its analysis snapshot, word 8 = 0, then up to 219
+four-byte records and the checksum in the last word; a continuation part
+carries its number in words 1/2 and up to 222 records from word 3.  A record
+is byte 0 = type, bytes 1, 3, 2 = the time in milliseconds as 24 bits (the
+converter 0xa425bba4; the GUI's consumer 0x00d2c118 reads b1 << 16 | b3 << 8
+| b2 and scales by 150/1000).  The GUI's wire handler 0x00d0fe00 stages the
+parts at 0x01b40d08 and hands the whole to the consumer when the total is
+reached.  The GUI asks for them: after a load it sends
+request type 0x20 (cursor 0x20) for the detail waveform and type 0x21 for
+the markers, and its completion dispatch 0x00d0f1a8 accepts a bulk answer
+only while the request of that command is open (MAIN 4.33 answers those
+requests with its last list, trackload-97).  The link is request/answer in lockstep:
+every GUI request gets one record back, MAIN announces a payload in status
+words 29 (count) and 30 (halfwords) of the record that answers the request,
+and sends the payload as the answer to the GUI's next request (trackload-99:
+swallowing the typed request without an answer stalled the GUI into
+timeouts and it dropped the continuation).  So the proxy answers a typed
+0x20/0x21 request itself: MAIN's last status record plus the announcement,
+immediately followed by the part (the firmware arms the payload receive
+from the announcement and takes the next frame of that length), and so on
+for each further typed request until the command's parts are out; MAIN
+sees none of those requests.  While a transfer runs, MAIN's own
+announcements in its records are cleared (trackload-101: MAIN kept
+re-announcing a stale 272-byte answer and the GUI fetched those); MAIN's
+answers to the requests it does get pass through unchanged -- the GUI's
+completion waits for them (trackload-119: dropped, the consumer never ran;
+trackload-106/112: released in a burst afterwards, the time display froze)
+and with BFIN_LINK_DEPTH=64 they no longer overwrite the parts.  The spec is a comma list of
+``beat:BPM[:OFFSET_MS[:TYPE[:BAR_TYPE]]]`` (a grid over the track's length
+from the record's words 7/8, TYPE on every beat, BAR_TYPE on every fourth,
+defaults 1 and 2) and ``cue:MS:TYPE`` items, plus ``at:SECONDS`` for when to
+start (default: as soon as the length is known).  Types are what the NXS
+converter copies from its 16-byte source records; which value draws which
+glyph is measured, not known -- give each cue a different one to find out.
+
+``--nxs-waveform FILE`` sends the detail waveform the markers are drawn on:
+command 0x20 (the NXS producer 0xa425bd60), word 0 = 0x20, words 1/2 = part
+number, words 3/4 = the byte count, words 5/6 = two PWV3 descriptor fields,
+then 0x370 bytes of PWV3 entries (one byte a column, 150 columns a second:
+height in bits 4..0, colour in bits 7..5), continuations with 0x378 bytes
+from word 3.  FILE holds the entries as rekordbox's ANLZ PWV3 tag carries
+them (the tag's 24-byte header stripped).  The waveform goes first, the
+markers after it, each part announced and fetched in turn.
 """
 
 # SPDX-License-Identifier: GPL-2.0-or-later
@@ -76,6 +124,202 @@ RECORD_MAGIC = b"CDJL"
 STATUS_RECORD_BYTES = 64
 
 
+MARKER_PART_HALFWORDS = 448
+MARKER_FIRST_RECORDS = 219
+MARKER_NEXT_RECORDS = 222
+WAVEFORM_FIRST_BYTES = 0x370
+WAVEFORM_NEXT_BYTES = 0x378
+POLL_WORDS = 24
+
+
+def waveform_parts(entries: bytes, fields: tuple[int, int] = (1, 0)) -> list[bytes]:
+    """Split PWV3 entries into command-0x20 parts of 448 halfwords, checksummed."""
+    total = len(entries)
+    parts: list[bytes] = []
+    index = 0
+    number = 1
+    while True:
+        if number == 1:
+            take = entries[index:index + WAVEFORM_FIRST_BYTES]
+            head = struct.pack("<7H", 0x20, 1, 0, total & 0xffff, total >> 16,
+                               fields[0] & 0xffff, fields[1] & 0xffff)
+        else:
+            take = entries[index:index + WAVEFORM_NEXT_BYTES]
+            head = struct.pack("<3H", 0x20, number & 0xffff, number >> 16)
+        body = head + take
+        body += bytes(MARKER_PART_HALFWORDS * 2 - 2 - len(body))
+        parts.append(body + struct.pack("<H", firmware_crc(body)))
+        index += len(take)
+        number += 1
+        if index >= total:
+            return parts
+
+
+def marker_record(kind: int, milliseconds: int) -> bytes:
+    """One four-byte record: type, then the time's bits 23..16, 7..0, 15..8."""
+    t = milliseconds & 0xffffff
+    return bytes((kind & 0xff, (t >> 16) & 0xff, t & 0xff, (t >> 8) & 0xff))
+
+
+def marker_parts(records: list[bytes], fields: tuple[int, int, int] = (0, 0, 0)) -> list[bytes]:
+    """Split records into command-0x21 parts of 448 halfwords, checksummed."""
+    total = len(records) * 4
+    parts: list[bytes] = []
+    index = 0
+    number = 1
+    while True:
+        if number == 1:
+            take = records[index:index + MARKER_FIRST_RECORDS]
+            head = struct.pack("<9H", 0x21, 1, 0, total & 0xffff, total >> 16,
+                               fields[0] & 0xffff, fields[1] & 0xffff, fields[2] & 0xffff, 0)
+        else:
+            take = records[index:index + MARKER_NEXT_RECORDS]
+            head = struct.pack("<3H", 0x21, number & 0xffff, number >> 16)
+        body = head + b"".join(take)
+        body += bytes(MARKER_PART_HALFWORDS * 2 - 2 - len(body))
+        parts.append(body + struct.pack("<H", firmware_crc(body)))
+        index += len(take)
+        number += 1
+        if index >= len(records):
+            return parts
+
+
+class MarkerFeed:
+    """Announce and deliver command-0x21 marker payloads in MAIN's place."""
+
+    def __init__(self, spec: str) -> None:
+        self.beats: list[tuple[float, int, int, int]] = []     # bpm, offset ms, type, bar type
+        self.cues: list[tuple[int, int]] = []                    # ms, type
+        self.start = 0.0
+        for item in spec.split(","):
+            fields = item.split(":")
+            if fields[0] == "beat":
+                nums = [float(fields[1])] + [int(f, 0) for f in fields[2:]]
+                bpm = nums[0]
+                offset = int(nums[1]) if len(nums) > 1 else 0
+                kind = int(nums[2]) if len(nums) > 2 else 1
+                bar = int(nums[3]) if len(nums) > 3 else 2
+                if bpm <= 0:
+                    raise ValueError("--nxs-markers: BPM must be positive")
+                self.beats.append((bpm, offset, kind, bar))
+            elif fields[0] == "cue" and len(fields) == 3:
+                self.cues.append((int(fields[1], 0), int(fields[2], 0)))
+            elif fields[0] == "at" and len(fields) == 2:
+                self.start = float(fields[1])
+            else:
+                raise ValueError(f"--nxs-markers: cannot read {item!r}")
+        self.length_ms = 0
+        self.parts: list[bytes] = []
+        self.queues: dict[int, list[bytes]] = {}
+        self.requested = 0                  # the bulk command the GUI has open, 0 = none
+        self.requests = 0
+        self.announced = False
+        self.sent = 0
+        self.done = False
+        self.waveform: bytes = b""
+        self.waveform_fields = (1, 0)       # command 0x20 words 5/6, the PWV3 descriptor's
+        self.last_status: bytes = b""       # MAIN's latest 64-byte record, prefix applied
+        self.elapsed = 0.0
+        self.pace = 0                       # typed requests seen during the transfer
+        self.hidden = 0                     # MAIN announcements cleared during transfers
+
+    def build(self, length_ms: int) -> None:
+        records: list[tuple[int, int, int]] = []
+        for bpm, offset, kind, bar in self.beats:
+            period = 60000.0 / bpm
+            n = 0
+            while True:
+                t = offset + n * period
+                if t > length_ms:
+                    break
+                records.append((int(t), bar if n % 4 == 0 else kind, 1))
+                n += 1
+        for ms, kind in self.cues:
+            records.append((ms, kind, 0))
+        records.sort()
+        self.queues = {}
+        if self.waveform:
+            self.queues[0x20] = waveform_parts(self.waveform, self.waveform_fields)
+        self.queues[0x21] = marker_parts([marker_record(k, t) for t, k, _ in records])
+        self.parts = [p for q in self.queues.values() for p in q]
+        self.length_ms = length_ms
+        print(f"proxy: nxs-markers built {len(records)} records"
+              + (f" after {len(self.waveform)} waveform bytes" if self.waveform else "")
+              + f" in {len(self.parts)} parts for {length_ms} ms", flush=True)
+
+    def answer(self, request: bytes) -> bytes | None:
+        """The frame to send the GUI for REQUEST instead of forwarding it, or None.
+
+        A typed 0x20/0x21 request while that command's parts are pending is
+        answered with the last status record announcing a part; the request
+        after an announcement (typed or the all-zero poll) gets the part."""
+        if len(request) != REQUEST_BYTES or self.elapsed < self.start:
+            return None
+        kind, cursor = struct.unpack_from("<HH", request, 2)
+        typed = kind & 0x8000 and kind & 0x7fff in (0x20, 0x21)
+        if not typed:
+            return None
+        command = kind & 0x7fff
+        # The GUI repeats a typed request faster than it takes parts
+        # (trackload-103: the firmware saw parts 4, 5, 8, 11, ...), so only
+        # every second request of a running transfer gets a part; the other
+        # goes to MAIN, whose status answer paces the GUI's next request.
+        if self.requested == command and self.queues.get(command):
+            self.pace += 1
+            if self.pace % 2:
+                return None
+        if not self.parts:
+            words = list(struct.unpack("<32H", self.last_status)) if self.last_status else None
+            if words is None:
+                return None
+            minutes, second = words[7], words[8]
+            if minutes >= 99 or minutes == 0xffff:
+                return None
+            length = minutes * 60000 + (second >> 8) * 1000 + (second & 0xff) * 1000 // 150
+            if length <= 0:
+                return None
+            self.build(length)
+        if not self.queues.get(command) or not self.last_status:
+            return None
+        if self.requested != command:
+            self.requests += 1
+            print(f"proxy: nxs-markers: GUI asks for command 0x{command:x} "
+                  f"({len(self.queues[command])} parts)", flush=True)
+        self.requested = command
+        words = list(struct.unpack("<32H", self.last_status))
+        words[29] = 1
+        words[30] = MARKER_PART_HALFWORDS
+        body = struct.pack("<31H", *words[:31])
+        record = body + struct.pack("<H", firmware_crc(body))
+        queue = self.queues[command]
+        part = queue.pop(0)
+        self.sent += 1
+        print(f"proxy: nxs-markers sent command 0x{command:x} part ({len(queue)} left)", flush=True)
+        if not queue:
+            self.done = all(not q for q in self.queues.values())
+            self.requested = 0
+        return (RECORD_MAGIC + struct.pack("<I", len(record)) + record
+                + RECORD_MAGIC + struct.pack("<I", len(part)) + part)
+
+    def transferring(self) -> bool:
+        return bool(self.requested) and bool(self.queues.get(self.requested))
+
+    def on_record(self, words: list[int], elapsed: float) -> bool:
+        """Called with MAIN's status words (after the prefix): remember the record
+        as the template for the proxy's own answers; while a transfer runs, clear
+        MAIN's own announcement so the GUI fetches nothing else."""
+        self.elapsed = elapsed
+        changed = False
+        if self.transferring() and words[29]:
+            words[29] = 0
+            words[30] = 0
+            self.hidden += 1
+            changed = True
+        body = struct.pack("<31H", *words[:31])
+        self.last_status = body + struct.pack("<H", firmware_crc(body))
+        return changed
+
+
 class StatusPrefix:
     """Rewrite words 1 and 2 of MAIN's status records with NXS beat bitfields."""
 
@@ -91,6 +335,8 @@ class StatusPrefix:
         self.last_beat = 0
         self.schedule: list[StatusPrefix] = []
         self.beat = True                    # False: leave words 1/2 alone
+        self.markers: MarkerFeed | None = None
+        self.elapsed = 0.0
         self.patches: list[tuple[int, int, int]] = []       # (index, value, mask)
         self.patch_schedule: list[tuple[float, int, int, int]] = []
 
@@ -135,6 +381,7 @@ class StatusPrefix:
 
     def advance(self, elapsed: float) -> None:
         """Switch to the next scheduled variant once its time has come."""
+        self.elapsed = elapsed
         while self.patch_schedule and self.patch_schedule[0][0] <= elapsed:
             _, index, value, mask = self.patch_schedule.pop(0)
             self.patches = [p for p in self.patches if p[0] != index] + [(index, value, mask)]
@@ -163,7 +410,15 @@ class StatusPrefix:
             bpm = words[10]
             if remaining is not None and length is not None and bpm:
                 elapsed = max(0, length - remaining)
-                beat = int(elapsed * bpm / (60 * 150)) % 4 + 1
+                if self.markers is not None and self.markers.beats:
+                    # the same grid the markers were built from: the beat in the
+                    # bar changes exactly at the grid's beat times, so the
+                    # phase meter and the waveform's beat marks agree
+                    grid_bpm, offset = self.markers.beats[0][:2]
+                    ms = elapsed * 1000 // 150 - offset
+                    beat = (int(ms * grid_bpm / 60000) % 4 + 1) if ms >= 0 else 1
+                else:
+                    beat = int(elapsed * bpm / (60 * 150)) % 4 + 1
                 self.last_beat = beat
                 words[1] = ((self.counter >> 8) << 15) | (beat << 12) | ((self.counter2 >> 8) << 11) \
                     | (beat << 8) | (self.mode << 4) | self.state
@@ -171,6 +426,8 @@ class StatusPrefix:
                 changed = True
         for index, value, mask in self.patches:
             words[index] = (words[index] & ~mask & 0xffff) | (value & mask)
+            changed = True
+        if self.markers is not None and self.markers.on_record(words, self.elapsed):
             changed = True
         if not changed:
             return record
@@ -338,6 +595,19 @@ def run_proxy(listen_host: str, listen_port: int, main_host: str, main_port: int
                     data = prefix.feed(data)
                     if not data:
                         continue
+                if prefix is not None and prefix.markers is not None and name == "gui-request":
+                    kept = bytearray()
+                    for offset in range(0, len(data) - len(data) % REQUEST_BYTES, REQUEST_BYTES):
+                        request = data[offset:offset + REQUEST_BYTES]
+                        frame = prefix.markers.answer(request)
+                        if frame is None:
+                            kept += request
+                        else:
+                            gui_record.sendall(frame)
+                    kept += data[len(data) - len(data) % REQUEST_BYTES:]
+                    data = bytes(kept)
+                    if not data:
+                        continue
                 try:
                     target.sendall(data)
                 except ConnectionResetError:
@@ -354,6 +624,9 @@ def run_proxy(listen_host: str, listen_port: int, main_host: str, main_port: int
         if prefix is not None:
             print(f"proxy: nxs-prefix rewrote {prefix.rewritten} status records, last beat {prefix.last_beat}",
                   flush=True)
+            if prefix.markers is not None:
+                print(f"proxy: nxs-markers sent {prefix.markers.sent} of {len(prefix.markers.parts)} parts, "
+                      f"hid {prefix.markers.hidden} MAIN announcements", flush=True)
         if dump:
             dump.close()
         for stream in reversed(streams):
@@ -377,6 +650,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--request-dump", type=Path,
                         help="append every GUI request and every injection, 48 bytes each")
+    parser.add_argument("--nxs-waveform", metavar="FILE[:W5[:W6]]",
+                        help="PWV3 entries to send as the command-0x20 detail waveform before "
+                             "the markers (needs --nxs-markers, even an empty 'at:0'); W5/W6 "
+                             "are the two descriptor words of the first part (default 1 and 0)")
+    parser.add_argument("--nxs-markers", metavar="SPEC",
+                        help="deliver command-0x21 marker payloads: beat:BPM[:OFFSET_MS[:TYPE"
+                             "[:BAR_TYPE]]],cue:MS:TYPE,...,at:SECONDS (see the module docstring)")
     parser.add_argument("--status-word", action="append", default=[],
                         metavar="IDX=VALUE[/MASK][@SECONDS]",
                         help="patch halfword IDX (1..30) of every status record MAIN sends, "
@@ -396,6 +676,17 @@ def main(argv: list[str] | None = None) -> int:
                 prefix = StatusPrefix()
                 prefix.beat = False
             prefix.add_words(args.status_word)
+        if args.nxs_markers:
+            if prefix is None:
+                prefix = StatusPrefix()
+                prefix.beat = False
+            prefix.markers = MarkerFeed(args.nxs_markers)
+            if args.nxs_waveform:
+                spec = args.nxs_waveform.split(":")
+                prefix.markers.waveform = Path(spec[0]).read_bytes()
+                if len(spec) > 1:
+                    prefix.markers.waveform_fields = (int(spec[1], 0),
+                                                      int(spec[2], 0) if len(spec) > 2 else 0)
         return run_proxy(args.listen_host, args.listen_port, args.main_host, args.main_port,
                          injections, args.timeout, args.request_dump, prefix)
     except (OSError, TimeoutError, ValueError) as exc:
