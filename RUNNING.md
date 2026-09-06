@@ -393,8 +393,14 @@ only the stream worker's position function (0x1a8e60.., writers 0x1a8f00 and
 levels) ever sets. That function never runs in the emulator: the worker
 stays in its load state waiting for the DSP, and neither consumption alone
 (`CDJ_DSP_CONSUME`, trackload-67) nor a class-0 event (trackload-69) wakes
-it into playback. The DSP's playback-start signal is the open question.
-There is no audio path.
+it into playback. The chain is known to its root: the position word is
+written by the decoder task's state-3/4 handler, which only the stream
+worker's state-1 handler commands, which only two player paths request --
+the second load variant (taken when the deck's word X+416 is 1 at load
+time) and the play handler when X+408 is 6. The emulator's load leaves
+X+416 at 0 and PLAY sets X+408 to 4, so neither path runs (trackload-74..76).
+What sets those words on the device -- a CUE before PLAY is the candidate --
+is the open question. There is no audio path.
 
 **The update file is not what the emulator boots.** The board loads
 `firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
