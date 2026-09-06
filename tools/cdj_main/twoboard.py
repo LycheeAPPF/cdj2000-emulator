@@ -110,6 +110,7 @@ def build_plan(args: argparse.Namespace, environ: dict[str, str] | None = None) 
     injects = list(args.inject) if args.inject else ([] if args.no_inject else list(DEFAULT_INJECTS))
     for item in injects:
         proxy += ["--inject", item]
+    proxy += list(args.proxy_arg)
     gui = [sys.executable, "-m", "tools.cdj_gui.run_headless", "--elf", args.elf,
            "--board", args.board, "--packet", args.packet,
            "--seconds", str(max(args.seconds - 5, 1)),
@@ -251,6 +252,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-port", type=int, default=5984)
     parser.add_argument("--main-port", type=int, default=5980)
     parser.add_argument("--proxy-port", type=int, default=5990)
+    parser.add_argument("--proxy-arg", action="append", default=[],
+                        help="extra link_inject argument, e.g. --proxy-arg=--nxs-prefix=beat")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, start nothing")
     return parser.parse_args(argv)
 

@@ -343,6 +343,27 @@ frames t165-t250). MAIN's own console (`CDJ_DEBUG_CONSOLE=70`, the file
 `♪WAVE[0,400]`, `♪CUE(U/S)[3]`; arm it after the library is up, at 5 s it
 broke the card switch.
 
+The proxy can also edit what MAIN sends. The NXS MAIN fills status record
+words 1 and 2 with the beat display's bitfields, MAIN 4.33 sends them as 0
+(its builder starts at word 3 -- Ghidra on both, and on the NXS GUI, whose
+decoder 0x00d0e346 splits them into the beat in the bar (bits 14..12 and
+10..8), a source mode (bits 7..4), a state (3..0) and two 9-bit bars.beat
+counters, 0x1ff = blank, that the screen-0 orchestrator 0x00d2d80c hands
+the widgets 0x26, 0x40, 0xc1/0x83 and 0x105/0x10b/0x111). `--nxs-prefix
+beat[:MODE[:STATE[:C1[:C2]]]][@SECONDS]` writes them into every record,
+the beat computed from the record's own time and BPM, checksum redone;
+`--status-word IDX=VALUE[/MASK][@SECONDS]` patches any other halfword. Both
+go through `twoboard --proxy-arg=...`. trackload-89/90: the words reach the
+GUI (the dump shows them) and nothing on the screen changes, in any of five
+variants of mode, state and counters. trackload-91 probed three other record words as the layout switch: word 18 bits 5..3 = 4 changed nothing, word 19 bit 14 blanked the overview waveform, word 13 = 2 (the decoder's link-player path) froze the time display and corrupted the frame -- none opened the beat layout. The widgets those
+setters address are not bound in the screen-0 tree the revival's static RE
+built (`codex/evidence/static-re/widget-tree-b`, attribution REJECTED for
+the callers 0x00d2cd68, 0x00d2cdc8, 0x00d2d580, 0x00d2d106), so the beat
+display lives in a layout this GUI has not entered; what enters it is the
+open question on the GUI side. The 2000 MAIN's patch list for the beat
+part is the NXS producer set the revival named `NXS_MAIN_StatusSource_*`
+(`main-closure-review-c-port-classes.tsv`, class TRANSPLANT_NXS).
+
 The load itself is a handshake with the audio DSP, and the built-in DSP
 model answers it only with `CDJ_DSP_ACK=1` (off by default; see the comments
 in `emulator/qemu/cdj2000_dsp_model.c` for every word and the run that
