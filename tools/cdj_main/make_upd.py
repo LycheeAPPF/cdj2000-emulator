@@ -9,8 +9,13 @@ writes.
 
 The file is a 32-byte header, Motorola S-records, and a CRC.
 
-* Header: `CDJ-2000 MAIN   Ver4.33\\0` then spaces and a flag byte at 0x1f
-  (`'0'`; `'1'` selects the updater's second programming mode).  The updater
+* Header: `CDJ-2000 MAIN   Ver4.33\\0` then spaces and a flag byte at 0x1f.
+  **The flag must be `'0'`.**  Both updaters -- the application's (0x2d6116)
+  and the loader's (0x20f6e) -- read it: `'0'` programs 0x40000..0x3dffff
+  from the records above 0x40000, `'1'` programs the whole 0x000000..0x3dffff
+  from the records at address 0, i.e. the boot ROM and the loader as well,
+  which are the only way a player with a broken application recovers.  This
+  tool therefore refuses to write anything but `'0'`.  The updater
   parses the version digits at 0x13, 0x15 and 0x16 (`4`, `3`, `3`) and only
   accepts a file whose number is **greater** than the running firmware's
   (0x2d58e4); a file of the installed version is skipped with "nothing to do".
@@ -55,6 +60,9 @@ def crc16(data: bytes) -> int:
 def header(version: str, flag: str = "0") -> bytes:
     if len(version) != 4 or version[1] != "." or not (version[0] + version[2:]).isdigit():
         raise ValueError("version must look like 4.34")
+    if flag != "0":
+        raise ValueError("header flag must be '0': '1' makes both updaters program "
+                         "the boot ROM and the loader (flash 0..0x3ffff) too")
     text = b"CDJ-2000 MAIN   Ver" + version.encode("ascii")
     return (text + b"\0").ljust(HEADER_SIZE - 1, b" ") + flag.encode("ascii")
 
@@ -92,9 +100,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", default="4.34", help="header version, e.g. 4.34")
     parser.add_argument("--end", type=lambda s: int(s, 0), default=DEFAULT_END,
                         help="first address not carried (default 0x287d60)")
-    parser.add_argument("--flag", default="0", help="header byte 0x1f, '0' or '1'")
     args = parser.parse_args(argv)
-    data = build(args.image.read_bytes(), args.version, args.end, args.flag)
+    data = build(args.image.read_bytes(), args.version, args.end)
     args.out.write_bytes(data)
     print(args.out, len(data), "bytes, version", args.version, "crc",
           data[-2:][::-1].hex())
