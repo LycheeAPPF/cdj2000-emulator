@@ -94,6 +94,14 @@ struct CdjDspModel {
     int32_t refill_low;                 /* CDJ_DSP_REFILL_LOW: the level that asks for more */
     bool refill_asked;                  /* posted for the current dip already */
 
+    /* CDJ_DSP_POSITION: the position report block +0x7bf0.. MAIN reads every tick. */
+    bool pos_report;
+    unsigned pos_state;                 /* 0 nothing loaded, 2 loaded/stopped, 3 playing */
+    int64_t pos_ms;                     /* position of the deck, milliseconds */
+    int64_t pos_last_ns;                /* last advance while playing */
+    int64_t pos_print_ns;
+    uint32_t pos_record;                /* +0x8120 of the last +0x8100 command: the record id the report names */
+
     /* CDJ_DSP_EVENT_PROBE: post event codes to MAIN on a schedule. */
     int64_t probe_start_ns;
     int64_t probe_interval_ns;
@@ -234,12 +242,13 @@ CdjDspModel *cdj_dsp_model_new(Chardev *external)
         ? (unsigned)strtoul(getenv("CDJ_DSP_PLAY_EVENT"), NULL, 0) : 0;
     /*
      * CDJ_DSP_CONSUME=<units per second>: playback as the stream worker sees
-     * it.  The time the GUI shows is [0x4832214] (the deck's position word,
-     * -1 = blank, 0x2cd378 reads it into the status record's word 5 at
-     * 0x216a0c); only the stream worker's position function (0x1a8e60..,
-     * writers 0x1a8f00 and 0x1a979c) sets it, and trackload-65/66 measured
-     * that with nothing consumed that function never runs -- the worker
-     * waits for the fill levels to drop.  A data transfer books 40 units
+     * it.  ([0x4832214] was taken for the deck's position word here; it is
+     * the track LENGTH, and the position comes from the report block --
+     * see CDJ_DSP_POSITION below, trackload-84..88.)  The stream worker's
+     * function 0x1a8e60.. (writers 0x1a8f00 and 0x1a979c) sets that word
+     * from -1 only, and trackload-65/66 measured that with nothing consumed
+     * it never runs -- the worker waits for the fill levels to drop.  A
+     * data transfer books 40 units
      * for 9408 bytes of 16-bit stereo PCM (2352 frames, 53.3 ms), so real
      * time is 750 units a second.  While the slot state is 3 the model takes
      * that many out of both levels and adds them to +0x81a0/+0x8180, the
@@ -271,6 +280,22 @@ CdjDspModel *cdj_dsp_model_new(Chardev *external)
         ? (unsigned)strtoul(getenv("CDJ_DSP_REFILL_EVENT"), NULL, 0) : 0;
     model->refill_low = getenv("CDJ_DSP_REFILL_LOW")
         ? (int32_t)strtol(getenv("CDJ_DSP_REFILL_LOW"), NULL, 0) : 20;
+    /*
+     * CDJ_DSP_POSITION=1: keep the position report block that MAIN's reader
+     * 0x19e568 takes every tick (trackload-84: it runs from boot, X+420 set,
+     * and after the load reaches its normal path 0x19eca0 every tick, turning
+     * +0x7c10 into the deck's elapsed time X+0x224..0x228 and X+0x218 --
+     * with the block zeroed those stayed 0 for 40558 ticks).  The block:
+     * +0x7bf0 status (0 = valid), +0x7bf4 low 16 bits = sample offset inside
+     * the current CD frame (0..587, /294 = half frame), +0x7c10 = position in
+     * CD frames (75/s), +0x7c14 = the id of the load-queue record being
+     * played (MAIN looks the record up by it, trackload-85/86; byte 2 of
+     * that word is the needle path's "valid" test).  (The player's
+     * 0x1b323e reads +0x7ccc, buffer 2's level, the same way -- word * 2 +
+     * (sub >= 294) -- not this block.)  The position runs while +0x7ba0 last
+     * said 3 (PLAY), stands after 5, and starts at 0 with the load's closing 4.
+     */
+    model->pos_report = getenv("CDJ_DSP_POSITION") != NULL;
     model->slot_period_ns = (int64_t)(getenv("CDJ_DSP_SLOT_PERIOD_MS")
         ? strtol(getenv("CDJ_DSP_SLOT_PERIOD_MS"), NULL, 0) : 500) * 1000000;
     /*
@@ -775,6 +800,37 @@ static void cdj_dsp_model_stream_header(CdjDspModel *model, uint8_t *window,
             buffer, count, is, level, now / 1e9);
 }
 
+#define DSP_POS_STATUS      0x7bf0
+#define DSP_POS_SUBFRAME    0x7bf4
+#define DSP_POS_FRAMES      0x7c10
+#define DSP_POS_VALID       0x7c14
+
+static void cdj_dsp_model_position_report(CdjDspModel *model, uint8_t *window,
+                                          size_t length, int64_t now)
+{
+    uint32_t frames, samples;
+
+    if (length < 0x7c60 || !model->control_cleared) {
+        return;
+    }
+    if (model->pos_state == 3) {
+        model->pos_ms += (now - model->pos_last_ns) / SCALE_MS;
+        model->pos_last_ns = now;
+    }
+    frames = (uint32_t)(model->pos_ms * 75 / 1000);
+    samples = (uint32_t)((model->pos_ms * 44100 / 1000) % 588);
+    stl_le_p(window + DSP_POS_STATUS, 0);
+    stl_le_p(window + DSP_POS_SUBFRAME, samples);
+    stl_le_p(window + DSP_POS_FRAMES, frames);
+    stl_le_p(window + DSP_POS_VALID, model->pos_state ? model->pos_record : 0);
+    if (model->pos_state == 3 && now - model->pos_print_ns >= 5 * 1000000000LL) {
+        model->pos_print_ns = now;
+        fprintf(stderr, "cdj2000-dsp: position %" PRId64 " ms = frame %u + %u "
+                "samples, state %u t=%.3f\n", model->pos_ms, frames, samples,
+                model->pos_state, now / 1e9);
+    }
+}
+
 void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -817,6 +873,40 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
             if (req->clear_result) {
                 stl_le_p(window + req->offset + 4, 0);
             }
+            if (req->offset == 0x8100 && word == 2 && model->pos_report
+                && length >= 0x8128) {
+                /*
+                 * trackload-86/87: the PCM-channel command +0x8100 carries
+                 * the load queue's record id in +0x8120/+0x8124 -- 2 at the
+                 * load names record 1, and the 3 that follows some 40 s
+                 * later names record 2, the NEXT track MAIN preloads into
+                 * buffer 2.  MAIN's reader looks the record up by the word
+                 * the DSP reports at +0x7c14 (0x1b23e4 over the ring at
+                 * 0x4836908, 0x794 bytes each) and takes the track length
+                 * X+620 from it, so the report must name the record being
+                 * played: trackload-87 named record 2 and the deck switched
+                 * to track 2 (5:31).  Only a 2 sets it.
+                 */
+                model->pos_record = ldl_le_p(window + 0x8120);
+                fprintf(stderr, "cdj2000-dsp: +0x8100 = %d names record %u t=%.3f\n",
+                        word, model->pos_record, now / 1e9);
+            }
+            if (req->offset == 0x7ba0 && model->pos_report) {
+                if (word == 4) {
+                    model->pos_state = 2;
+                    model->pos_ms = 0;
+                } else if (word == 3) {
+                    model->pos_state = 3;
+                    model->pos_last_ns = now;
+                } else if (word == 5 && model->pos_state == 3) {
+                    model->pos_state = 2;
+                }
+                if (word == 3 || word == 4 || word == 5) {
+                    fprintf(stderr, "cdj2000-dsp: +0x7ba0 = %d -> position state %u "
+                            "at %" PRId64 " ms t=%.3f\n", word, model->pos_state,
+                            model->pos_ms, now / 1e9);
+                }
+            }
             if (req->offset == 0x7ba0 && model->slot_report) {
                 if (word == 4) {
                     model->saw_load_end = true;
@@ -830,6 +920,9 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
                 }
             }
         }
+    }
+    if (model->pos_report && model->running && !model->absent && window) {
+        cdj_dsp_model_position_report(model, window, length, now);
     }
     cdj_dsp_model_census(model, window, length, now);
     if (model->probe_interval_ns && model->running && !model->absent

@@ -399,21 +399,35 @@ worker's state-1 handler commands, which only two player paths request --
 the second load variant (taken when the deck's word X+416 is 1 at load
 time) and the play handler when X+408 is 6. The emulator's load leaves
 X+416 at 0 and PLAY sets X+408 to 4, so neither path runs (trackload-74..76;
-X+416 = 1 turns out to be needle search, trackload-78). What the DSP does on
-the device to feed that chain is the open question. Until it is answered the
-position word can be driven from the board instead:
+X+416 = 1 turns out to be needle search, trackload-78).
+
+That chain was the wrong one. Ghidra on the reader that writes the deck's
+time words (trackload-84..88) says: X+620 (`0x4832214`) is the track LENGTH
+in CD frames (-1 = unknown, which blanks the time display), and the elapsed
+position is read from the DSP by 0x19e568, a function the tick 0x286248
+calls every 10 ms: it takes the report block at window +0x7bf0..+0x7c60 --
++0x7bf0 status (0 = valid), +0x7bf4 low 16 bits = sample offset inside the
+current frame (0..587, /294 = half frame), +0x7c10 = position in CD frames
+(75 a second), +0x7c14 = the id of the load-queue record being played
+(MAIN looks it up in the ring at 0x4836908 and takes the track length from
+it) -- and writes X+0x224/0x226/0x228 (minutes, seconds, frames) and
+X+0x218 (frames * 2 + half). The status record carries those as the time;
+0x2cd378 only supplies the length for REMAIN and the end warning. So the
+poke of trackload-83 drove the length, and the GUI's REMAIN display showed
+length minus zero. The DSP model keeps that block with
 
 ```
-CDJ_MAIN_POKE=0x5355fa8=1,0x4832214=0/75@232 CDJ_MAIN_POKE_AT=75 CDJ_MAIN_POKE_EVERY_MS=100
+CDJ_DSP_POSITION=1
 ```
 
-`ADDR=VALUE/RATE@AT` adds RATE per second of guest time from second AT, so
-the deck's position word counts CD sectors from a PLAY at 230 s. trackload-83:
-the status record's time words leave 0xbbbb the moment the poke starts, the
-GUI shows 00M:07S at 240 s, 00M:33S at 265 s, 01M:03S at 295 s -- real time
--- and the waveform cursor moves with it. That is a stand-in for the DSP's
-report, not a model of it, and it says nothing about beat grid or phase
-meter, which need the real report's other fields. There is no audio path.
+taking the record id from the PCM-channel command +0x8100 = 2 (+0x8120),
+starting the position at 0 with the load's closing +0x7ba0 = 4 and running
+it from +0x7ba0 = 3 (PLAY) in real time. trackload-88, no poke: the deck's
+length word becomes the record's 0x39e2 (3:17) at the load, the time words
+count from PLAY, the GUI's REMAIN display TRACK 01 bleibt, X+620 = 0x39e2 (3:17) ab 170 s aus Datensatz 1, X+0x224 zählt ab PLAY; REMAIN 03:17 bei 230 s, 03:08 bei 240, 02:43 bei 265, 02:14 bei 295 (Echtzeit), Cursor wandert, kein Fehler (`result-overview.png`) and the waveform
+cursor moves. Pitch, jog, cue and loop are not in the model's position yet
+(it only runs, at nominal speed), and beat grid and phase meter are the next
+things to trace from the GUI side. There is no audio path.
 
 **The update file is not what the emulator boots.** The board loads
 `firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
@@ -570,7 +584,13 @@ effect). What did hold: trackload-72 -- class-5 events with a fresh report
 number every 500 ms while playing (`CDJ_DSP_PLAY_EVENT=0x500
 CDJ_DSP_REPORT_ID=1 CDJ_DSP_CONSUME=750`) made MAIN stream buffer-1 data
 following the position in +0x81a0 every half second without an error; the
-deck position word and the time display still did not move), `CDJ_DMAC_TRACE` (every DMA start
+deck position word and the time display still did not move),
+`CDJ_DSP_POSITION=1` (the DSP's position report block +0x7bf0..+0x7c60 that
+MAIN's reader 0x19e568 takes every tick: position in CD frames at +0x7c10,
+sample offset in the frame at +0x7bf4, the load-queue record id at +0x7c14
+from the +0x8100 = 2 command's +0x8120; trackload-88 -- the time display
+runs from PLAY with the track's real length, see "Switching to a medium"),
+`CDJ_DMAC_TRACE` (every DMA start
 with channel, SAR, DAR, TCR, CHCR and role), `CDJ_SDHI_TRACE` (every SD
 command; walking the card image's FAT for the block addresses says which
 file a read was -- `runs/nxs-swap/trackload-39-final/fatmap.py` does that)
