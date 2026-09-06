@@ -356,13 +356,32 @@ the beat computed from the record's own time and BPM, checksum redone;
 go through `twoboard --proxy-arg=...`. trackload-89/90: the words reach the
 GUI (the dump shows them) and nothing on the screen changes, in any of five
 variants of mode, state and counters. trackload-91 probed three other record words as the layout switch: word 18 bits 5..3 = 4 changed nothing, word 19 bit 14 blanked the overview waveform, word 13 = 2 (the decoder's link-player path) froze the time display and corrupted the frame -- none opened the beat layout. The widgets those
-setters address are not bound in the screen-0 tree the revival's static RE
-built (`codex/evidence/static-re/widget-tree-b`, attribution REJECTED for
-the callers 0x00d2cd68, 0x00d2cdc8, 0x00d2d580, 0x00d2d106), so the beat
-display lives in a layout this GUI has not entered; what enters it is the
-open question on the GUI side. The 2000 MAIN's patch list for the beat
-part is the NXS producer set the revival named `NXS_MAIN_StatusSource_*`
-(`main-closure-review-c-port-classes.tsv`, class TRANSPLANT_NXS).
+setters address are not in the screen the GUI shows after a load (the
+revival's registry calls it screen 0, `performance`: list on top, deck
+strip below; `codex/evidence/static-re/nxs-v144/screen_registry.tsv`).
+The simulator's call watch (`BFIN_CALL_WATCH=<pc>,...`, trackload-92/93)
+showed the orchestrator 0x00d2d80c never running there: its event 0x10016
+reaches screen 0's own dispatcher 0x00d3a97c, and the beat setters belong
+to screen 5 (`browser` in the registry, 306 widgets, dispatcher
+0x00d45456). The switch is the panel's BROWSE key (20.0, MAIN's own name
+table): trackload-94 pressed it at 200 s and the GUI went to the full
+performance screen -- title bar, detail waveform with ZOOM/GRID, and the
+two-row MASTER/PLAYER phase meter with the beat countdowns, which drew the
+proxy's fields: beat lit from the record's time and BPM, `08.1 Bars` and
+`04.2 Bars` from the counters 0x21 and 0x12. So with
+
+```
+python -m tools.cdj_main.twoboard NAME --card CARD --keys keys.txt \
+    --env CDJ_DSP_ACK=1 --env CDJ_DSP_POSITION=1 \
+    --proxy-arg=--nxs-prefix=beat:1:0:0x21:0x12
+```
+
+and a keys file with `200 press 20.0` (BROWSE) before `230 press 16.0`
+(PLAY), MAIN 4.33 plus the proxy drive every visible element of the NXS
+phase meter. The 2000 MAIN's patch list for the beat part is the NXS
+producer set the revival named `NXS_MAIN_StatusSource_*`
+(`main-closure-review-c-port-classes.tsv`, class TRANSPLANT_NXS); the
+proxy is the stand-in until it exists.
 
 The load itself is a handshake with the audio DSP, and the built-in DSP
 model answers it only with `CDJ_DSP_ACK=1` (off by default; see the comments
