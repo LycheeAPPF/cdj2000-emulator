@@ -159,7 +159,29 @@ so a mask is only usable against the run it was made for.
 python -m tools.cdj_main.monitor "1,2,GU"      # MAIN's own service monitor
 python -m tools.cdj_main.caution --live        # decode the caution store
 python -m tools.cdj_main.gui_handshake         # measure the link handshake
+python -m tools.cdj_gui.decode_link_dump run/main-link-dump.bin   # what MAIN's link handed the GUI
+python -m tools.cdj_main.link_exchanges run/vm-main.log --dump run/main-link-dump.bin   # every request against MAIN's answers
 ```
+
+`decode_link_dump` reads a `BFIN_MAIN_LINK_DUMP` (every record the simulator
+handed the GUI firmware) and prints the status-word changes, every payload with
+its list rows or player-state strings, and which announced payload lengths
+were never delivered -- the shape of a frame the link lost.
+
+`link_exchanges` reads MAIN's own log (`boot_vm --main-output`), pairs every
+request the GUI sent (a delivered frame with bit 15 of word 1 set) with the
+payloads MAIN sent before the next request, and prints a table per request
+class -- type, cursor, words 3..5 -- of how often it was asked, how often a
+payload answered it, which (length and command word), how fast, and how many
+times the GUI asked again meanwhile; then the classes MAIN never answered
+with a payload, and the frames delivered less than 0.5 ms after the one
+before, which is the shape of a request the firmware read twice or not at
+all. With `--dump` one payload of every answer signature is decoded from the
+GUI's dump. On `trackload-45-final` it says, for instance, that the NXS
+GUI's type-9 player-state request is answered by MAIN 4.33 with 224 bytes
+under command `0x0009` (not the `0x19` layout the GUI tools build), that the
+type-7 encoder-LED commands never get a payload, and that 93 of 8263 frames
+went in back to back (see `CDJ_LINK_RX_GAP_US`).
 
 `caution` turns MAIN's internal codes into the `E-nnnn` numbers the player would
 show: `E-7010` is the audio DSP, `E-7020` the USB device, `E-7001` the disc
@@ -298,6 +320,264 @@ one-row answers the GUI gives up on after ~5 s (m1).
 Switching **away** from the card works: the USB key with no stick shows
 the platter 1.5-3.5 s after the key, three of three.
 
+**Loading a track.** The track list of a playlist is one 896-byte link
+frame, and until 2026-09-03 both link models threw anything over 512 bytes
+away -- the board without reporting the completion, which left MAIN's sender
+dead for the rest of the run (`runs/nxs-swap/twoboard-10-load`: the answer
+announced in 9 545 status records, never delivered). Both carry 4096 bytes
+now, the protocol's own limit. What the browse keys of the NXS GUI do on this
+MAIN is measured in `runs/nxs-swap/NOTE-trackload-2026-09-03.md`: the select
+encoder (`rotary 7`) moves the left column, the pane follows, and no key was
+found that sends the "enter" request. So the requests are injected instead:
+`tools/cdj_main/link_inject.py` sits between the GUI (`BFIN_MAIN_LINK=
+127.0.0.1:5990`) and MAIN and sends, at given seconds after the GUI connected,
+an ENTER (`type 1 cursor 3, words 7 1 N` -- row N of MAIN's current list
+becomes the list) or a LOAD (`type 7 cursor 1, words 0 N` -- the track at
+index N of the current list). From the library screen, `--inject 90:1:3:7:1:0
+--inject 110:1:3:7:1:0 --inject 130:1:3:7:1:0 --inject 155:7:1:0:0` opens
+PLAYLIST, its first folder, that folder's first playlist -- the track list
+draws -- and loads its first track: TRACK 01, overview waveform, and after a
+second load the duration, BPM and key of the track (`trackload-12-load`,
+frames t165-t250). MAIN's own console (`CDJ_DEBUG_CONSOLE=70`, the file
+`TEMP/vm-console.txt`, Shift-JIS) narrates it: `BlackFin → ロード要求`,
+`♪WAVE[0,400]`, `♪CUE(U/S)[3]`; arm it after the library is up, at 5 s it
+broke the card switch.
+
+The proxy can also edit what MAIN sends. The NXS MAIN fills status record
+words 1 and 2 with the beat display's bitfields, MAIN 4.33 sends them as 0
+(its builder starts at word 3 -- Ghidra on both, and on the NXS GUI, whose
+decoder 0x00d0e346 splits them into the beat in the bar (bits 14..12 and
+10..8), a source mode (bits 7..4), a state (3..0) and two 9-bit bars.beat
+counters, 0x1ff = blank, that the screen-0 orchestrator 0x00d2d80c hands
+the widgets 0x26, 0x40, 0xc1/0x83 and 0x105/0x10b/0x111). `--nxs-prefix
+beat[:MODE[:STATE[:C1[:C2]]]][@SECONDS]` writes them into every record,
+the beat computed from the record's own time and BPM, checksum redone;
+`--status-word IDX=VALUE[/MASK][@SECONDS]` patches any other halfword. Both
+go through `twoboard --proxy-arg=...`. trackload-89/90: the words reach the
+GUI (the dump shows them) and nothing on the screen changes, in any of five
+variants of mode, state and counters. trackload-91 probed three other record words as the layout switch: word 18 bits 5..3 = 4 changed nothing, word 19 bit 14 blanked the overview waveform, word 13 = 2 (the decoder's link-player path) froze the time display and corrupted the frame -- none opened the beat layout. The widgets those
+setters address are not in the screen the GUI shows after a load (the
+GUI's own screen registry calls it screen 0, `performance`: list on top,
+deck strip below).
+The simulator's call watch (`BFIN_CALL_WATCH=<pc>,...`, trackload-92/93)
+showed the orchestrator 0x00d2d80c never running there: its event 0x10016
+reaches screen 0's own dispatcher 0x00d3a97c, and the beat setters belong
+to screen 5 (`browser` in the registry, 306 widgets, dispatcher
+0x00d45456). The switch is the panel's BROWSE key (20.0, MAIN's own name
+table): trackload-94 pressed it at 200 s and the GUI went to the full
+performance screen -- title bar, detail waveform with ZOOM/GRID, and the
+two-row MASTER/PLAYER phase meter with the beat countdowns, which drew the
+proxy's fields: beat lit from the record's time and BPM, `08.1 Bars` and
+`04.2 Bars` from the counters 0x21 and 0x12. So with
+
+```
+python -m tools.cdj_main.twoboard NAME --card CARD --keys keys.txt \
+    --env CDJ_DSP_ACK=1 --env CDJ_DSP_POSITION=1 \
+    --proxy-arg=--nxs-prefix=beat:1:0:0x21:0x12
+```
+
+and a keys file with `200 press 20.0` (BROWSE) before `230 press 16.0`
+(PLAY), MAIN 4.33 plus the proxy drive every visible element of the NXS
+phase meter.  There is no finer phase than the beat in that record: the
+meter's lit segment is the beat in the bar (word 1 bits 14..12), the
+countdowns are the two bars.beat counters, and the GUI has no field for the
+position within the beat -- when the proxy also sends a beat grid
+(`--nxs-markers beat:BPM`), it aligns the beat it announces to that grid.
+
+The beat grid and the cue markers on the waveform are two more payloads the
+NXS MAIN sends and MAIN 4.33 does not: command 0x20, the detail waveform
+(PWV3 entries of the track's ANLZ file, one byte a column at 150 a second),
+and command 0x21, four-byte marker records (type, then the time in
+milliseconds as bytes 1, 3, 2), both in 448-halfword parts with the part
+number in words 1/2 and the total in words 3/4 (NXS producers 0xa425bd60
+and 0xa425c3b8; the GUI's first-frame decoder 0x00d0fa64 and wire handler
+0x00d0fe00 stage them, the completion dispatch 0x00d0f1a8 hands them to
+the consumers 0x00d2f51c and 0x00d2c118).  The GUI asks for them with
+request types 0x20 and 0x21 when the status record's word 18 carries bit
+11 (detail waveform) or bit 15 (markers) -- MAIN 4.33 reads a type-0x20
+request as a cancel ("ｷｬﾝｾﾙできない") and answers with its last list.
+`--nxs-waveform FILE` and `--nxs-markers beat:BPM[:OFFSET[:TYPE[:BAR]]],
+cue:MS:TYPE,...` make the proxy answer those requests: the announcing
+status record and the part go out together, MAIN's own announcements are
+hidden while a transfer runs, every second typed request goes to MAIN to
+pace the GUI, and MAIN's answers to those pass through (held back and
+dropped, the GUI never completes the command, trackload-119; released in
+a burst afterwards, the time display froze, trackload-106).  The
+simulator's per-length frame slot must be deep enough to hold the parts
+(`--gui-env BFIN_LINK_DEPTH=64`; with the default depth of 1 the firmware
+saw every third part, trackload-103/105).  Drawing the detail waveform is
+gated on the record as well (0x00d2f418): word 18 bits 5..3, the source,
+must be neither 0 nor 4, and MAIN 4.33 sends 0 -- `--status-word
+18=0x08/0x38` supplies a 1.
+trackload-120/121: with the answers passing, the GUI takes all 34
+detail-waveform parts and both marker parts and runs the consumers
+0x00d2f51c (0x73c3 bytes) and 0x00d2c118 (0x674 bytes = 413 records)
+once each -- and still drew nothing, because the draw gate 0x00d2f418
+(called from the GUI task's loop 0x00cfd378) waits for a readiness word
+(0x00cd3694) that the widget handler 0x00d2e8e8 sets on the
+"detail waveform complete" message only if the first part's words 5/6
+repeat the track length of the status record's words 7/8 (minutes,
+seconds, frames within 2).  The proxy now copies those words in by
+default, and trackload-122 draws it all: the detail waveform with the
+beat grid's ticks scrolling under the play head, the cue point's marker
+on it, the memory-cue triangles on the overview (`result-overview.png`).
+
+The DSP model's transport, from MAIN's writes into the window
+(`CDJ_DSP_TRACE`, trackload-96..118) and the DSP task that makes them
+(0x19fca2, Ghidra; it resolves the window as `0xac0c....`): the tempo
+slider is panel fields 2/3 and lands in +0x7bc0 as the playback rate,
+fixed point with 2^20 = 1.0 (0x0010020c = +0.05 %); +0x7ba0 is a state
+request (3 at PLAY, 2 at a pause, 4 for cue standby after a cue return and
+at the load's end, 5 at an unload; the task follows the DSP's answer in
++0x7bf8); +0x7c80 = 0x11 / 0x21 is a locate to the position in +0x7c84
+(stand there / run from there -- a CUE while playing sends 0x11, state 4,
+0x21; the PLAY after it state 2 and 0x21); +0x7c9c = slot * 16 + command
+with parameters in +0x7ca0..+0x7cac is the segment-slot interface: 0xc
+flushes the slot (before a cue return and before IN), 1 is loop IN and 2
+loop OUT with the point in +0x7ca8 as half frames (150 a second, the
+position reader's unit) plus +0x7ca4 in samples -- MAIN quantises them to
+the beat (7.805 s and 11.708 s = 16 and 24 beats at 123 BPM in
+trackload-120/121, identical in both runs) and the DSP plays the segment;
++0x7bc4 is the flag word the task
+rebuilds every pass from the deck's flag bytes (bit 31 = byte 0x690 in
+state 4), not a transport command.  With `CDJ_DSP_POSITION=1` the model
+follows the rate, the state requests, the locates and loops between the
+two points.
+trackload-120/121 (PLAY 230, pause 240, PLAY 247, CUE 255, PLAY 260, IN 268, OUT 272): the position stands at 9.6 s through the pause, resumes, returns to 0 and waits in standby, runs from the PLAY, and after IN/OUT loops between 7.805 s and 11.708 s; the NXS GUI's REMAIN follows all of it (result-overview.png).  Still open: the jog (panel field 6 plus the JOG TOUCH key 15.5
+changed neither the rate nor any command in trackload-96/98/102 -- the
+platter's pulses are not what that field carries), RELOOP/EXIT (not
+pressed yet), and the flag bytes behind +0x7bc4.
+
+The DSP itself is not a Pioneer custom part: `D710E001BZDHA275` is a TI
+Aureus DA710 with a TMS320C67x+ core (UHPI host port, McASP audio, EMIF
+SDRAM, a 768 KB internal ROM whose content is not public).  The program
+MAIN downloads at boot -- `main-unpacked.bin` 0x1010 (54192 bytes) and
+0xe3d0 (nine 32 KB pages and one of 24384) -- disassembles cleanly as
+little-endian C67x+ at load address 0x10000000 with the pip package
+`tms320c6x-disassembler`; the bytes and the listing are in
+`runs/nxs-swap/dsp/`.  A full virtualisation would need a C67x+
+interpreter plus the DA710 peripherals and the ROM; the listing's value
+now is the host-window protocol it implements (its header dispatcher at
+0x1004e1d8 tests the 0x03000100.. codes MAIN writes into +0x8140).
+
+Two tool limits met on the way: gdb write watchpoints on the DSP window
+(`--trace w:0xac0c7c9c:4`, the uncached alias MAIN uses -- the physical
+0x0c0c.... never fires) slow MAIN to a fifth once the streaming loop
+touches the window (trackload-118), and `BFIN_PEEK_WATCH` on a byte
+address double-faults the NXS GUI at boot (trackload-115/116).
+
+The 2000 MAIN's patch list for the beat part is the NXS MAIN's set of
+status-source producers (the functions that feed its status builder
+0xa425ca0c); the proxy is the stand-in until it exists.
+
+The load itself is a handshake with the audio DSP, and the built-in DSP
+model answers it only with `CDJ_DSP_ACK=1` (off by default; see the comments
+in `emulator/qemu/cdj2000_dsp_model.c` for every word and the run that
+measured it). With it MAIN writes the load's parameters, the stream format
+and header into the DSP window, reads the file from the card and streams it
+into the DSP over DMAC channel 5 -- the whole track, the way the player loads
+into the DSP's 32 MB of SDRAM -- and reports the load complete when the last
+buffer is in: `Musicﾛｰﾄﾞ要求完了通知受理 PL→全`, NOW LOADING ends, the
+tempo field shows the track's BPM (`trackload-36-levels`, ~130 s of guest
+time for a 3:17 WAV). Without the switch the load stays pending behind NOW
+LOADING, or stops with `E-8302` once the model answers some words but not
+others. `CDJ_DSP_TRACE=1` prints every acknowledged request with its
+parameters, a per-second census of the control block's changed words and the
+two buffer levels. The recipe that held (trackload-49..52, four of four): the
+card given at launch (`--sd`), the SD SOURCE key at 60 s (`--source-key sd
+--source-key-at 60` -- the card alone leaves the NXS GUI browsing LINK, and
+its cursor-3 polls then collide with the injected ENTERs, trackload-47/48),
+ENTERs at 90/110/130 and the LOAD at 155 s of the injector's clock; the
+receive gap (`CDJ_LINK_RX_GAP_US`) is what made it hold. That recipe is a
+tool:
+
+```
+python -m tools.cdj_main.twoboard trackload-60 --card runs/nxs-swap/rbstick1g.img
+python -m tools.cdj_main.twoboard play-1 --card CARD --keys keys.txt --env CDJ_DSP_ACK=1 \
+    --bootvm-arg=--trace=0x41bd304 --dry-run
+```
+
+`twoboard` starts MAIN (`boot_vm`, the card's work copy at launch, the SD key
+at 60 s), the injecting proxy (`link_inject`, the four requests above unless
+`--inject` or `--no-inject` says otherwise) and the GUI (`run_headless`),
+presses panel keys from a `SECONDS ARGS` file through `panel_control`, and
+leaves logs, frames, request dump, MAIN console and a README with every
+command line in a fresh directory under `runs/nxs-swap/` -- an existing one is
+refused, so runs never overwrite each other. `--env` is MAIN board environment
+(`CDJ_*`), `--gui-env` the simulator's, `--bootvm-arg` anything else for
+`boot_vm`; the gdb stub stays free for `--trace` because nothing is polled
+unless `--poll-words` asks. Still blank: the time fields of the status record (words
+5..8 read `0xbbbb` while a track is loaded, 0 once it is unloaded). The slot
+table at window+0x7ce0 can now carry a state and an advancing position
+(`CDJ_DSP_SLOT_REPORT`, trackload-59), but MAIN's player task reads it only
+on its own command path (the copy at 0x1b39cc), which a PLAY in the
+emulator does not take. Where the time really comes from was traced with
+write watchpoints (`boot_vm --trace w:ADDR[:LEN]`, trackload-61..66): the
+status record's word 5 is written at 0x216a24 -- 0xbbbb when 0x2cd378()
+returns -1 -- and 0x2cd378 reads the deck's position word 0x4832214, which
+only the stream worker's position function (0x1a8e60.., writers 0x1a8f00 and
+0x1a979c, reading the DSP's per-buffer status at +0x81a0 and the fill
+levels) ever sets. That function never runs in the emulator: the worker
+stays in its load state waiting for the DSP, and neither consumption alone
+(`CDJ_DSP_CONSUME`, trackload-67) nor a class-0 event (trackload-69) wakes
+it into playback. The chain is known to its root: the position word is
+written by the decoder task's state-3/4 handler, which only the stream
+worker's state-1 handler commands, which only two player paths request --
+the second load variant (taken when the deck's word X+416 is 1 at load
+time) and the play handler when X+408 is 6. The emulator's load leaves
+X+416 at 0 and PLAY sets X+408 to 4, so neither path runs (trackload-74..76;
+X+416 = 1 turns out to be needle search, trackload-78).
+
+That chain was the wrong one. Ghidra on the reader that writes the deck's
+time words (trackload-84..88) says: X+620 (`0x4832214`) is the track LENGTH
+in CD frames (-1 = unknown, which blanks the time display), and the elapsed
+position is read from the DSP by 0x19e568, a function the tick 0x286248
+calls every 10 ms: it takes the report block at window +0x7bf0..+0x7c60 --
++0x7bf0 status (0 = valid), +0x7bf4 low 16 bits = sample offset inside the
+current frame (0..587, /294 = half frame), +0x7c10 = position in CD frames
+(75 a second), +0x7c14 = the id of the load-queue record being played
+(MAIN looks it up in the ring at 0x4836908 and takes the track length from
+it) -- and writes X+0x224/0x226/0x228 (minutes, seconds, frames) and
+X+0x218 (frames * 2 + half). The status record carries those as the time;
+0x2cd378 only supplies the length for REMAIN and the end warning. So the
+poke of trackload-83 drove the length, and the GUI's REMAIN display showed
+length minus zero. The DSP model keeps that block with
+
+```
+CDJ_DSP_POSITION=1
+```
+
+taking the record id from the PCM-channel command +0x8100 = 2 (+0x8120),
+starting the position at 0 with the load's closing +0x7ba0 = 4 and running
+it from +0x7ba0 = 3 (PLAY) in real time. trackload-88, no poke: the deck's
+length word becomes the record's 0x39e2 (3:17) at the load, the time words
+count from PLAY, the GUI's REMAIN display TRACK 01 bleibt, X+620 = 0x39e2 (3:17) ab 170 s aus Datensatz 1, X+0x224 zählt ab PLAY; REMAIN 03:17 bei 230 s, 03:08 bei 240, 02:43 bei 265, 02:14 bei 295 (Echtzeit), Cursor wandert, kein Fehler (`result-overview.png`) and the waveform
+cursor moves. Pitch, jog, cue and loop are not in the model's position yet
+(it only runs, at nominal speed), and beat grid and phase meter are the next
+things to trace from the GUI side. There is no audio path.
+
+**The update file is not what the emulator boots.** The board loads
+`firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
+`C2KMAIN.UPD` by `tools.cdj_gui.main_unpack` -- into its NOR flash model (a
+CFI02 device in RAM, so the settings sectors the firmware erases and rewrites
+never reach the file). A modified image is tested by putting it there; nothing
+in the emulator exercises the updater. What the device itself checks on an
+update file is host-side arithmetic: Motorola S-records with per-record
+checksums, a little-endian CRC-16/XMODEM trailer over the container, the two
+LZSS-packed application regions at 0x10000 and 0x40000 with their additive
+checksums, and the model/version header at image offset 0x700 (`PIONEER`,
+`CDJ-2000`, `4.33`, `20150209`). `main_unpack` verifies the first three on the
+way in; a patcher for that file has to re-emit all of them, and should refuse
+to patch unless the stock file round-trips byte for byte first. The
+updater task that reads the file (`UpDtae_TASK`, "*** Update END ! ***") lives
+in the application image but names no file -- the 4.33 image contains neither
+`.UPD` nor `C2K` in any encoding -- so its trigger and its medium handling are
+open. Running it in the emulator would need a USB mass-storage or SD image
+carrying the file, the menu path that starts it, and the flash model taking
+the rewrite; that is a project of its own, and the decision here is not to
+build it: the file's acceptance is proven on the host (unpack what was built,
+compare with what was booted), the firmware change itself in the emulator.
+
 **What the SOURCE key costs.** Measured with `boot_vm --source-key usb
 --source-key-at 40` and `CDJ_PANEL_HOLD_MS=2800` (the default 300 ms hold
 reaches MAIN -- `0x04c084d4` goes to 1 -- but the GUI never learns of it): the
@@ -374,10 +654,78 @@ The board itself takes a long list of its own, all read with `getenv` in
 `emulator/qemu/`: `CDJ_INPUT_PORT`, `CDJ_PANEL_KEYS`, `CDJ_SD_INSERT`,
 `CDJ_DSP_ABSENT`, `CDJ_USB_ABSENT`, `CDJ_ATAPI_ABSENT`, `CDJ_BUS_TRACE`,
 `CDJ_LINK_TRACE` (arm, acknowledge and gate lines with virtual-clock stamps,
-and the header words of every request delivered), `CDJ_LINK_TX_US` (off) and
-more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
+and the header words of every request delivered), `CDJ_LINK_TX_US` (off),
+`CDJ_LINK_RX_GAP_US` (the least guest time between two GUI frames going into
+MAIN's receive buffer, default 2000: the simulator delivers frames in bursts
+and two of them 0.1 ms apart made GuiCom_RcvTASK read the second twice --
+an injected LOAD taken twice failed the load in `trackload-42-final`; 0
+restores the burst) and `CDJ_LINK_RX_HANDOVER=answer` (hand the next queued
+frame over only when MAIN transmits; measured worse in `trackload-48-launch2`
+and kept for the A/B),
+`CDJ_NO_PANEL` and `CDJ_NO_USB_POWER` (the two input bits of GPIO
+`0xfff10060` the board holds high: the panel-present bit and the USB power
+switch's sense line, whose absence made MAIN raise caution `0x92` "USB Error"
+every 50 polls), `CDJ_DSP_ACK` (the DSP model zeroes its control block once
+MAIN has seen it up and answers the request words a track load and its PCM
+stream write there; off, an experiment -- see "Loading a track"),
+`CDJ_DSP_TRACE` (firmware pages, mailbox, every acknowledged request, a
+per-second census of the control block, every event posted), `CDJ_DSP_EVENT_PROBE=<start s>[:<interval s>[:<codes>]]`
+(post DSP event codes to MAIN on its interrupt line -- irq 0x7f, bit 24 of
+0xffd4005c, GPIO 0xfff10040 bit 4, the code in bytes 2/3 of window+0xffe8:
+byte 2 is the class the player task switches on, byte 3 a parameter --
+one every interval from the start second on; `<codes>` is a range
+`<first>-<last>` (default 1..13) or a list `0x100,0x200,...`. Measured:
+every code is acknowledged within a millisecond (trackload-50/51b); class
+1, 2 and 5 events are dropped unless the report number below has changed
+(trackload-55); a class-1 event with a new number is "segment finished" --
+MAIN pops its segment queue, finds nothing, unloads the track and its time
+fields turn from blank to 00:00 (trackload-56/57); class 3 makes MAIN write
+window+0x7ba4 = 1 and wait 6 s for the DSP to clear it, then E-8302 000F
+(trackload-55)), `CDJ_DSP_REPORT_ID=<n>` (the DSP's report sequence number
+at window+0x7cd4, which MAIN compares with its copy before handling a class
+1/2/5 event and copies afterwards; the model writes n+1, n+2, ... there
+before each event it posts), `CDJ_DSP_SLOT_REPORT=<state>` (after the
+load's closing commands 4 and 2 write that state into the four slot-table
+entries at window+0x7ce0 with the position words +96/+100 -- 22050ths of a
+second and CD sectors, the reader divides +96 by 294 -- then post the event
+`CDJ_DSP_SLOT_EVENT` (default 0x100, 0 = none); PLAY makes it state 3, and
+from then on the position advances and the entries are rewritten every
+`CDJ_DSP_SLOT_PERIOD_MS` (500); state 2 plus the event got E-8302 in
+trackload-52/57 -- the entry is read, its vocabulary is still open),
+`CDJ_DSP_PLAY_EVENT=<code>` (the event posted with each periodic state-3
+report instead; default none -- class 0 code 1 there made MAIN re-stream
+in a loop and stop with E-8302 C611, trackload-69), `CDJ_DSP_CONSUME=<units
+per second>` (while the slot state is 3 the DSP consumes: both fill levels
++0x7cd0/+0x7ccc go down and the per-buffer status words +0x81a0/+0x8180 go
+up by that many units -- 40 units book one 9408-byte PCM transfer of 53.3 ms,
+so 750 is real time; trackload-67 measured that MAIN does not poll the
+levels: nothing happened until an event came; since trackload-71 only
+buffer 1 is consumed), `CDJ_DSP_REFILL_EVENT=<code>` with
+`CDJ_DSP_REFILL_LOW` (default 20: post that event once whenever buffer 1's
+level falls under the mark -- trackload-71: MAIN answered class 0 code 1
+with a stop and E-8302 even before the buffer was empty, so class 0 is not
+the refill path while playing), `CDJ_DSP_STATUS_FLAGS=1` (raise the two
+buffer-active bits the stream worker reports to the player, +0x81ac bit 24
+and +0x818c bit 25, while the slot state is 3; trackload-73: no visible
+effect). What did hold: trackload-72 -- class-5 events with a fresh report
+number every 500 ms while playing (`CDJ_DSP_PLAY_EVENT=0x500
+CDJ_DSP_REPORT_ID=1 CDJ_DSP_CONSUME=750`) made MAIN stream buffer-1 data
+following the position in +0x81a0 every half second without an error; the
+deck position word and the time display still did not move),
+`CDJ_DSP_POSITION=1` (the DSP's position report block +0x7bf0..+0x7c60 that
+MAIN's reader 0x19e568 takes every tick: position in CD frames at +0x7c10,
+sample offset in the frame at +0x7bf4, the load-queue record id at +0x7c14
+from the +0x8100 = 2 command's +0x8120; trackload-88 -- the time display
+runs from PLAY with the track's real length, see "Switching to a medium"),
+`CDJ_DMAC_TRACE` (every DMA start
+with channel, SAR, DAR, TCR, CHCR and role), `CDJ_SDHI_TRACE` (every SD
+command; walking the card image's FAT for the block addresses says which
+file a read was -- `runs/nxs-swap/trackload-39-final/fatmap.py` does that)
+and more. The simulator likewise: `BFIN_MAIN_LINK`, `BFIN_GUI_OUTPUT`,
 `BFIN_GUI_COLOR`, `BFIN_PPI_DMA_DELAY`, `BFIN_SPORT_TX_OUTPUT`,
-`BFIN_SPORT_RX_US` (off), and the time-base knobs above: `BFIN_TIME_BASE`,
+`BFIN_SPORT_RX_US` (off), `BFIN_LINK_REPEAT_ANNOUNCED` (on: a payload MAIN's
+record still announces is handed over again when the firmware arms for it),
+and the time-base knobs above: `BFIN_TIME_BASE`,
 `BFIN_CCLK_HZ`, `BFIN_PPI_FPS`, `BFIN_SPORT_RETRY_US`, `BFIN_WALL_LAG_MS`,
 `BFIN_STATS`, `BFIN_EXIT_AFTER_WALL`, `BFIN_EXIT_AFTER_TICKS`,
 `BFIN_MEM_FAST`. Each is documented where it is read.

@@ -81,7 +81,9 @@ If you are here to build on it, that is exactly what it is for.
   start: its library -- categories, folders, playlists from the rekordbox
   export -- is on the screen with the player screen, at 33-35 s. Switching
   to it later, from another source, mostly is not (see "Switching to a
-  medium" in RUNNING.md).
+  medium" in RUNNING.md). Opening a playlist and loading a track from it
+  works when the requests are injected on the link (see "Loading a track"
+  in RUNNING.md).
 
 ## What does not
 
@@ -101,10 +103,35 @@ Be clear about this: **the player is not usable as a player.**
   never learns of the key (see "Switching to a medium" in RUNNING.md). Give
   a freshly inserted card ~25 s before its key. The card at launch is seven
   of seven.
-* **No track loading.** The library lists come from the card; selecting a
-  track in them has not been driven, and there is no audio path.
-* **No audio at all.** The DSP is a register model with a position counter and
-  no signal path.
+* **A track loads, but does not play.** The library lists come from the
+  card, a playlist's track list with them (896-byte link frames, the ceiling
+  was 512), and a load request brings the track up as TRACK 01 with its
+  overview waveform, duration, BPM and key -- driven by injecting the browse
+  and load requests with `tools/cdj_main/link_inject.py` (which can also
+  rewrite MAIN's status records: `--nxs-prefix` fills the NXS beat fields, and
+  after the BROWSE key the NXS GUI's phase meter and beat countdowns draw
+  them; `--nxs-waveform` and `--nxs-markers` answer the GUI's requests for
+  the detail waveform and the beat/cue markers; `--status-word`), because no key of
+  the NXS GUI has been found that sends the "enter" request. With
+  `CDJ_DSP_ACK=1` the DSP model also answers the load's handshake, MAIN
+  streams the whole file into the DSP window over DMAC channel 5 (the
+  player loads a track into the DSP's 32 MB SDRAM) and reports the load
+  complete; the time display stays blank because the DSP's position report
+  is not modelled, and there is no audio path, so PLAY changes nothing
+  audible. The recipe used to fail one run in four: the board handed the
+  GUI's frames to MAIN in bursts, two of them 0.1 ms apart, and MAIN's
+  receive task read the injected LOAD twice ("MusicID多重要求"). Frames now
+  go into MAIN's buffer no closer than 2 ms apart (`CDJ_LINK_RX_GAP_US`),
+  which is how the wire spaces them; `tools/cdj_main/twoboard.py` runs the
+  whole recipe into a fresh run directory; with `CDJ_DSP_POSITION=1` the DSP
+  model keeps the position report block MAIN reads every tick, so the time
+  display and the waveform cursor run from PLAY with the track's real length
+  (nominal speed only; pitch, jog, cue and loop not modelled yet, see
+  RUNNING.md); `tools/cdj_main/link_exchanges.py`
+  counts the back-to-back deliveries a run still has.
+* **No audio at all.** The DSP (a Pioneer custom LSI, D710E001, with no
+  public instruction set) is modelled from MAIN's side: it takes the request
+  words MAIN polls and keeps two buffer levels, and has no signal path.
 * No USB passthrough: a real stick on the host does not appear as a source.
   **Selecting `USB` shows the `Wait` platter and leaves it there**: the GUI
   routes a source whose media state MAIN reports as zero to the platter

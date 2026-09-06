@@ -11,10 +11,12 @@ side: an MBR with one type-0x0C partition at LBA 2048, then FAT32 with 4 KiB
 clusters.  MAIN reads sector 0 first (CMD17 with argument 0), so the MBR is not
 optional.
 
-Only 8.3 names are emitted -- no long-name entries.  Everything a CDJ-2000 reads
-is already 8.3 (`export.pdb`, `ANLZ0000.DAT`, `P000/0000193A/`); anything longer
-is a rekordbox 6 artefact the player does not open, and is skipped with a note
-rather than silently truncated into a name that would collide.
+Every name that is not a plain upper-case 8.3 name gets a long-name entry set
+in front of its short entry (`lfn_entries`), with the short name made unique per
+directory by a `~N` tail.  That is what a rekordbox stick looks like and what
+MAIN needs: `PIONEER/rekordbox/` itself is nine characters, and the audio files
+a rekordbox export references keep their long names.  (An earlier version of
+this text claimed only 8.3 names were written; the code never did that.)
 """
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 LycheeAPPF
@@ -124,7 +126,6 @@ class Builder:
         self.fat = [0] * (self.max_cluster + 2)
         self.fat[0], self.fat[1] = 0x0FFFFFF8, 0x0FFFFFFF
         self.next_cluster = 2
-        self.skipped: list[str] = []
 
     def alloc(self, count: int) -> list[int]:
         if self.next_cluster + count > self.max_cluster + 2:
@@ -251,8 +252,6 @@ def main() -> int:
     print("%s: %d bytes, %d clusters used of %d"
           % (args.image, len(builder.image), builder.next_cluster - 2,
              builder.max_cluster))
-    for name in builder.skipped:
-        print("  skipped (not an 8.3 name): %s" % name)
     return 0
 
 

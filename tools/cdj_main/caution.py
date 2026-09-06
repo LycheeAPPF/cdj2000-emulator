@@ -642,8 +642,16 @@ REG_PC, REG_PR = 16, 17
 def trace_thread(port: int, addresses: list[int], budget: int,
                  stop: threading.Event,
                  hits: dict[tuple[int, ...], list],
-                 cap: int = 0) -> None:
+                 cap: int = 0,
+                 watches: list[tuple[int, int]] | None = None) -> None:
     """Hold breakpoints on the caution entry points and count what arrives.
+
+    `watches` are (address, length) pairs for gdb write watchpoints (`Z2`):
+    the stop reports the pc of the storing instruction with the same register
+    key as a breakpoint hit, so a hit list answers "who writes this word" --
+    the question a literal search cannot when the address is base+offset
+    (trackload-60/61: the status record's time fields).  A watchpoint stop
+    needs no step-over; QEMU resumes past the access on its own.
 
     Both wrappers are worth breaking on, not only `Caution_Set` itself: a hit on
     `0x250e68` reports `pr` inside the wrapper that called it, which says
@@ -679,6 +687,7 @@ def trace_thread(port: int, addresses: list[int], budget: int,
         print("# trace: cannot reach the stub: %s" % error)
         return
     placed = []
+    watched = []
     started = time.monotonic()
     try:
         for address in addresses:
@@ -686,10 +695,18 @@ def trace_thread(port: int, addresses: list[int], budget: int,
                 placed.append(address)
             else:
                 print("# trace: the stub refused a breakpoint at 0x%08x" % address)
-        if not placed:
+        watched = []
+        for address, length in watches or []:
+            if stub.command("Z2,%x,%x" % (address, length)) == "OK":
+                watched.append((address, length))
+            else:
+                print("# trace: the stub refused a watchpoint at 0x%08x" % address)
+        if not placed and not watched:
             return
         print("# trace: breakpoints at "
-              + ", ".join("0x%08x" % address for address in placed))
+              + ", ".join("0x%08x" % address for address in placed)
+              + (" watchpoints at " + ", ".join("0x%08x:%d" % w for w in watched)
+                 if watched else ""))
         spent = {address: 0 for address in placed}
         total = {address: 0 for address in placed}
         stub.send("c")
@@ -771,6 +788,11 @@ def trace_thread(port: int, addresses: list[int], budget: int,
         for address in placed:
             try:
                 stub.command("z0,%x,2" % address, timeout=2.0)
+            except (OSError, EOFError, socket.timeout):
+                pass
+        for address, length in watched:
+            try:
+                stub.command("z2,%x,%x" % (address, length), timeout=2.0)
             except (OSError, EOFError, socket.timeout):
                 pass
         stub.close()

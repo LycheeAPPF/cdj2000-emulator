@@ -192,6 +192,44 @@ numbers; the first such arm also logs the SPORT's clock registers
 (`bfin sport: ...`), which say the transmit clock is internal at SCLK/34 and
 the receive clock is MAIN's.
 
+### `sim/bfin/dv-bfin_ppi.c` — the link's frame ceiling
+
+MAIN's records reach the simulator over TCP as `"CDJL"` + length + body, and
+the SPORT model keeps them in slots keyed by exact frame length, handing one
+over when the firmware arms a receive of that length. Two limits in that model
+were set from the records seen at the time, 64-byte status records and
+224-byte payloads: a frame longer than **512 bytes** was thrown away together
+with the whole staging buffer, and there were **eight** slots that were never
+freed. The first playlist's track list broke both. MAIN sends a track list as
+one 896-byte frame (its rows are UTF-16 titles), and every page of a track list
+has a different length. The QEMU side had the same 512-byte ceiling in its
+transmit path, and there it also swallowed the completion, which is why MAIN
+went silent for the rest of every run that opened a playlist
+(`runs/nxs-swap/twoboard-10-load`, 2026-09-02: the 896-byte answer announced in
+9 545 status records, never delivered).
+
+The ceiling is now 4096 bytes on both boards -- the firmware validates an
+announced payload against 1..2048 halfwords at `0xb7f8d2`, and the DMA model
+reads a receive in chunks of at most 4096 bytes, so that is the protocol's own
+limit -- there are sixteen slots, a slot whose ring has been read out is
+recycled for a new length (never the 64-byte slot, whose newest record the
+model repeats), and both losses say so once on stderr (`link: unusable frame
+length`, `link: no slot for a ...-byte frame`). `BFIN_LINK_RX_CENSUS` prints
+`recycled=` and `noslot=` with the rest. Behaviour for the lengths seen before
+is unchanged: same slot assignment in the same order, depth 1.
+
+One more rule came out of the same runs. A payload was handed over once and
+then refused as stale, because a payload is one transmission -- but MAIN's
+status record keeps announcing its last answer after it went over, the
+firmware arms the receive for it again, and on the wire a fetch poll brings
+that answer back. Refusing wedged the GUI in its boot-time browse loop in
+half the runs: `runs/nxs-swap/trackload-6-jogenter` armed the announced
+48-byte receive 45 277 times and was handed 42, with MAIN answering every
+poll with a status record, and the SD key never got past it. Now, while
+MAIN's own newest record announces exactly that length, the newest payload
+of the length is handed over again (`repeat_payload=` in the census);
+`BFIN_LINK_REPEAT_ANNOUNCED=0` restores the refusal.
+
 ### `sim/bfin/interp.c` — guest time on the wall clock
 
 Upstream ticks the event queue once per instruction (plus a few for slow

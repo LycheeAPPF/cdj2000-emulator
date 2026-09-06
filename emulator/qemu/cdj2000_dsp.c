@@ -98,6 +98,13 @@ typedef struct {
     QEMUTimer *tick;
     CdjDspModel *model;
 
+    /* The interrupt line to MAIN (cdj_dsp_event). */
+    qemu_irq irq;
+    CdjDspPendingFn pending;
+    void *pending_opaque;
+    bool event_raised;
+    uint64_t events;
+
     /* Reporting, so a run says what the DSP was asked for without a debugger. */
     bool trace;
     uint64_t transfers;
@@ -128,6 +135,9 @@ static uint64_t cdj_dsp_mailbox_read(void *opaque, hwaddr offset, unsigned size)
     if (dsp->trace) {
         fprintf(stderr, "cdj2000-dsp: mailbox read  +0x%04x = 0x%08x\n",
                 (unsigned)(DSP_MAILBOX_OFFSET + offset), (uint32_t)value);
+    }
+    if (DSP_MAILBOX_OFFSET + (offset & ~3ull) == CDJ_DSP_MAIL_UP && value) {
+        cdj_dsp_model_up_seen(dsp->model, dsp->ram, CDJ_DSP_WINDOW_SIZE);
     }
     return value;
 }
@@ -189,7 +199,55 @@ static void cdj_dsp_ctl_write(void *opaque, hwaddr offset, uint64_t value,
     if ((value & DSP_CTL_RUN) && !(dsp->ctl_value & DSP_CTL_RUN)) {
         cdj_dsp_model_reset(dsp->model, dsp->ram, CDJ_DSP_WINDOW_SIZE);
     }
+    /*
+     * The ACK bit is MAIN taking an event: the handler 0x1c09a0 and the poll
+     * 0x1c7ce4 both set it after reading the event word.  Any write with the
+     * bit set lowers the line -- not only a rising edge, because the bring-up
+     * leaves the bit set (0x1c745e) and MAIN's handler ORs it in again.
+     */
+    if ((value & DSP_CTL_ACK) && dsp->event_raised) {
+        dsp->event_raised = false;
+        if (dsp->pending) {
+            dsp->pending(dsp->pending_opaque, false);
+        }
+        qemu_set_irq(dsp->irq, 0);
+        if (dsp->trace) {
+            fprintf(stderr, "cdj2000-dsp: event acknowledged t=%.3f\n",
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+        }
+    }
     dsp->ctl_value = value;
+}
+
+void cdj_dsp_event(unsigned code)
+{
+    CdjDspState *dsp = cdj_dsp;
+    uint8_t *at;
+
+    if (!dsp) {
+        return;
+    }
+    at = dsp->ram + CDJ_DSP_MAIL_EVENT;
+    at[0] = 0;
+    at[1] = 0;
+    at[2] = (code >> 8) & 0xff;
+    at[3] = code & 0xff;
+    dsp->events++;
+    if (dsp->event_raised && dsp->trace) {
+        fprintf(stderr, "cdj2000-dsp: event 0x%04x posted while the previous "
+                "one is still pending\n", code);
+    }
+    dsp->event_raised = true;
+    if (dsp->pending) {
+        dsp->pending(dsp->pending_opaque, true);
+    }
+    qemu_set_irq(dsp->irq, 1);
+    if (dsp->trace) {
+        fprintf(stderr, "cdj2000-dsp: event 0x%04x posted (+0x%04x = %02x %02x "
+                "%02x %02x), #%" PRIu64 " t=%.3f\n", code, CDJ_DSP_MAIL_EVENT,
+                at[0], at[1], at[2], at[3], dsp->events,
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+    }
 }
 
 static const MemoryRegionOps cdj_dsp_ctl_ops = {
@@ -245,11 +303,15 @@ void cdj_dsp_transfer_done(hwaddr source, hwaddr destination, unsigned bytes)
     }
 }
 
-void cdj_dsp_init(MemoryRegion *system, Chardev *external)
+void cdj_dsp_init(MemoryRegion *system, Chardev *external, qemu_irq irq,
+                  CdjDspPendingFn pending, void *pending_opaque)
 {
     CdjDspState *dsp = g_new0(CdjDspState, 1);
 
     dsp->trace = getenv("CDJ_DSP_TRACE") != NULL;
+    dsp->irq = irq;
+    dsp->pending = pending;
+    dsp->pending_opaque = pending_opaque;
 
     memory_region_init_ram(&dsp->window, NULL, "cdj2000.dsp-window",
                            CDJ_DSP_WINDOW_SIZE, &error_fatal);
