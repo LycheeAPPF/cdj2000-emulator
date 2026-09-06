@@ -539,7 +539,19 @@ per second>` (while the slot state is 3 the DSP consumes: both fill levels
 +0x7cd0/+0x7ccc go down and the per-buffer status words +0x81a0/+0x8180 go
 up by that many units -- 40 units book one 9408-byte PCM transfer of 53.3 ms,
 so 750 is real time; trackload-67 measured that MAIN does not poll the
-levels: nothing happened until an event came), `CDJ_DMAC_TRACE` (every DMA start
+levels: nothing happened until an event came; since trackload-71 only
+buffer 1 is consumed), `CDJ_DSP_REFILL_EVENT=<code>` with
+`CDJ_DSP_REFILL_LOW` (default 20: post that event once whenever buffer 1's
+level falls under the mark -- trackload-71: MAIN answered class 0 code 1
+with a stop and E-8302 even before the buffer was empty, so class 0 is not
+the refill path while playing), `CDJ_DSP_STATUS_FLAGS=1` (raise the two
+buffer-active bits the stream worker reports to the player, +0x81ac bit 24
+and +0x818c bit 25, while the slot state is 3; trackload-73: no visible
+effect). What did hold: trackload-72 -- class-5 events with a fresh report
+number every 500 ms while playing (`CDJ_DSP_PLAY_EVENT=0x500
+CDJ_DSP_REPORT_ID=1 CDJ_DSP_CONSUME=750`) made MAIN stream buffer-1 data
+following the position in +0x81a0 every half second without an error; the
+deck position word and the time display still did not move), `CDJ_DMAC_TRACE` (every DMA start
 with channel, SAR, DAR, TCR, CHCR and role), `CDJ_SDHI_TRACE` (every SD
 command; walking the card image's FAT for the block addresses says which
 file a read was -- `runs/nxs-swap/trackload-39-final/fatmap.py` does that)

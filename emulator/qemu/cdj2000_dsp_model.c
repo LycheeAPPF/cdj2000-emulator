@@ -88,6 +88,11 @@ struct CdjDspModel {
     int64_t consume_carry_ms;
     int64_t consumed;                   /* total units taken since PLAY */
     int64_t consume_report_ns;
+    bool status_flags;                  /* CDJ_DSP_STATUS_FLAGS: buffer-active bits while playing */
+    bool status_flags_set;
+    unsigned refill_event;              /* CDJ_DSP_REFILL_EVENT: posted when buffer 1 runs low */
+    int32_t refill_low;                 /* CDJ_DSP_REFILL_LOW: the level that asks for more */
+    bool refill_asked;                  /* posted for the current dip already */
 
     /* CDJ_DSP_EVENT_PROBE: post event codes to MAIN on a schedule. */
     int64_t probe_start_ns;
@@ -242,6 +247,30 @@ CdjDspModel *cdj_dsp_model_new(Chardev *external)
      */
     model->consume_rate = getenv("CDJ_DSP_CONSUME")
         ? strtol(getenv("CDJ_DSP_CONSUME"), NULL, 0) : 0;
+    /*
+     * trackload-69/70: every class-0 event code (1, 2, 3, 5, 6, 7, 10) while
+     * playing got the same answer from MAIN -- +0x7cb0 = 2 with the record of
+     * slot <param>, then a 0x03000100 data header for buffer 1 whose offset
+     * word followed the model's +0x81a0 count exactly (0x1daf ten seconds
+     * after PLAY at 750 a second, 0x4227 at twenty-two), then +0x7ba0 = 2, 1.
+     * So the DSP's per-buffer status word IS the play position MAIN streams
+     * from, and a class-0 event is "buffer <param> wants data".  Both runs
+     * ended in an error stop (E-8302 C611) -- with buffer 1 already at level
+     * 0, an underrun.  Hence: consume from buffer 1 only, and ask before it
+     * is empty.
+     */
+    /*
+     * The stream worker's load-state handler 0x1aaf28 answers the player
+     * with four bytes built from the two fill levels and two flag bits it
+     * reads next to them: byte 3 of +0x818c bit 1 (buffer 2) and byte 3 of
+     * +0x81ac bit 0 (buffer 1).  Nothing in the model ever set them.  With
+     * CDJ_DSP_STATUS_FLAGS the bits are up while the slot state is 3.
+     */
+    model->status_flags = getenv("CDJ_DSP_STATUS_FLAGS") != NULL;
+    model->refill_event = getenv("CDJ_DSP_REFILL_EVENT")
+        ? (unsigned)strtoul(getenv("CDJ_DSP_REFILL_EVENT"), NULL, 0) : 0;
+    model->refill_low = getenv("CDJ_DSP_REFILL_LOW")
+        ? (int32_t)strtol(getenv("CDJ_DSP_REFILL_LOW"), NULL, 0) : 20;
     model->slot_period_ns = (int64_t)(getenv("CDJ_DSP_SLOT_PERIOD_MS")
         ? strtol(getenv("CDJ_DSP_SLOT_PERIOD_MS"), NULL, 0) : 500) * 1000000;
     /*
@@ -817,6 +846,19 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
         model->slot_last_ns = now;
         cdj_dsp_model_slot_report(model, window, length, 3, now);
     }
+    if (model->status_flags && window && length >= 0x81b0) {
+        bool playing = model->slot_state == 3;
+
+        if (playing != model->status_flags_set) {
+            uint32_t b1 = ldl_le_p(window + 0x81ac), b2 = ldl_le_p(window + 0x818c);
+
+            stl_le_p(window + 0x81ac, playing ? (b1 | (1u << 24)) : (b1 & ~(1u << 24)));
+            stl_le_p(window + 0x818c, playing ? (b2 | (1u << 25)) : (b2 & ~(1u << 25)));
+            model->status_flags_set = playing;
+            fprintf(stderr, "cdj2000-dsp: buffer status flags %s (+0x81ac bit 24, "
+                    "+0x818c bit 25) t=%.3f\n", playing ? "set" : "cleared", now / 1e9);
+        }
+    }
     if (model->consume_rate > 0 && model->slot_state == 3 && elapsed_ms > 0
         && window && length >= 0x81a8) {
         int64_t units;
@@ -824,18 +866,22 @@ void cdj_dsp_model_tick(CdjDspModel *model, uint8_t *window, size_t length)
         model->consume_carry_ms += elapsed_ms;
         units = model->consume_carry_ms * model->consume_rate / 1000;
         if (units > 0) {
-            static const unsigned levels[] = { DSP_LEVEL_BUFFER1, DSP_LEVEL_BUFFER2 };
-            static const unsigned status[] = { 0x81a0, 0x8180 };
-            unsigned i;
+            int32_t level = (int32_t)ldl_le_p(window + DSP_LEVEL_BUFFER1);
 
             model->consume_carry_ms -= units * 1000 / model->consume_rate;
-            for (i = 0; i < 2; i++) {
-                int32_t level = (int32_t)ldl_le_p(window + levels[i]);
-
-                stl_le_p(window + levels[i], level > units ? level - units : 0);
-                stl_le_p(window + status[i], ldl_le_p(window + status[i]) + units);
-            }
+            level = level > units ? level - units : 0;
+            stl_le_p(window + DSP_LEVEL_BUFFER1, level);
+            stl_le_p(window + 0x81a0, ldl_le_p(window + 0x81a0) + units);
             model->consumed += units;
+            if (model->refill_event && level < model->refill_low
+                && !model->refill_asked) {
+                model->refill_asked = true;
+                fprintf(stderr, "cdj2000-dsp: buffer 1 at %d, asking with event "
+                        "0x%x t=%.3f\n", level, model->refill_event, now / 1e9);
+                cdj_dsp_model_post(model, window, length, model->refill_event, now);
+            } else if (level >= model->refill_low) {
+                model->refill_asked = false;
+            }
             if (now - model->consume_report_ns >= 5 * 1000000000LL) {
                 model->consume_report_ns = now;
                 fprintf(stderr, "cdj2000-dsp: consumed %" PRId64 " units so far; "
