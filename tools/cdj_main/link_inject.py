@@ -217,13 +217,19 @@ class MarkerFeed:
         self.sent = 0
         self.done = False
         self.waveform: bytes = b""
-        self.waveform_fields = (1, 0)       # command 0x20 words 5/6, the PWV3 descriptor's
+        self.waveform_fields = None         # command 0x20 words 5/6: the track length as the
         self.last_status: bytes = b""       # MAIN's latest 64-byte record, prefix applied
         self.elapsed = 0.0
         self.pace = 0                       # typed requests seen during the transfer
         self.hidden = 0                     # MAIN announcements cleared during transfers
 
-    def build(self, length_ms: int) -> None:
+    def build(self, length_ms: int, length_words: tuple[int, int] = (0, 0)) -> None:
+        """Build the parts for a track of LENGTH_MS; LENGTH_WORDS are the status
+        record's words 7/8, which the detail waveform's first part must repeat
+        in its words 5/6 -- the GUI's widget handler 0x00d2e8e8 sets the
+        readiness word 0x00cd3694 the draw gate 0x00d2f418 waits for only when
+        minutes, seconds and (within 2) frames match the record (trackload-121:
+        both consumers ran, nothing drew, with 1/0 there)."""
         records: list[tuple[int, int, int]] = []
         for bpm, offset, kind, bar in self.beats:
             period = 60000.0 / bpm
@@ -239,7 +245,7 @@ class MarkerFeed:
         records.sort()
         self.queues = {}
         if self.waveform:
-            self.queues[0x20] = waveform_parts(self.waveform, self.waveform_fields)
+            self.queues[0x20] = waveform_parts(self.waveform, self.waveform_fields or length_words)
         self.queues[0x21] = marker_parts([marker_record(k, t) for t, k, _ in records])
         self.parts = [p for q in self.queues.values() for p in q]
         self.length_ms = length_ms
@@ -278,7 +284,7 @@ class MarkerFeed:
             length = minutes * 60000 + (second >> 8) * 1000 + (second & 0xff) * 1000 // 150
             if length <= 0:
                 return None
-            self.build(length)
+            self.build(length, (minutes, second))
         if not self.queues.get(command) or not self.last_status:
             return None
         if self.requested != command:
@@ -653,7 +659,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--nxs-waveform", metavar="FILE[:W5[:W6]]",
                         help="PWV3 entries to send as the command-0x20 detail waveform before "
                              "the markers (needs --nxs-markers, even an empty 'at:0'); W5/W6 "
-                             "are the two descriptor words of the first part (default 1 and 0)")
+                             "are the two descriptor words of the first part (default: the "
+                             "record's length words 7/8, which the GUI's readiness check wants)")
     parser.add_argument("--nxs-markers", metavar="SPEC",
                         help="deliver command-0x21 marker payloads: beat:BPM[:OFFSET_MS[:TYPE"
                              "[:BAR_TYPE]]],cue:MS:TYPE,...,at:SECONDS (see the module docstring)")

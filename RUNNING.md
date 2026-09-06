@@ -378,7 +378,11 @@ python -m tools.cdj_main.twoboard NAME --card CARD --keys keys.txt \
 
 and a keys file with `200 press 20.0` (BROWSE) before `230 press 16.0`
 (PLAY), MAIN 4.33 plus the proxy drive every visible element of the NXS
-phase meter.
+phase meter.  There is no finer phase than the beat in that record: the
+meter's lit segment is the beat in the bar (word 1 bits 14..12), the
+countdowns are the two bars.beat counters, and the GUI has no field for the
+position within the beat -- when the proxy also sends a beat grid
+(`--nxs-markers beat:BPM`), it aligns the beat it announces to that grid.
 
 The beat grid and the cue markers on the waveform are two more payloads the
 NXS MAIN sends and MAIN 4.33 does not: command 0x20, the detail waveform
@@ -405,7 +409,18 @@ saw every third part, trackload-103/105).  Drawing the detail waveform is
 gated on the record as well (0x00d2f418): word 18 bits 5..3, the source,
 must be neither 0 nor 4, and MAIN 4.33 sends 0 -- `--status-word
 18=0x08/0x38` supplies a 1.
-trackload-120/121: with the answers passing, the GUI takes all 34 detail-waveform parts and both marker parts, runs the consumers 0x00d2f51c (0x73c3 bytes) and 0x00d2c118 (0x674 bytes = 413 records) once each and asks for nothing more -- but draws neither: the draw gate 0x00d2f418 is never called (no code reference to it in the image; the widget handle DAT_00cd368c comes from its own factory), so the path from the filled tables to the screen is the open question.
+trackload-120/121: with the answers passing, the GUI takes all 34
+detail-waveform parts and both marker parts and runs the consumers
+0x00d2f51c (0x73c3 bytes) and 0x00d2c118 (0x674 bytes = 413 records)
+once each -- and still drew nothing, because the draw gate 0x00d2f418
+(called from the GUI task's loop 0x00cfd378) waits for a readiness word
+(0x00cd3694) that the widget handler 0x00d2e8e8 sets on the
+"detail waveform complete" message only if the first part's words 5/6
+repeat the track length of the status record's words 7/8 (minutes,
+seconds, frames within 2).  The proxy now copies those words in by
+default, and trackload-122 draws it all: the detail waveform with the
+beat grid's ticks scrolling under the play head, the cue point's marker
+on it, the memory-cue triangles on the overview (`result-overview.png`).
 
 The DSP model's transport, from MAIN's writes into the window
 (`CDJ_DSP_TRACE`, trackload-96..118) and the DSP task that makes them
