@@ -119,7 +119,10 @@ Be clear about this: **the player is not usable as a player.**
   receive task read the injected LOAD twice ("MusicID多重要求"). Frames now
   go into MAIN's buffer no closer than 2 ms apart (`CDJ_LINK_RX_GAP_US`),
   which is how the wire spaces them; `tools/cdj_main/twoboard.py` runs the
-  whole recipe into a fresh run directory; `tools/cdj_main/link_exchanges.py`
+  whole recipe into a fresh run directory; the time display runs when the
+  deck's position word is driven from the board (`CDJ_MAIN_POKE=...=0/75@T`,
+  see RUNNING.md), the DSP's own report of it is still unmodelled;
+  `tools/cdj_main/link_exchanges.py`
   counts the back-to-back deliveries a run still has.
 * **No audio at all.** The DSP (a Pioneer custom LSI, D710E001, with no
   public instruction set) is modelled from MAIN's side: it takes the request

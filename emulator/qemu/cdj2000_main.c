@@ -3010,6 +3010,14 @@ static void cdj_debug_console_write(hwaddr address, uint32_t value)
  *   CDJ_MAIN_POKE_AT=<virtual seconds before the first write, default 60>
  *   CDJ_MAIN_POKE_EVERY_MS=<rewrite interval, default 100; 0 writes once>
  *
+ * An entry may be ADDR=VALUE/RATE[@AT]: RATE is added per second of guest
+ * time from that entry's own start second AT (default the global one), so
+ * the word advances instead of being held -- 0x4832214=0/75@230 makes the
+ * deck's position word (trackload-64/65: the status record's time fields
+ * come from it, in CD sectors, -1 = blank) count 75 a second from PLAY at
+ * 230 s.  That stands in for the DSP's position report, whose form is still
+ * open (trackload-55..82), and proves the chain to the GUI's time display.
+ *
  * Addresses are physical, as everywhere else in this file, and the values are
  * 32-bit little-endian — the width of MAIN's one-shot flags and state words.
  * This is a diagnostic: nothing here runs unless the variable is set.
@@ -3019,6 +3027,8 @@ static void cdj_debug_console_write(hwaddr address, uint32_t value)
 typedef struct CdjMainPoke {
     hwaddr address[CDJ_MAIN_POKE_MAX];
     uint32_t value[CDJ_MAIN_POKE_MAX];
+    int64_t rate[CDJ_MAIN_POKE_MAX];        /* added per second, 0 = hold */
+    int64_t start_ns[CDJ_MAIN_POKE_MAX];    /* this entry's first write */
     unsigned count;
     uint64_t period_ns;
     QEMUTimer *timer;
@@ -3027,11 +3037,20 @@ typedef struct CdjMainPoke {
 static void cdj_main_poke_fire(void *opaque)
 {
     CdjMainPoke *poke = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     unsigned i;
 
     for (i = 0; i < poke->count; i++) {
-        uint32_t word = cpu_to_le32(poke->value[i]);
+        uint32_t value = poke->value[i];
+        uint32_t word;
 
+        if (now < poke->start_ns[i]) {
+            continue;
+        }
+        if (poke->rate[i]) {
+            value += (uint32_t)(poke->rate[i] * ((now - poke->start_ns[i]) / SCALE_MS) / 1000);
+        }
+        word = cpu_to_le32(value);
         address_space_write(&address_space_memory, poke->address[i],
                             MEMTXATTRS_UNSPECIFIED, &word, sizeof(word));
     }
@@ -3063,9 +3082,15 @@ static void cdj_main_poke_init(void)
         if (!equals) {
             continue;
         }
+        char *slash = strchr(equals + 1, '/');
+        char *atsign = strchr(equals + 1, '@');
+
         *equals = '\0';
         poke->address[poke->count] = strtoull(token, NULL, 0);
         poke->value[poke->count] = strtoul(equals + 1, NULL, 0);
+        poke->rate[poke->count] = slash ? strtoll(slash + 1, NULL, 0) : 0;
+        poke->start_ns[poke->count] = atsign
+            ? (int64_t)strtoull(atsign + 1, NULL, 0) * NANOSECONDS_PER_SECOND : -1;
         poke->count++;
     }
     g_free(copy);
@@ -3074,6 +3099,15 @@ static void cdj_main_poke_init(void)
         return;
     }
     seconds = at ? strtoull(at, NULL, 0) : 60;
+    {
+        unsigned i;
+
+        for (i = 0; i < poke->count; i++) {
+            if (poke->start_ns[i] < 0) {
+                poke->start_ns[i] = (int64_t)seconds * NANOSECONDS_PER_SECOND;
+            }
+        }
+    }
     period_ms = every ? strtoull(every, NULL, 0) : 100;
     poke->period_ns = period_ms * SCALE_MS;
     poke->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_main_poke_fire, poke);

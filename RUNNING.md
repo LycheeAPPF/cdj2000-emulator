@@ -398,9 +398,22 @@ written by the decoder task's state-3/4 handler, which only the stream
 worker's state-1 handler commands, which only two player paths request --
 the second load variant (taken when the deck's word X+416 is 1 at load
 time) and the play handler when X+408 is 6. The emulator's load leaves
-X+416 at 0 and PLAY sets X+408 to 4, so neither path runs (trackload-74..76).
-What sets those words on the device -- a CUE before PLAY is the candidate --
-is the open question. There is no audio path.
+X+416 at 0 and PLAY sets X+408 to 4, so neither path runs (trackload-74..76;
+X+416 = 1 turns out to be needle search, trackload-78). What the DSP does on
+the device to feed that chain is the open question. Until it is answered the
+position word can be driven from the board instead:
+
+```
+CDJ_MAIN_POKE=0x5355fa8=1,0x4832214=0/75@232 CDJ_MAIN_POKE_AT=75 CDJ_MAIN_POKE_EVERY_MS=100
+```
+
+`ADDR=VALUE/RATE@AT` adds RATE per second of guest time from second AT, so
+the deck's position word counts CD sectors from a PLAY at 230 s. trackload-83:
+the status record's time words leave 0xbbbb the moment the poke starts, the
+GUI shows 00M:07S at 240 s, 00M:33S at 265 s, 01M:03S at 295 s -- real time
+-- and the waveform cursor moves with it. That is a stand-in for the DSP's
+report, not a model of it, and it says nothing about beat grid or phase
+meter, which need the real report's other fields. There is no audio path.
 
 **The update file is not what the emulator boots.** The board loads
 `firmware/main-unpacked.bin` -- the address-zero flash image, decoded from
