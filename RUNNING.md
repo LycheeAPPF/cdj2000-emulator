@@ -357,8 +357,8 @@ go through `twoboard --proxy-arg=...`. trackload-89/90: the words reach the
 GUI (the dump shows them) and nothing on the screen changes, in any of five
 variants of mode, state and counters. trackload-91 probed three other record words as the layout switch: word 18 bits 5..3 = 4 changed nothing, word 19 bit 14 blanked the overview waveform, word 13 = 2 (the decoder's link-player path) froze the time display and corrupted the frame -- none opened the beat layout. The widgets those
 setters address are not in the screen the GUI shows after a load (the
-revival's registry calls it screen 0, `performance`: list on top, deck
-strip below; `codex/evidence/static-re/nxs-v144/screen_registry.tsv`).
+GUI's own screen registry calls it screen 0, `performance`: list on top,
+deck strip below).
 The simulator's call watch (`BFIN_CALL_WATCH=<pc>,...`, trackload-92/93)
 showed the orchestrator 0x00d2d80c never running there: its event 0x10016
 reaches screen 0's own dispatcher 0x00d3a97c, and the beat setters belong
@@ -464,10 +464,11 @@ Two tool limits met on the way: gdb write watchpoints on the DSP window
 (`--trace w:0xac0c7c9c:4`, the uncached alias MAIN uses -- the physical
 0x0c0c.... never fires) slow MAIN to a fifth once the streaming loop
 touches the window (trackload-118), and `BFIN_PEEK_WATCH` on a byte
-address double-faults the NXS GUI at boot (trackload-115/116). The 2000 MAIN's patch list for the beat part is the NXS
-producer set the revival named `NXS_MAIN_StatusSource_*`
-(`main-closure-review-c-port-classes.tsv`, class TRANSPLANT_NXS); the
-proxy is the stand-in until it exists.
+address double-faults the NXS GUI at boot (trackload-115/116).
+
+The 2000 MAIN's patch list for the beat part is the NXS MAIN's set of
+status-source producers (the functions that feed its status builder
+0xa425ca0c); the proxy is the stand-in until it exists.
 
 The load itself is a handshake with the audio DSP, and the built-in DSP
 model answers it only with `CDJ_DSP_ACK=1` (off by default; see the comments
@@ -566,8 +567,8 @@ checksums, a little-endian CRC-16/XMODEM trailer over the container, the two
 LZSS-packed application regions at 0x10000 and 0x40000 with their additive
 checksums, and the model/version header at image offset 0x700 (`PIONEER`,
 `CDJ-2000`, `4.33`, `20150209`). `main_unpack` verifies the first three on the
-way in; the CDJ2000-revival repository's `build_main_patch.py` re-emits all of
-them and refuses to patch unless the stock file round-trips byte for byte. The
+way in; a patcher for that file has to re-emit all of them, and should refuse
+to patch unless the stock file round-trips byte for byte first. The
 updater task that reads the file (`UpDtae_TASK`, "*** Update END ! ***") lives
 in the application image but names no file -- the 4.33 image contains neither
 `.UPD` nor `C2K` in any encoding -- so its trigger and its medium handling are

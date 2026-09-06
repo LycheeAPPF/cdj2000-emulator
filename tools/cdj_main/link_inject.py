@@ -32,8 +32,8 @@ So from the library screen (current list = the categories, PLAYLIST first):
 enter 0 (the playlist root), enter 0 (the first folder), enter 0 (its first
 playlist: the track list), load 0 (its first track).
 
-The request format and checksum come from CDJ2000-revival
-``codex/tools/main_link_proxy.py``, which injected the load alone.
+The request format and checksum are the GUI's own (``main_packet.py``);
+an earlier stand-alone proxy injected the load alone.
 
 ``--nxs-prefix`` rewrites the other direction.  The NXS MAIN fills status
 record words 1 and 2 with the beat display's bitfields (its builder at
