@@ -2,46 +2,15 @@
 
 An emulator for the Pioneer CDJ-2000 that runs the player's own firmware.
 
-Not a mock-up: the CDJ-2000 has two processors, and this emulates both of them.
-The SH-4 that runs the player boots on a QEMU machine written for it; the
-Blackfin BF531 that paints the display boots on GNU's Blackfin simulator; the
-two talk to each other over the same serial link they use on real hardware.
-Every pixel on the screen is drawn by Pioneer's code, and every button press
-travels the path a real press travels.
+The CDJ-2000 has two processors, and this emulates both. The SH-4 that runs
+the player boots on a QEMU machine written for it; the Blackfin BF531 that
+paints the display boots on GNU's Blackfin simulator, patched; the two talk
+over the same serial link they use on the real board. Every pixel is drawn by
+Pioneer's code, and every button press travels the path a real press travels.
 
-## Read this first
-
-**This is a developer tool, and it is barebones.** It exists as a foundation for
-firmware modding and reverse engineering — somewhere to run a change and see
-what the machine does with it, without risking a real player. It is not a way to
-use a CDJ-2000 on your desktop, and it will not become one by itself.
-
-Three things to expect before you build anything:
-
-- **It is slower than the real thing, but not by much any more.** Measured
-  here on an i7-13700H: the Pioneer logo at about 20 s, the player screen with
-  `NO DISC` -- the handshake with MAIN complete -- at about 35 s of wall clock.
-  Before the speed work of September 2026 the same run showed the `Wait`
-  spinner still at 150 s; the player screen now comes at 28-34 s. MAIN's
-  RTOS tick runs at its real 1000 Hz;
-  what remains is MAIN's own boot sequence and its device time-outs, which
-  are real firmware time-outs. See "Speed" in RUNNING.md for the numbers and
-  the knobs.
-- **It can still die at `0x00b99196`.** The GUI board's long-standing double
-  fault is a link race: the interpreter is still thirty times slower than the
-  real chip on real work, an announcement-plus-payload transaction takes it
-  longer than MAIN's status interval, and the next plain record lands on the
-  validated announcement. The launchers now run the simulator with
-  `BFIN_LINK_ANNOUNCE_STICKY=1`, which carries the announcement over until the
-  payload has gone through: measured on the wall-clock time base, four of six
-  90 s boots faulted without it and none of three with it. Three runs is a
-  small sample; if the panel freezes and the launcher reports `simulator
-  exited with code 1`, that is what happened, and the fault line is in the
-  simulator's log.
-- **Almost nothing is finished past booting.** See "What does not" below. If you
-  need a working player, this is the wrong repository.
-
-If you are here to build on it, that is exactly what it is for.
+**It is a developer tool for firmware modding and reverse engineering**, a
+place to run a change and watch what the machine does with it without risking
+a player. It is not a way to use a CDJ-2000 on a desktop.
 
 ```
     ┌─────────────────────┐  serial link   ┌────────────────────────┐
@@ -51,7 +20,6 @@ If you are here to build on it, that is exactly what it is for.
     │  panel, SD, ATAPI,  │                │  SPORT, DMA, CFI flash │
     │  USB, audio DSP     │                │                        │
     └──────────┬──────────┘                └───────────┬────────────┘
-               │                                       │
                │  TCP control channel                  │  framebuffer
                ▼                                       ▼
          panel_control                            the window
@@ -59,104 +27,55 @@ If you are here to build on it, that is exactly what it is for.
 
 ## What works
 
-* Both boards boot their stock firmware and complete their startup handshake:
-  MAIN's panel handshake publishes an operating mode, the GUI link comes up, and
-  the record stream runs.
-* The panel is drawn: 480x234, RGB555, cropped out of the 255 lines the display
-  DMA actually emits. The boot splash animates, and a run that gets far enough
-  reaches the player screen with `PLAYER`, `TRACK`, `REMAIN`, `TEMPO` and `BPM`.
-* All **48 inputs** the board decodes are reachable from the host — 40 button
-  bits and 8 analogue fields, including the rotary encoder. A press travels the
-  real path: merged into the panel payload before the checksum, as an edge, and
-  MAIN's own service-mode name table is what says which bit is which key. The
-  window refuses to start if any input has no control.
-* Devices are modelled far enough to clear the caution banners: the disc drive
-  (`E-7001`), the audio DSP (`E-7010`) and the USB device (`E-7020`) all report
-  up.
-* MAIN's own service monitor is reachable over the emulated debug serial port,
-  and its caution store can be read back and decoded, so the machine can be
-  asked what it thinks rather than guessed at.
-* An SD card image is accepted by the card controller and the guest reads
-  sectors from it, and with `--sd card.img` the card is the source from the
-  start: its library -- categories, folders, playlists from the rekordbox
-  export -- is on the screen with the player screen, at 33-35 s. Switching
-  to it later, from another source, mostly is not (see "Switching to a
-  medium" in RUNNING.md). Opening a playlist and loading a track from it
-  works when the requests are injected on the link (see "Loading a track"
-  in RUNNING.md).
+* Both boards boot their stock firmware (MAIN 4.33, GUI 4.20 or the NXS 1.44
+  image), complete their handshake and reach the player screen in about 30 s
+  of wall clock. MAIN's RTOS tick runs at its real 1000 Hz.
+* The panel is drawn at 480x234 from the display DMA, and all 48 inputs the
+  board decodes -- 40 buttons and 8 analogue fields, rotary encoder included --
+  are driven from the host through the real panel path. MAIN's own service-mode
+  name table says which bit is which key (`INPUT_MANIFEST.md`).
+* The disc drive, the audio DSP and the USB device report up, so no caution
+  banner stands in the way; MAIN's service monitor and caution store are
+  readable over the emulated debug port.
+* An SD card image with a rekordbox export is the library: categories,
+  playlists and track lists on screen, a track loaded with its overview
+  waveform, detail waveform, beat grid, cue markers, duration, BPM and key,
+  and a time display that runs from PLAY (`tools/cdj_main/twoboard.py` runs
+  that recipe into a fresh run directory).
+* The DSP model answers the load handshake, keeps the position report,
+  locates, loops on the beat, and raises events on its interrupt line.
+* A USB stick is a disk image on the SoC's USB host module. With the two
+  update keys held at power-on, MAIN's updater takes a `C2KMAIN.UPD` from it
+  and rewrites the flash model; the boot ROM's recovery path (the loader at
+  flash 0x10000, run when the application checksum fails) does the same; and
+  with the GUI board on the link a `C2KGUI.UPD` is streamed to it, checked,
+  erased and programmed into the simulator's flash, dumped afterwards for
+  comparison. `tools/cdj_main/make_upd.py` builds a MAIN update file from any
+  flash image. See "A firmware update" in RUNNING.md.
 
 ## What does not
 
-Be clear about this: **the player is not usable as a player.**
-
-* **The GUI board double-faults.** Intermittent, at `0x00b99196`, typically
-  after one to three minutes. The panel stops updating and the launcher says
-  `simulator exited with code 1`. Run it again, and keep the machine quiet
-  while you do -- see the note above.
-* **Speed.** Tens of seconds, not seconds. A boot to the idle player screen
-  costs 28-36 s; the GUI board runs on the wall clock and sleeps when the
-  firmware idles, so the host is mostly free while it waits.
-* **Switching sources after boot.** A source with nothing in it shows the
-  `Wait` platter and stays there. Switching to the card from a running
-  machine brings its library in 0.6-2.6 s in six runs of eight; in the
-  others MAIN answers the GUI's polls with a stale browse answer and the GUI
-  never learns of the key (see "Switching to a medium" in RUNNING.md). Give
-  a freshly inserted card ~25 s before its key. The card at launch is seven
-  of seven.
-* **A track loads, but does not play.** The library lists come from the
-  card, a playlist's track list with them (896-byte link frames, the ceiling
-  was 512), and a load request brings the track up as TRACK 01 with its
-  overview waveform, duration, BPM and key -- driven by injecting the browse
-  and load requests with `tools/cdj_main/link_inject.py` (which can also
-  rewrite MAIN's status records: `--nxs-prefix` fills the NXS beat fields, and
-  after the BROWSE key the NXS GUI's phase meter and beat countdowns draw
-  them; `--nxs-waveform` and `--nxs-markers` answer the GUI's requests for
-  the detail waveform and the beat/cue markers; `--status-word`), because no key of
-  the NXS GUI has been found that sends the "enter" request. With
-  `CDJ_DSP_ACK=1` the DSP model also answers the load's handshake, MAIN
-  streams the whole file into the DSP window over DMAC channel 5 (the
-  player loads a track into the DSP's 32 MB SDRAM) and reports the load
-  complete; the time display stays blank because the DSP's position report
-  is not modelled, and there is no audio path, so PLAY changes nothing
-  audible. The recipe used to fail one run in four: the board handed the
-  GUI's frames to MAIN in bursts, two of them 0.1 ms apart, and MAIN's
-  receive task read the injected LOAD twice ("MusicID多重要求"). Frames now
-  go into MAIN's buffer no closer than 2 ms apart (`CDJ_LINK_RX_GAP_US`),
-  which is how the wire spaces them; `tools/cdj_main/twoboard.py` runs the
-  whole recipe into a fresh run directory; with `CDJ_DSP_POSITION=1` the DSP
-  model keeps the position report block MAIN reads every tick, so the time
-  display and the waveform cursor run from PLAY with the track's real length
-  (nominal speed only; pitch, jog, cue and loop not modelled yet, see
-  RUNNING.md); `tools/cdj_main/link_exchanges.py`
-  counts the back-to-back deliveries a run still has.
-* **No audio at all.** The DSP (a Pioneer custom LSI, D710E001, with no
-  public instruction set) is modelled from MAIN's side: it takes the request
-  words MAIN polls and keeps two buffer levels, and has no signal path.
-* A USB stick is a disk image on the SoC's own USB host module
-  (`boot_vm --usb-stick IMAGE`, QEMU's `usb-storage`): MAIN enumerates it,
-  mounts its FAT32 and reads it, and with the two update keys held at power-on
-  its updater takes a `C2KMAIN.UPD` from the stick's root and rewrites the
-  flash model -- `tools/cdj_main/make_upd.py` builds such a file from any
-  flash image. The recovery path works too: with a damaged application the
-  boot ROM runs the loader, which rewrites the application from the same
-  stick with the same keys. Two boards on the link in that mode also update
-  the GUI: MAIN streams a `C2KGUI.UPD` in 2 KiB link records and the 2000 GUI
-  firmware checks it, erases and programs its flash model. See "A firmware
-  update" in RUNNING.md. No host passthrough of a real stick, and the USB
-  source in the browser has not been exercised.
+* **No audio.** The DSP (a Pioneer custom LSI with no public instruction set)
+  is modelled from MAIN's side only: request words, buffer levels, position.
+  There is no signal path, and PLAY changes nothing audible.
+* **No jog**, no pitch. The position report runs at nominal speed.
+* The detail waveform and beat grid reach the GUI through the link proxy
+  (`tools/cdj_main/link_inject.py`), which also injects the browse and load
+  requests: no key of the NXS GUI has been found that sends "enter".
+* Switching sources after boot is unreliable (six of eight); the card given at
+  launch is reliable. The USB stick as a music source has not been tried.
+* The GUI simulator is about thirty times slower than the chip on real work,
+  and the live link has intermittent stalls and, rarely, a double fault. Run
+  it again; the fault line is in the simulator's log.
 * No link between players.
-
-Most inputs, measured properly against a control run, are proven no-ops on the
-screens reached so far. `INPUT_MANIFEST.md` says which, in which run, and how it
-was measured.
 
 ## Firmware is not included
 
-**This repository contains no Pioneer firmware and never will.** You supply your
-own copy of the firmware update — the manufacturer distributes it free to
-owners — and the extractors here turn it into the boot images the two emulators
-load. See [FIRMWARE.md](FIRMWARE.md). Nothing in this tree is derived from
-Pioneer's code: no images, no disassembly, no screenshots.
+**This repository contains no Pioneer firmware and never will.** You supply
+your own copy of the firmware update, which the manufacturer distributes free
+to owners, and the extractors turn it into the images the emulators load. See
+[FIRMWARE.md](FIRMWARE.md). Nothing here is derived from Pioneer's code: no
+images, no disassembly, no screenshots.
 
 ## Getting started
 
@@ -165,55 +84,41 @@ pip install -r requirements.txt
 sh scripts/build-bfin-sim.sh                                   # the GUI board
 git clone --depth 1 https://gitlab.com/qemu-project/qemu.git /c/qemu-src
 sh scripts/build-qemu-sh4.sh /c/qemu-src                       # the MAIN board
-# ... put C2KGUI.UPD and C2KMAIN.UPD in firmware/, then:
+# put C2KGUI.UPD and C2KMAIN.UPD in firmware/, then:
 python -m tools.cdj_gui.extract     firmware/C2KGUI.UPD  firmware
 python -m tools.cdj_gui.main_unpack firmware/C2KMAIN.UPD firmware
 python -m tools.cdj_main.view_vm
 ```
 
-Then wait. See the note on speed above.
+[BUILD.md](BUILD.md) has the platform notes. [RUNNING.md](RUNNING.md) has
+everything you can do once it boots: the environment knobs, the two-board
+recipe, the speed numbers, the update procedure, and the measurements behind
+each claim above.
 
-[BUILD.md](BUILD.md) has the details and the platform notes.
-[RUNNING.md](RUNNING.md) has everything you can do once it boots.
+## One rule about the UI
 
-## One rule worth knowing before you touch the UI
-
-Only the inner rectangle is the 480x234 panel. `BROWSE` / `TAG LIST` / `INFO` /
-`MENU` across the top and `LINK` / `USB` / `SD` / `DISC` down the left are
-**hardware buttons** — backlit plastic on the real player, appearing in no frame
-the firmware draws. They are not list rows; a browse list containing them is
-invented content.
-
-So the virtual buttons belong **beside** the panel image, never drawn into it. A
-control painted onto the LCD is a claim about what the firmware rendered, and it
-is a false one. `tests/test_panel_layout.py` enforces both halves: that the
-captured frame is passed through untouched apart from cutting the blanking rows,
-and that the picture occupies a grid cell no button block shares.
-
-This is the commonest mistake in the project and it has cost real work twice.
+Only the inner rectangle is the 480x234 panel. `BROWSE` / `TAG LIST` / `INFO`
+/ `MENU` and `LINK` / `USB` / `SD` / `DISC` are hardware buttons, backlit
+plastic that appears in no frame the firmware draws. Virtual buttons belong
+beside the panel image, never in it; `tests/test_panel_layout.py` enforces
+that the captured frame is shown untouched.
 
 ## Layout
 
 | path | what |
 |---|---|
-| `emulator/qemu/` | the SH-4 MAIN board: machine, panel, link, SD, ATAPI, USB, DSP |
+| `emulator/qemu/` | the SH-4 MAIN board: machine, panel, link, SD, ATAPI, USB host, DSP |
 | `emulator/*.hw` | GNU sim board descriptions for the Blackfin side |
 | `patches/` | what has to change in QEMU and in GDB's simulator, and why |
-| `tools/cdj_main/` | launchers, panel control, the service monitor, card images |
-| `tools/cdj_gui/` | the viewer, the firmware extractors, stimulus generators |
+| `tools/cdj_main/` | launchers, panel control, the two-board recipe, card and update images |
+| `tools/cdj_gui/` | the viewer, the firmware extractors, link decoders, stimulus generators |
 | `tests/` | the host-side test suite; most of it needs no emulator |
 | `INPUT_MANIFEST.md` | all 48 inputs, what was done with each, what was measured |
 
-## The patches are the interesting part
-
-`patches/README.md` is worth reading on its own. Four omissions in QEMU's SH-4
-interrupt handling are invisible to Linux and fatal to a uITRON RTOS that masks
-with `SR.IMASK`; without them this firmware never survives its first timer tick.
-On the Blackfin side, one packed-ALU instruction committed its result a cycle
-early, which made a parallel store write the wrong value and sent the firmware
-into a fatal loop — and GNU sim's CFI flash model has no AMD command set, which
-is the part the CDJ's flash actually speaks. Each patch says what was measured
-before and after.
+`patches/README.md` is worth reading on its own: four omissions in QEMU's SH-4
+interrupt handling that are invisible to Linux and fatal to a uITRON RTOS, a
+Blackfin packed-ALU instruction that committed a cycle early, and the AMD
+command set the CDJ's flash actually speaks.
 
 ## Licence
 
@@ -222,6 +127,6 @@ for what is patched and under what terms.
 
 ## Not affiliated with Pioneer
 
-This is an independent project. It is not endorsed by, affiliated with, or
-supported by Pioneer DJ, AlphaTheta, or any successor. "CDJ" and "Pioneer" are
-their trademarks and are used here only to say which hardware this emulates.
+This is an independent project, not endorsed by, affiliated with, or supported
+by Pioneer DJ, AlphaTheta, or any successor. "CDJ" and "Pioneer" are their
+trademarks and are used here only to say which hardware this emulates.
