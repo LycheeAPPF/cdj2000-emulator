@@ -8104,7 +8104,26 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/common/dv-cfi.c gdb-17.2/sim/common/dv-cfi.c
 --- a/sim/common/dv-cfi.c	2026-05-10 16:32:31.000000000 +0200
 +++ b/sim/common/dv-cfi.c	2026-09-02 10:35:19.600590400 +0200
-@@ -166,6 +166,9 @@
+@@ -29,6 +29,8 @@
+ #include <fcntl.h>
+ #include <math.h>
+ #include <stdbool.h>
++#include <stdlib.h>
++#include <stdio.h>
+ #include <unistd.h>
+ #ifdef HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
+@@ -39,6 +41,9 @@
+ #include "hw-main.h"
+ #include "dv-cfi.h"
+ 
++/* Counted for the BFIN_CFI_DUMP line at exit.  */
++static unsigned long cfi_amd_erases, cfi_amd_programs;
++
+ /* Flashes are simple state machines, so here we cover all the
+    different states a device might be in at any particular time.  */
+ enum cfi_state
+@@ -166,6 +171,9 @@
  
    unsigned char *erase_region_info;
    struct cfi_erase_region *erase_regions;
@@ -8114,7 +8133,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  };
  
  /* Helpful strings which are used with HW_TRACE.  */
-@@ -341,12 +344,98 @@
+@@ -341,12 +349,107 @@
  {
    CFI_CMDSET_INTEL, cmdset_intel_setup, cmdset_intel_write, cmdset_intel_read,
  };
@@ -8155,10 +8174,16 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +  if (cfi->amd_erase_setup)
 +    {
 +      if (value == AMD_CMD_ERASE_SECTOR)
-+	cfi_erase_block (me, cfi, offset);
++	{
++	  cfi_erase_block (me, cfi, offset);
++	  cfi_amd_erases++;
++	}
 +      else if (value == AMD_CMD_ERASE_CHIP
 +	       && shifted_offset == AMD_ADDR_UNLOCK_FIRST)
-+	memset (cfi->data, 0xff, cfi->dev_size);
++	{
++	  memset (cfi->data, 0xff, cfi->dev_size);
++	  cfi_amd_erases++;
++	}
 +      else
 +	return false;
 +      cfi->amd_erase_setup = false;
@@ -8169,7 +8194,10 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
 +  if (shifted_offset != AMD_ADDR_UNLOCK_FIRST)
 +    return false;
 +  if (value == AMD_CMD_PROGRAM)
-+    cfi->state = CFI_STATE_WRITE;
++    {
++      cfi->state = CFI_STATE_WRITE;
++      cfi_amd_programs++;
++    }
 +  else if (value == AMD_CMD_ERASE_SETUP)
 +    cfi->amd_erase_setup = true;
 +  else
@@ -8213,7 +8241,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  };
  
  /* All writes to the flash address space come here.  Using the state
-@@ -382,7 +471,8 @@
+@@ -382,7 +485,8 @@
        for (i = 0; i < nr_bytes; ++i)
  	cfi->data[offset + i] &= ssource[i];
  
@@ -8223,7 +8251,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  
        return nr_bytes;
      }
-@@ -466,6 +556,25 @@
+@@ -466,6 +570,25 @@
      {
      case CFI_STATE_READ:
        memcpy (dest, cfi->data + offset, nr_bytes);
@@ -8249,7 +8277,22 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
        break;
  
      case CFI_STATE_CFI_QUERY:
-@@ -722,7 +831,7 @@
+@@ -503,9 +626,14 @@
+ 
+ /* Clean up any state when this device is removed (e.g. when shutting
+    down, or when reloading via gdb).  */
++static void cfi_dump_at_exit (void);
++
+ static void
+ cfi_delete_callback (struct hw *me)
+ {
++  /* The device tree is torn down before the process exits, so the dump
++     has to happen here, while the data is still ours.  */
++  cfi_dump_at_exit ();
+ #ifdef HAVE_MMAP
+   struct cfi *cfi = hw_data (me);
+ 
+@@ -722,7 +850,7 @@
  	  fd_writable = !strcmp (writable, "rw");
  	}
  
@@ -8258,7 +8301,7 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
        if (fd < 0)
  	hw_abort (me, "unable to read file `%s': %s", file, strerror (errno));
      }
-@@ -755,13 +864,19 @@
+@@ -755,13 +883,19 @@
        if (fd != -1)
  	{
  	  /* Use stdio to avoid EINTR issues with read().  */
@@ -8279,6 +8322,60 @@ diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.
  	  /* Don't need to fclose() with fdopen("r").  */
  	}
        else
+@@ -773,6 +907,40 @@
+   close (fd);
+ }
+ 
++/* BFIN_CFI_DUMP=<path>: write the flash contents to <path> when the
++   simulator exits.  The board file opens the image read-only, and file
++   write-back needs mmap() which this host does not have, so a firmware
++   update that erases and programs the part -- the GUI board's own updater,
++   fed over the link -- would otherwise leave no evidence of what it wrote.
++   One device only: the CDJ has one flash.  */
++static struct cfi *cfi_dump_device;
++static const char *cfi_dump_path;
++
++static void
++cfi_dump_at_exit (void)
++{
++  FILE *out;
++
++  if (!cfi_dump_device || !cfi_dump_path)
++    return;
++  const char *path = cfi_dump_path;
++  cfi_dump_path = NULL;  /* once: the delete callback or atexit, whichever first */
++  out = fopen (path, "wb");
++  if (!out)
++    {
++      fprintf (stderr, "cfi: cannot write %s\n", path);
++      return;
++    }
++  {
++    size_t done = fwrite (cfi_dump_device->data, 1, cfi_dump_device->dev_size, out);
++    fclose (out);
++    fprintf (stderr, "cfi: %u bytes of flash written to %s "
++	   "(%lu sector erases, %lu program commands)\n",
++	   (unsigned) done, path,
++	   cfi_amd_erases, cfi_amd_programs);
++  }
++}
++
+ /* Once we've been declared in the device tree, this is the main
+    entry point. So allocate state, attach memory addresses, and
+    all that fun stuff.  */
+@@ -782,6 +950,12 @@
+   struct cfi *cfi;
+ 
+   cfi = HW_ZALLOC (me, struct cfi);
++  if (!cfi_dump_device && getenv ("BFIN_CFI_DUMP"))
++    {
++      cfi_dump_device = cfi;
++      cfi_dump_path = getenv ("BFIN_CFI_DUMP");
++      atexit (cfi_dump_at_exit);
++    }
+ 
+   set_hw_data (me, cfi);
+   set_hw_io_read_buffer (me, cfi_io_read_buffer);
 diff -ruN -x '*.o' -x '*.orig' -x '*.rej' -x .deps -x .dirstamp pristine/gdb-17.2/sim/common/dv-cfi.h gdb-17.2/sim/common/dv-cfi.h
 --- a/sim/common/dv-cfi.h	2026-05-10 16:32:31.000000000 +0200
 +++ b/sim/common/dv-cfi.h	2026-09-02 09:40:29.364248500 +0200

@@ -148,7 +148,7 @@ new files. Everything it adds is off unless an environment variable switches it
 on, so an unconfigured simulator behaves as it does upstream. The patch's own
 header lists every piece; two are worth knowing about before you build.
 
-### `sim/common/dv-cfi.c` — the AMD command set
+### `sim/common/dv-cfi.c` — the AMD command set, and a dump of the part on exit
 
 Upstream implements CFI command set 1 (Intel) only. The CDJ's 2 MiB parallel
 flash is an AMD part, so without this the board file is rejected with
@@ -158,7 +158,16 @@ flash is an AMD part, so without this the board file is rejected with
 ```
 
 the simulator carries on with no flash behind the EBIU, and the firmware
-double-faults a fraction of a second later at `0xffb00000`. The visible symptom
+double-faults a fraction of a second later at `0xffb00000`.
+
+`BFIN_CFI_DUMP=<path>` writes the flash contents to `<path>` when the simulator
+exits, with a count of the sector erases and program commands the AMD path
+saw. The board file opens the image read-only and write-back through the file
+needs `mmap()`, which this host lacks, so a firmware update the GUI applies to
+itself -- fed over the link by MAIN's updater -- would otherwise leave nothing
+to compare. It is an `atexit` hook: the simulator has to exit on its own
+(`BFIN_EXIT_AFTER_WALL`), a `run_headless` budget that terminates it does not
+trigger it. The visible symptom
 is a crash that says nothing about a missing device — worth recognising, because
 it is what you get if you build the simulator without this patch.
 
