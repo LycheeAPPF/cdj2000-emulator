@@ -6,6 +6,18 @@ repository root.
 
 ## The whole player, in a window
 
+Use the unified profile selector when you do not want to remember the two
+launcher module names:
+
+```sh
+python -m tools.cdj_main.launch 2000
+python -m tools.cdj_main.launch nxs runs/nxs-deck --ui --seconds 3600
+```
+
+`2000` dispatches to the original CDJ-2000 `view_vm` launcher; `nxs` dispatches
+to the NXS `nxs_vm` launcher. Arguments after the model are passed through.
+The direct commands below remain useful when you want profile-specific help.
+
 ```sh
 python -m tools.cdj_main.view_vm
 ```
@@ -13,6 +25,47 @@ python -m tools.cdj_main.view_vm
 MAIN boots on QEMU, the GUI board boots on the Blackfin simulator, the two are
 linked, and the GUI's framebuffer appears in a window with the player's controls
 drawn around it.
+
+The default device view fits the deck to the window, with the firmware LCD
+kept separate from the controls. Resize freely, or use **Full screen** and
+Escape. **Inspector** opens the unassigned digital/analogue inputs and control
+channel tools; **Controls ?** explains the gestures. Ordinary mouse-down holds
+a key until mouse-up (including outside its hit box) or deck focus loss.
+Closing an attached viewer releases its owned contacts without clearing analog
+settings. Shift-click is a long
+press, Ctrl/right-click latches a key, and the browse knob accepts drag and
+scroll without also sending a push. Arrow keys navigate the focused deck;
+holding Enter or Space holds the originally focused control until key-up or
+focus loss. Inspector and lab buttons also support mouse and keyboard holds;
+auto-repeat does not enqueue additional presses. Releasing one input source
+does not release another source or a right-click latch on the same key.
+The UTILITY shortcut and mouse browse push remain timed gestures. Ordinary
+holds bypass the serialized pulse queue; rapid clicks can still miss firmware
+sampling, so hold a key deliberately when testing. Lights represent host input
+feedback, not decoded hardware LEDs. The existing `--skin lab` viewer remains
+available for bit-level work; `--scale` controls that view's integer zoom.
+
+For the experimental NXS profile, use a new run directory:
+
+```sh
+python -m tools.cdj_main.nxs_vm runs/nxs-deck --ui --seconds 3600
+```
+
+The launcher owns both emulators; the deck attaches to their framebuffer and
+input port. Closing the deck stops that run. This does not remove the NXS
+profile's remaining DSP limitations or add jog rotation/audio.
+To view an existing NXS run without starting or stopping its emulators:
+
+```sh
+python -m tools.cdj_gui.view_ui --attach --device-name CDJ-2000NXS \
+  --output runs/nxs-deck/screen.ppm --control-port 5984
+```
+
+An attached viewer can also display a saved frame; a static image alone is
+not evidence that either emulator is running. After five seconds without a
+framebuffer publication, the status bar reports its age and marks emulator
+liveness unverified rather than retaining an old FPS value. This does not
+mean the emulator is stopped: firmware may simply leave the picture unchanged.
 
 **It takes half a minute to become interesting.** Measured with
 `boot_vm --poll-every 5 --frames`: black until about 15 s, the Pioneer logo at
@@ -154,6 +207,110 @@ A mask from a different world erases exactly the fields that carry the evidence,
 so a mask is only usable against the run it was made for.
 
 ## Diagnostics
+
+### NXS panel CPU error caused by DMA address modes
+
+The NXS `E-7022: PANEL CPU ERROR` reproduced on 2026-09-09 was a MAIN
+memory-initialization bug, not a missing panel identity byte. Startup uses
+DMA with a fixed source word and an incrementing destination (`CHCR=0x4431`)
+to clear RAM. The former generic DMA path incremented both addresses, reading
+past the zero word and filling parts of RAM with unrelated data.
+
+The UDP port table at `0x04687508` consequently contained `0xffff` ports.
+Pro DJ Link endpoint creation returned `-41`; its receiver task then spun on
+`-18` receive errors. That runnable priority-4 task starved the equally
+prioritized panel receive task even though the panel interrupt had copied a
+valid frame and woken it.
+
+After respecting DMA source/destination modes, a stock NXS MAIN/GUI boot
+with the unchanged zero panel payload produced a valid endpoint (`31` at
+`0x04d10874`), zero UDP receive errors (`0x04d10e60`), and initialized panel
+state (`1` at `0x051e2184`). The display no longer showed E-7022. That probe
+still showed E-8709, but its serial wiring was incomplete: it exposed only
+the request socket and sent the status serial channel to `null`. This was a
+probe error, not evidence of a remaining communication failure in `nxs_vm`.
+Another boot with no `CDJ_PANEL_FRAME` override confirmed the same state.
+A live `analog 2 4660` command then appeared as `12 34` in both the received
+frame (`0x04d1209c + 4`) and the validated payload (`0x051e218c + 4`).
+
+Rebuild QEMU after updating the board source. The firmware-free regression
+tests exercise the real board registers with the CPU stopped:
+
+```sh
+sh scripts/build-qemu-sh4.sh build/qemu
+python -m pytest -q tests/test_main_dmac.py
+```
+
+The tests cover fixed, incrementing and decrementing addresses, 4- and
+16-byte transfers, final register values, and copies crossing the DMA chunk
+boundary. Set `CDJ_QEMU` if the binary lives outside `build/qemu/build/`.
+
+### NXS E-8709 versus E-7010
+
+The GUI's `BFIN_MAIN_LINK=host:port` bridge opens **two** TCP connections:
+the request channel at `port` and the status channel at `port + 2`. It closes
+both if either connection fails. QEMU therefore needs both `-serial`
+backends; a listening request port alone is insufficient. `nxs_vm` already
+sets these correctly. With its default port, they are 5980 and 5982;
+5984 is the separate host panel-control port.
+
+Verification on 2026-09-09 used the normal NXS launcher for 45 seconds,
+without a proxy, firmware patches, or functional DSP overrides. The GUI
+received 772,448 link bytes, displayed `Not Loaded.`, and reported
+`E-7010: DSP DEVICE ERROR`, not E-8709. MAIN was running and communicating.
+
+The tested QEMU binary's DSP interpreter stopped at PC `0xc004f306`, compact
+instruction `0x2627`, with `parallel register write conflict`. Its captured
+checkpoint was number 65, after 25,364,865 DSP packets. This identifies the
+next execution blocker, not its architectural cause: decoding, packet
+grouping, and delayed-result/loop timing still need to be distinguished.
+The working tree's in-progress C674x changes were not rebuilt or altered by
+this communication diagnosis, so this result describes the tested binary.
+
+The later exploratory run `runs/nxs-interactive-exploratory-1` is not proof of
+responsive controls: its GUI link byte count stopped at 9,032 by wall time
+30 seconds and stayed there through 290 seconds. MAIN's input log nevertheless
+records applied key down/up transitions from 139 seconds onward. Repeated UI
+clicks also accumulated serialized 3.3-second pulses. Direct mouse contacts
+fix that host gesture/queue problem, but do not establish that the firmware's
+status delivery or display response is fixed. Native Tk gesture tests and the
+compiled C input harness verify delivery to panel payloads, not firmware UI
+response. The run ended because its viewer was closed.
+
+A strict panel-delivery recheck on 2026-09-09 used the SPKERNEL-fixed binary
+without functional DSP switches, with `CDJ_REQ_STATUS_FRESH=0` and
+`CDJ_LINK_LINK_ROWS=off` to preserve request and answer bytes. A ten-second
+`down 20 08` / `up 20 08` MENU contact opened the firmware's UTILITY screen.
+Control snapshots showed frame counts 7,721, 9,986 and 12,258, the expected
+held bit followed by released bits, and an empty pulse queue. GUI link bytes
+grew from 492,432 at 40 seconds to 833,528 at 60 seconds. This establishes a
+genuine panel-to-MAIN-to-GUI response, not complete boot: the visible E-7206
+auth-chip banner and strict SPI1 DSP stop remain. Local temporary evidence is
+in `/tmp/cdj-panel-delivery-strict-1`; it is not a committed test fixture.
+
+The follow-up `/tmp/cdj-panel-delivery-visible-1` exercised the actual native
+Tk deck against the rebuilt strict timed-SPI binary. A generated mouse-down
+on MENU sent `down 20 08`; releasing outside the button sent `up 20 08`.
+The control channel reported MENU held at frame 182, all bits released at
+frame 221, and queue zero throughout. The captured firmware picture
+`viewer-hold.png` visibly shows UTILITY, still with E-7206. DSP execution now
+ended each phase by its cooperative budget rather than the earlier SPI fault.
+This is visible-viewer interaction evidence, not an error-free boot gate or
+evidence that USB/SD track loading is ready.
+
+A later reproducible communication failure was traced to the GUI simulator's
+SIC interrupt-mask write ordering, corrected by patch 07 (`69d0d88`). Rebuild
+`bin/cdj-run` with `sh scripts/build-bfin-sim.sh build/gdb-17.2` to include it.
+The fix prevents a duplicate interrupt from cancelling a newly armed payload
+receive. A normal cached-transport boot with detailed tracing disabled now
+passes a native Tk MENU hold/outside release, opens UTILITY, and retains free
+MAIN message pools after 80 seconds. The focused native/input/transport suite
+passes 128 tests.
+Do not enable fresh-only delivery as a workaround: it remains diagnostic-only.
+E-7206 auth-chip emulation is still unresolved; USB/SD loading and audio playback
+are not yet validated.
+
+### Existing tracing tools
 
 ```sh
 python -m tools.cdj_main.monitor "1,2,GU"      # MAIN's own service monitor

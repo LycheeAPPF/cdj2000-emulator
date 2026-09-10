@@ -55,6 +55,10 @@ def toolchain() -> tuple[Path, Path] | None:
         gcc = here / ("gcc.exe" if sys.platform == "win32" else "gcc")
         if gcc.exists():
             return gcc, here
+        # macOS uses Apple's compiler with Homebrew's pkg-config/GLib.
+        # Only Windows needs the strict same-directory runtime pairing.
+        if sys.platform != "win32" and (compiler := shutil.which("cc")):
+            return Path(compiler), here
     return None
 
 
@@ -76,6 +80,7 @@ def environment() -> dict[str, str]:
     settings = dict(os.environ)
     settings["PATH"] = str(bindir) + os.pathsep + settings.get("PATH", "")
     settings.pop("CDJ_INPUT_PORT", None)
+    settings.pop("CDJ_NXS_SD_LID", None)
     return settings
 
 
@@ -140,7 +145,8 @@ class Segment(NamedTuple):
 
 
 def script(harness: Path, steps: list[tuple[str, int]],
-           where: Path | None = None) -> list[Segment]:
+           where: Path | None = None, *,
+           defer_replies: bool = False) -> list[Segment]:
     """Drive a list of (command, exchanges-afterwards) and cut the trace up.
 
     The harness echoes `# command` before sending and `# reply` for everything
@@ -156,7 +162,8 @@ def script(harness: Path, steps: list[tuple[str, int]],
 
     settings = environment()
     settings["CDJ_INPUT_PORT"] = str(free_port())
-    finished = subprocess.run([str(harness), "script", str(path)],
+    scenario = 'script-deferred-replies' if defer_replies else 'script'
+    finished = subprocess.run([str(harness), scenario, str(path)],
                               capture_output=True, text=True, timeout=300,
                               env=settings)
     assert finished.returncode == 0, finished.stderr
@@ -174,6 +181,64 @@ def script(harness: Path, steps: list[tuple[str, int]],
     assert [segment.command for segment in segments] == \
         [command for command, _ in steps], "the harness lost a command"
     return segments
+
+
+def test_sd_lid_is_persistent_and_overrides_raw_button_commands(harness, tmp_path):
+    steps = [('sd-lid closed', 3), ('clear', 3), ('up 17 04', 3),
+             ('sd-lid open', 3), ('down 17 04', 3), ('clear', 3),
+             ('sd-lid toggle', 3), ('sd-lid invalid', 3),
+             ('sd-lid open extra', 3), ('sd-lid state', 3)]
+    segments = script(harness, steps, tmp_path)
+    for segment, closed in zip(segments, [True, True, True, False, False,
+                                          False, True, True, True, True]):
+        assert all(bool(frame[17] & 4) == closed for frame in segment.frames)
+    assert 'ok sd-lid closed' in segments[-1].replies
+    assert any(r.startswith('err ') for r in segments[-2].replies)
+
+
+@pytest.mark.parametrize('state,closed', [('closed', True), ('open', False)])
+def test_sd_lid_default_works_without_control_socket(harness, state, closed):
+    settings = environment()
+    settings['CDJ_NXS_SD_LID'] = state
+    result = subprocess.run([str(harness), 'quiet'], env=settings,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    frames = [bytes.fromhex(line.split(' ', 3)[3])
+              for line in result.stdout.splitlines() if line.startswith('f ')]
+    assert frames
+    assert all(bool(frame[17] & 4) == closed for frame in frames)
+
+
+def test_script_waits_for_replies_before_starting_the_next_segment(harness, tmp_path):
+    # Deliberately collect nothing during the simulated frames: replies must
+    # still belong to their own command, not whichever command is printed next.
+    segments = script(harness, [('ping', 1), ('clear', 1), ('ping', 1)],
+                      tmp_path, defer_replies=True)
+    assert [[reply for reply in segment.replies
+             if reply != 'ok cdj2000-input'] for segment in segments] == [
+                 ['ok pong'], ['ok clear'], ['ok pong']]
+    assert all(len(segment.frames) == 1 for segment in segments[:-1])
+    assert len(segments[-1].frames) == 5  # existing final four-frame drain
+
+
+def test_harness_reassembles_fragmented_reply_lines(harness):
+    settings = environment()
+    settings.pop('CDJ_INPUT_PORT', None)
+    completed = subprocess.run([str(harness), 'reply-fragments'], env=settings,
+                               capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    replies = [line for line in completed.stdout.splitlines()
+               if line.startswith('# reply ') and line != '# reply ok cdj2000-input']
+    assert replies == ['# reply ok pong', '# reply ok clear']
+
+
+def test_harness_missing_reply_is_a_bounded_failure(harness):
+    settings = environment()
+    settings.pop('CDJ_INPUT_PORT', None)
+    completed = subprocess.run([str(harness), 'reply-timeout'], env=settings,
+                               capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 2
+    assert 'timed out waiting for reply 1' in completed.stderr
 
 
 def runs_of(frames: list[bytes], byte: int, mask: int) -> list[tuple[int, int]]:
@@ -198,6 +263,24 @@ def field(frames: list[bytes], first: int, width: int) -> list[int]:
 
 
 # ------------------------------------------------------- the control case --
+def test_viewer_contacts_reach_payload_without_entering_pulse_queue(harness, tmp_path):
+    from unittest.mock import Mock
+
+    viewer = object.__new__(view_ui.UiViewer)
+    viewer.held, viewer.momentary = {}, {}
+    viewer.contact_sources = {}
+    viewer.deck = None
+    viewer.send = Mock(return_value="ok")
+    control = next(c for c in view_ui.controls() if c.input_id == "16.0")
+    assert viewer.contact(control, True)
+    assert viewer.contact(control, False)
+    commands = [call.args[1].strip() for call in viewer.send.call_args_list]
+    segments = script(harness, [(commands[0], 50), (commands[1], 5)], tmp_path)
+    assert segments[0].frames and segments[1].frames
+    assert all(frame[16] & 1 for frame in segments[0].frames)
+    assert all(not (frame[16] & 1) for frame in segments[1].frames)
+
+
 def test_without_the_port_nothing_is_merged(harness):
     """A run without CDJ_INPUT_PORT has to be a control run in the strict sense.
 

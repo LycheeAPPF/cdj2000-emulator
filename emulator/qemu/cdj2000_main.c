@@ -52,6 +52,10 @@
 
 #include "cdj2000_ata.h"
 #include "cdj2000_dsp.h"
+#include "cdj2000_nxs_hpi.h"
+#include "cdj_nxs_iic.h"
+
+static bool cdj_nxs_profile;
 #include "cdj2000_input.h"
 #include "cdj2000_usb.h"
 #include "cdj2000_usbh.h"
@@ -869,6 +873,24 @@ static void cdj_dmac_panel_done(void *opaque)
     }
 }
 
+static void cdj_dmac_dsp_irq(CdjDmacState *dmac, unsigned index)
+{
+    /* Both legacy shared-window and NXS UHPI transfers use the SH DMAC's
+     * completion interrupt. The PCM ISR clears IE, leaving TE for rearm. */
+    if (!(dmac->channel[index].chcr & CHCR_IE)) {
+        return;
+    }
+    if (index == DMA5_CHANNEL) {
+        if (dmac->dma5_irq && !dmac->dma5_pending) {
+            dmac->dma5_pending = true;
+            qemu_set_irq(dmac->dma5_irq, 1);
+        }
+    } else if (dmac->dsp_dma_irq && !dmac->dsp_dma_pending) {
+        dmac->dsp_dma_pending = true;
+        qemu_set_irq(dmac->dsp_dma_irq, 1);
+    }
+}
+
 static void cdj_dmac_run(CdjDmacState *dmac, unsigned index)
 {
     CdjDmacChannel *channel = &dmac->channel[index];
@@ -876,7 +898,32 @@ static void cdj_dmac_run(CdjDmacState *dmac, unsigned index)
     hwaddr destination = cdj_dma_phys(channel->dar);
     uint8_t buffer[DMA_CHUNK];
     uint64_t remaining;
+    unsigned unit = (channel->chcr & CHCR_TS_WIDE)
+        ? DMA_BURST : DMA_BURST_LONG;
+    unsigned source_mode = (channel->chcr >> 12) & 3;
+    unsigned destination_mode = (channel->chcr >> 14) & 3;
 
+    if (cdj_nxs_hpi_port(source) || cdj_nxs_hpi_port(destination)) {
+        /* UHPI data access is one 32-bit bus cycle; the DSP address advances
+         * inside HPID. The host-side fixed register address must not move. */
+        unsigned sm = (channel->chcr >> 12) & 3;
+        unsigned dm = (channel->chcr >> 14) & 3;
+        unsigned ts = ((channel->chcr >> 3) & 3) | ((channel->chcr >> 18) & 4);
+        if (ts != 2 || sm > 1 || dm > 1 || !channel->tcr) {
+            error_report("nxs-hpi: unsupported DMA CHCR=%#x TCR=%#x", channel->chcr, channel->tcr);
+            return;
+        }
+        channel->role = CDJ_DMA_DSP;
+        for (uint32_t word = 0; word < channel->tcr; ++word) {
+            address_space_read(&address_space_memory, source, MEMTXATTRS_UNSPECIFIED, buffer, 4);
+            address_space_write(&address_space_memory, destination, MEMTXATTRS_UNSPECIFIED, buffer, 4);
+            source += sm ? 4 : 0;
+            destination += dm ? 4 : 0;
+        }
+        cdj_dmac_complete(channel, source, destination);
+        cdj_dmac_dsp_irq(dmac, index);
+        return;
+    }
     channel->role = cdj_dmac_role(channel);
     if (getenv("CDJ_DMAC_TRACE")) {
         fprintf(stderr, "cdj2000-dmac %.3f: ch%u SAR %#010x DAR %#010x TCR %#x "
@@ -946,20 +993,36 @@ static void cdj_dmac_run(CdjDmacState *dmac, unsigned index)
         return;
     }
 
-    remaining = (uint64_t)channel->tcr
-        * ((channel->chcr & CHCR_TS_WIDE) ? DMA_BURST : DMA_BURST_LONG);
+    remaining = (uint64_t)channel->tcr * unit;
     if (channel->role == CDJ_DMA_DSP) {
         cdj_dsp_transfer_start();
     }
     while (remaining) {
         size_t chunk = remaining < DMA_CHUNK ? remaining : DMA_CHUNK;
 
+        /* SM/DM: 0 = fixed, 1 = increment, 2 = decrement.  In particular,
+         * NXS startup's 0x4431 transfer clears BSS from a fixed zero word.
+         * Treating that as memcpy reads past the zero and corrupts the UDP
+         * table; lnkfrm then busy-loops and starves PnlCom_RcvTASK (E-7022).
+         * Keep the bulk path for incrementing copies, but execute other
+         * address modes one transfer unit at a time. */
+        if (source_mode != 1 || destination_mode != 1) {
+            chunk = unit;
+        }
         address_space_read(&address_space_memory, source,
                            MEMTXATTRS_UNSPECIFIED, buffer, chunk);
         address_space_write(&address_space_memory, destination,
                             MEMTXATTRS_UNSPECIFIED, buffer, chunk);
-        source += chunk;
-        destination += chunk;
+        if (source_mode == 1) {
+            source += chunk;
+        } else if (source_mode == 2) {
+            source -= chunk;
+        }
+        if (destination_mode == 1) {
+            destination += chunk;
+        } else if (destination_mode == 2) {
+            destination -= chunk;
+        }
         remaining -= chunk;
     }
     if (channel->role == CDJ_DMA_DSP) {
@@ -978,17 +1041,11 @@ static void cdj_dmac_run(CdjDmacState *dmac, unsigned index)
          * (see DMA5_IRQ).  A channel-5 completion delivered on 0x7a0 storms the
          * boot handler and leaves the sender asleep for ever.
          */
-        if (index == DMA5_CHANNEL) {
-            if (dmac->dma5_irq && !dmac->dma5_pending) {
-                dmac->dma5_pending = true;
-                qemu_set_irq(dmac->dma5_irq, 1);
-            }
-        } else if (dmac->dsp_dma_irq && !dmac->dsp_dma_pending) {
-            dmac->dsp_dma_pending = true;
-            qemu_set_irq(dmac->dsp_dma_irq, 1);
-        }
     }
     cdj_dmac_complete(channel, source, destination);
+    if (channel->role == CDJ_DMA_DSP) {
+        cdj_dmac_dsp_irq(dmac, index);
+    }
 }
 
 /* DMAOR occupies the block a seventh channel would have used. */
@@ -1179,7 +1236,8 @@ static uint64_t cdj_intc2_dma_read(void *opaque, hwaddr offset, unsigned size)
     /* Bit n is DMINTn, i.e. board index n + 2: the application's receive on
      * index 3 is bit 1 (INTC2_DMA_RX), its transmit on index 4 bit 2. */
     return (dmac->panel_rx_pending ? 1u << (dmac->panel_rx_index - 2) : 0)
-         | (dmac->panel_tx_pending ? 1u << (dmac->panel_tx_index - 2) : 0);
+         | (dmac->panel_tx_pending ? 1u << (dmac->panel_tx_index - 2) : 0)
+         | (dmac->dma5_pending ? 1u << (DMA5_CHANNEL - 2) : 0);
 }
 
 static void cdj_intc2_dma_write(void *opaque, hwaddr offset, uint64_t value,
@@ -1528,6 +1586,10 @@ typedef struct {
  */
 #define DSP_EVENT_REG   0xfff10040
 #define DSP_EVENT_BIT   0x0010
+#define DSP_RESET_REG   0xfff10054
+#define DSP_RESET_BIT   0x0040
+#define DSP_PHASE_REG   0xfff1005c
+#define DSP_PHASE_MASK  0x0007
 
 typedef struct {
     CdjIntc2State *intc2;
@@ -1550,6 +1612,12 @@ static void cdj_dsp_event_pending(void *opaque, bool raised)
     if (sink->flag) {
         sink->flag->dsp_event = raised;
     }
+}
+
+static void cdj_nxs_hint_level(void *opaque, bool high)
+{
+    CdjLinkFlagState *flag = opaque;
+    flag->dsp_event = high;
 }
 
 static uint64_t cdj_link_flag_read(void *opaque, hwaddr offset, unsigned size)
@@ -1583,13 +1651,24 @@ static void cdj_link_flag_write(void *opaque, hwaddr offset, uint64_t value,
                                 unsigned size)
 {
     CdjLinkFlagState *flag = opaque;
+    bool old_dsp_reset = false;
 
     if (offset + size > SOC_BLOCK_SIZE) {
         return;
     }
+    if (cdj_nxs_profile && offset == DSP_RESET_REG - SOC_BLOCK_BASE) {
+        old_dsp_reset = (flag->reg[offset >> 1] & DSP_RESET_BIT) != 0;
+    }
     flag->reg[offset >> 1] = value;
     if (size > 2) {
         flag->reg[(offset >> 1) + 1] = value >> 16;
+    }
+    if (cdj_nxs_profile && offset == DSP_RESET_REG - SOC_BLOCK_BASE &&
+        old_dsp_reset != ((value & DSP_RESET_BIT) != 0)) {
+        cdj_nxs_hpi_reset_line((value & DSP_RESET_BIT) != 0);
+    }
+    if (cdj_nxs_profile && offset == DSP_PHASE_REG - SOC_BLOCK_BASE) {
+        cdj_nxs_hpi_boot_phase(value & DSP_PHASE_MASK);
     }
 }
 
@@ -4383,9 +4462,13 @@ static void cdj_intc_timer_init(MemoryRegion *system, SuperHCPU *cpu)
      */
     const char *dsp_chardev = getenv("CDJ_DSP_CHARDEV");
 
+    if (cdj_nxs_profile) {
+        cdj_nxs_hpi_init(system, cdj_nxs_hint_level, cdj_dsp_event_sink.flag);
+    } else {
     cdj_dsp_init(system, dsp_chardev ? qemu_chr_find(dsp_chardev) : NULL,
                  intc->irqs[CDJ_INTC_DSP_EVENT], cdj_dsp_event_pending,
                  &cdj_dsp_event_sink);
+    }
     /*
      * The USB controller sits on the external bus at physical 0x01000000, well
      * clear of CS0's 4 MiB of flash.  Without it USBFD_TSK's enable-and-poll at
@@ -4487,9 +4570,10 @@ static void cdj2000_main_init(MachineState *machine)
 #endif
     ssize_t loaded;
 
+    cdj_nxs_profile = !strcmp(object_get_typename(OBJECT(machine)), MACHINE_TYPE_NAME("cdj2000nxs-main"));
     cpu = SUPERH_CPU(cpu_create(machine->cpu_type));
 
-    memory_region_init_ram(sdram, NULL, "cdj2000.sdram", SDRAM_SIZE,
+    memory_region_init_ram(sdram, NULL, "cdj2000.sdram", machine->ram_size,
                            &error_fatal);
     memory_region_add_subregion(system, SDRAM_BASE, sdram);
 
@@ -4519,6 +4603,9 @@ static void cdj2000_main_init(MachineState *machine)
     }
 
     cdj_periph_init(system);
+    if (cdj_nxs_profile) {
+        cdj_nxs_iic_init(system);
+    }
     cdj_bus_trace_init(system);
     cdj_watch_init(system);
     cdj_intc_timer_init(system, cpu);
@@ -4564,6 +4651,7 @@ static void cdj2000_main_machine_init(MachineClass *mc)
     mc->desc = "Pioneer CDJ-2000 MAIN board (SH-4)";
     mc->init = cdj2000_main_init;
     mc->default_cpu_type = TYPE_SH7785_CPU;
+    mc->default_ram_size = SDRAM_SIZE;
     /* SDRAM is allocated by the board, as on r2d — no default_ram_id here. */
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
@@ -4571,3 +4659,16 @@ static void cdj2000_main_machine_init(MachineClass *mc)
 }
 
 DEFINE_MACHINE("cdj2000-main", cdj2000_main_machine_init)
+
+/* Experimental NXS profile. The boot stack is at physical 0x0c000000;
+ * retaining the original player's 64 MiB RAM makes its RAM test fail.
+ * Peripheral and C674x emulation are still being validated for this profile.
+ */
+static void cdj2000_nxs_main_machine_init(MachineClass *mc)
+{
+    cdj2000_main_machine_init(mc);
+    mc->desc = "Pioneer CDJ-2000NXS MAIN board (experimental)";
+    mc->default_ram_size = 128 * MiB;
+}
+
+DEFINE_MACHINE("cdj2000nxs-main", cdj2000_nxs_main_machine_init)

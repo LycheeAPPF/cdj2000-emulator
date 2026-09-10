@@ -64,6 +64,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.paths import (BFIN_SIM, BOARDS, FIRMWARE,  # noqa: E402
                          PACKETS, RUNS, board_path)
 from tools.cdj_main import panel_control  # noqa: E402
+from tools.cdj_main import nxs_panel  # noqa: E402
 from tools.cdj_gui import faceplate  # noqa: E402
 
 # ---------------------------------------------------------------- geometry --
@@ -248,6 +249,15 @@ def firmware_name(byte: int, bit: int) -> str:
 # short one cannot be delivered on this link at all.
 WINDOW_HOLD_MS = 3300
 
+
+def publication_age_note(mtime_ns: int, now: float) -> str | None:
+    """Publication age is observable; an unchanged image cannot prove a stall."""
+    age = max(0.0, now - mtime_ns / 1_000_000_000)
+    if age < 5:
+        return None
+    return (f"Last framebuffer publication {int(age)}s ago — "
+            "display may be static; emulator liveness unverified")
+
 # A long press.  The firmware tells a short MENU from a held one by whether
 # the key is still down in the *next* status record, so on this link "held"
 # means held across two of MAIN's 3.05 s record builds.  Measured, MENU
@@ -370,11 +380,32 @@ def channel_controls() -> list[Control]:
     ]
 
 
-def controls() -> list[Control]:
-    return button_controls() + analog_controls() + channel_controls()
+def controls(nxs: bool = False) -> list[Control]:
+    buttons = button_controls()
+    if nxs:
+        translated = []
+        for control in buttons:
+            if control.group == "bits":
+                continue
+            if control.input_id is not None:
+                target = nxs_panel.deck_input(control.input_id)
+                byte, mask = panel_control.button_mask(target)
+                duration = WINDOW_LONG_HOLD_MS if control.kind == "hold" else WINDOW_HOLD_MS
+                control = control._replace(input_id=target,
+                    lines=(panel_control.encode_press(byte, mask, duration),),
+                    note="NXS firmware panel decoder 042f5810")
+            translated.append(control)
+        for byte, bit in nxs_panel.BUTTON_BITS:
+            key = f"{byte}.{bit}"
+            name = nxs_panel.KEY_NAMES.get((byte, bit), "unassigned")
+            translated.append(Control(key, key, "button", "bits",
+                (panel_control.encode_press(byte, 1 << bit, WINDOW_HOLD_MS),),
+                f"NXS decoder 042f5810; {name}"))
+        buttons = translated
+    return buttons + analog_controls() + channel_controls()
 
 
-def coverage(built: list[Control] | None = None
+def coverage(built: list[Control] | None = None, nxs: bool = False
              ) -> tuple[list[str], list[str], list[str]]:
     """(inputs reached, inputs with no control, controls with no input).
 
@@ -382,8 +413,8 @@ def coverage(built: list[Control] | None = None
     does not have is the same class of error as a missing one, and it is the
     error a hand-written table makes first.
     """
-    built = controls() if built is None else built
-    board = panel_control.input_ids()
+    built = controls(nxs) if built is None else built
+    board = nxs_panel.input_ids() if nxs else panel_control.input_ids()
     # field6-touch is a control for a flag inside field 6 rather than for one
     # of the 48 the manifest enumerates; it is counted as reaching field 6.
     reached = {control.input_id.split("-")[0]
@@ -393,9 +424,9 @@ def coverage(built: list[Control] | None = None
             sorted(name for name in reached if name not in board))
 
 
-def coverage_line(built: list[Control] | None = None) -> str:
+def coverage_line(built: list[Control] | None = None, nxs: bool = False) -> str:
     """What the window says about itself, in one line."""
-    reached, missing, stray = coverage(built)
+    reached, missing, stray = coverage(built, nxs)
     text = "%d of %d inputs have a control" % (len(reached),
                                                len(reached) + len(missing))
     if missing:
@@ -450,8 +481,11 @@ class UiViewer:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.root = tk.Tk()
-        self.root.title("CDJ-2000 GUI firmware lab")
+        self.root.title(f"{args.device_name} · Emulator")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.configure(background="#121418")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
         self.photo: ImageTk.PhotoImage | None = None
         self.last_mtime_ns = -1
@@ -474,6 +508,8 @@ class UiViewer:
         self.control_note = tk.StringVar(value="")
         self.status = tk.StringVar(value="Starting Blackfin firmware…")
         self.held: dict[tuple[int, int], Control] = {}
+        self.momentary: dict[tuple[int, int], Control] = {}
+        self.contact_sources: dict[tuple[int, int], set[object]] = {}
         # Key -> the time its click's press is over (hold plus the board's
         # gap).  The board queues presses one behind the other, so a click
         # repeated while the first is still down does not land sooner: it
@@ -487,13 +523,75 @@ class UiViewer:
         self.analog_value: dict[int, tk.StringVar] = {}
         self.analog_position: dict[int, tk.DoubleVar] = {}
         self.analog_touch: dict[int, tk.BooleanVar] = {}
+        self.status_light: tk.Canvas | None = None
 
+        self.configure_theme()
         self.build_layout()
+        self.status.trace_add("write", self.status_changed)
+        self.status_changed()
         self.show_boot_panel()
         self.start_simulator()
         self.root.after(self.args.refresh_ms, self.refresh)
 
     # ------------------------------------------------------------- layout --
+    def configure_theme(self) -> None:
+        """A compact dark instrument theme shared by both window skins."""
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("TFrame", background="#181b20")
+        style.configure("TLabel", background="#181b20", foreground="#cdd2db",
+                        font=("TkDefaultFont", 10))
+        style.configure("Muted.TLabel", foreground="#858d9b")
+        style.configure("Title.TLabel", foreground="#f1f3f7",
+                        font=("TkDefaultFont", 15, "bold"))
+        style.configure("Eyebrow.TLabel", foreground="#6faaf2",
+                        font=("TkDefaultFont", 8, "bold"))
+        style.configure("Badge.TLabel", background="#202a36",
+                        foreground="#9dc7fa", padding=(8, 4),
+                        font=("TkDefaultFont", 8, "bold"))
+        style.configure("TLabelframe", background="#181b20",
+                        bordercolor="#363c46", relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background="#181b20",
+                        foreground="#9ca5b4", font=("TkDefaultFont", 9, "bold"))
+        style.configure("TButton", background="#2b3038", foreground="#e5e8ee",
+                        bordercolor="#505864", lightcolor="#59616e",
+                        darkcolor="#16191d", padding=(8, 6),
+                        font=("TkDefaultFont", 9, "bold"))
+        style.map("TButton",
+                  background=[("pressed", "#1f5b9e"),
+                              ("active", "#39414c")],
+                  bordercolor=[("focus", "#74b7ff"),
+                               ("active", "#788393")],
+                  foreground=[("disabled", "#6c737e")])
+        style.configure("Quiet.TButton", background="#20242a",
+                        foreground="#b7bec9", padding=(7, 5))
+        style.configure("Unbound.TButton", foreground="#f19a9f",
+                        background="#332428")
+        style.map("Unbound.TButton", foreground=[("active", "#ffc2c5")],
+                  background=[("active", "#493035")])
+        style.configure("TEntry", fieldbackground="#0e1013", foreground="#eef1f5",
+                        insertcolor="#eef1f5", bordercolor="#4a525e",
+                        padding=(5, 4))
+        style.configure("TCheckbutton", background="#181b20",
+                        foreground="#c5cad3")
+        style.map("TCheckbutton", background=[("active", "#181b20")])
+        style.configure("Horizontal.TScale", background="#181b20",
+                        troughcolor="#0d0f12", bordercolor="#343a43")
+
+    def status_changed(self, *_args) -> None:
+        """Keep the footer's status light meaningful without parsing state."""
+        if self.status_light is None:
+            return
+        message = self.status.get().lower()
+        if "exited" in message or "error" in message or "lost" in message:
+            color = "#f05f6c"
+        elif "boot" in message or "starting" in message or "waiting" in message:
+            color = "#e8bb43"
+        else:
+            color = "#3fd083"
+        self.status_light.itemconfigure("light", fill=color, outline=color)
+
     def build_layout(self) -> None:
         if self.args.skin == "device":
             self.build_deck()
@@ -509,35 +607,140 @@ class UiViewer:
         last verdict beside them is the right window for attributing a bit, and
         the wrong one for finding out whether the machine works.
         """
-        self.root.configure(background="#%02x%02x%02x" % faceplate.CHASSIS)
-        outer = tk.Frame(self.root, background="#%02x%02x%02x" % faceplate.CHASSIS)
+        self.root.configure(background="#121418")
+        outer = tk.Frame(self.root, background="#121418")
         outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+        self.root.geometry("%dx%d" % (
+            min(1180, self.root.winfo_screenwidth() - 80),
+            min(940, self.root.winfo_screenheight() - 100)))
+        self.root.minsize(700, 610)
 
-        built = controls()
+        header = ttk.Frame(outer, padding=(14, 10, 14, 9))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        title = ttk.Frame(header)
+        title.grid(row=0, column=0, sticky="w")
+        ttk.Label(title, text="PLAYER / 01",
+                  style="Eyebrow.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(title, text=self.args.device_name,
+                  style="Title.TLabel").grid(row=1, column=0, sticky="w")
+        badges = ttk.Frame(header)
+        badges.grid(row=0, column=2, rowspan=2, sticky="e")
+        self.zoom_note = tk.StringVar(value="FIT")
+        ttk.Label(badges, textvariable=self.zoom_note, style="Badge.TLabel").grid(
+            row=0, column=0, padx=(0, 10))
+        ttk.Button(badges, text="Inspector", command=self.show_inspector).grid(
+            row=0, column=1, padx=4)
+        ttk.Button(badges, text="Controls ?", command=self.show_help).grid(
+            row=0, column=2, padx=4)
+        ttk.Button(badges, text="Full screen", command=self.toggle_fullscreen).grid(
+            row=0, column=3, padx=4)
+        if self.args.nxs_panel:
+            self.sd_lid_text = tk.StringVar(value="SD lid: unknown")
+            ttk.Button(badges, textvariable=self.sd_lid_text,
+                       command=lambda: self.sd_lid_command("toggle")).grid(
+                           row=1, column=0, columnspan=2, sticky="e")
+            self.root.after(1000, self.poll_sd_lid)
+
+        built = controls(self.args.nxs_panel)
         self.by_id = {control.input_id: control for control in built
                       if control.input_id}
+        self.viewport = tk.Frame(outer, background="#0b0d10")
+        self.viewport.grid(row=1, column=0, sticky="nsew")
         self.deck = faceplate.Faceplate(
-            outer, self.args.scale,
-            resolve=self.by_id.get,
+            self.viewport, 1,
+            resolve=lambda key: self.by_id.get(
+                nxs_panel.deck_input(key) if self.args.nxs_panel else key),
             click=self.click,
             rotate=lambda field, delta: self.rotate(
-                panel_control.ANALOG_CONTROLS[field], delta))
-        self.deck.grid(row=0, column=0, sticky="nw")
+                panel_control.ANALOG_CONTROLS[field], delta),
+            long_press=self.long_press, hold=self.toggle_hold,
+            contact=self.contact,
+            key_contact=lambda c, down: self.contact(c, down, source="deck-keyboard"))
+        self.deck.place(relx=0.5, rely=0.5, anchor="center")
+        self.resize_timer = None
+        self.viewport.bind("<Configure>", self.queue_resize)
+        self.root.bind("<Escape>", lambda _e: self.root.attributes("-fullscreen", False))
         # The picture lives on the canvas now; `image_label` stays as the
         # attribute the boot panel and refresh write through so both skins
         # travel the same code path.
         self.image_label = None
 
-        rack = ttk.Frame(outer, padding=(10, 4))
-        rack.grid(row=1, column=0, sticky="ew")
+        self.inspector = tk.Toplevel(self.root)
+        self.inspector.title("CDJ-2000 · Input inspector")
+        self.inspector.withdraw()
+        self.inspector.protocol("WM_DELETE_WINDOW", self.inspector.withdraw)
+        self.inspector.geometry("%dx520" % min(1100, self.root.winfo_screenwidth() - 80))
+        self.inspector.columnconfigure(0, weight=1)
+        self.inspector.rowconfigure(0, weight=1)
+        scroll = tk.Canvas(self.inspector, background="#181b20", highlightthickness=0)
+        scroll.grid(row=0, column=0, sticky="nsew")
+        for orient, row, col, sticky in [("vertical", 0, 1, "ns"), ("horizontal", 1, 0, "ew")]:
+            bar = ttk.Scrollbar(self.inspector, orient=orient,
+                                command=scroll.yview if orient == "vertical" else scroll.xview)
+            bar.grid(row=row, column=col, sticky=sticky)
+            scroll.configure(**{("yscrollcommand" if orient == "vertical" else "xscrollcommand"): bar.set})
+        rack = ttk.Frame(scroll, padding=(16, 12))
+        scroll.create_window(0, 0, window=rack, anchor="nw")
+        rack.bind("<Configure>", lambda _e: scroll.configure(scrollregion=scroll.bbox("all")))
         self.build_rack(rack, built)
 
-        ttk.Label(outer, textvariable=self.status).grid(row=2, column=0,
-                                                        sticky="w", padx=10)
-        ttk.Label(outer, textvariable=self.control_note,
-                  foreground="#a06020").grid(row=3, column=0, sticky="w",
-                                             padx=10, pady=(0, 6))
+        footer = ttk.Frame(outer, padding=(14, 8, 14, 12))
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(1, weight=1)
+        self.status_light = tk.Canvas(footer, width=14, height=14,
+                                      highlightthickness=0,
+                                      background="#181b20")
+        self.status_light.create_oval(3, 3, 11, 11, fill="#e8bb43",
+                                      outline="#e8bb43", tags="light")
+        self.status_light.grid(row=0, column=0, sticky="n", pady=(2, 0),
+                               padx=(0, 7))
+        ttk.Label(footer, textvariable=self.status, wraplength=400).grid(row=0, column=1,
+                                                         sticky="w")
+        ttk.Label(footer, text="FIRMWARE LCD · 480 × 234", style="Muted.TLabel").grid(
+            row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Separator(footer).grid(row=1, column=0, columnspan=3, sticky="ew",
+                                   pady=7)
+        ttk.Label(footer, textvariable=self.control_note, style="Muted.TLabel",
+                  wraplength=650,
+                  justify="left").grid(row=2, column=0, columnspan=3,
+                                       sticky="w")
         self.announce_channel(built)
+
+    def queue_resize(self, _event=None) -> None:
+        if self.resize_timer is not None:
+            self.root.after_cancel(self.resize_timer)
+        self.resize_timer = self.root.after(90, self.fit_deck)
+
+    def fit_deck(self) -> None:
+        self.resize_timer = None
+        scale = faceplate.fit_scale(self.viewport.winfo_width(), self.viewport.winfo_height())
+        self.deck.set_scale(scale)
+        self.zoom_note.set("FIT · %d%%" % round(scale * 100))
+
+    def show_inspector(self) -> None:
+        self.inspector.deiconify()
+        self.inspector.lift()
+
+    def toggle_fullscreen(self) -> None:
+        self.root.attributes("-fullscreen", not self.root.attributes("-fullscreen"))
+
+    def show_help(self) -> None:
+        from tkinter import messagebox
+        messagebox.showinfo("Deck controls", "Hold the mouse down to hold a key; release to let go.\n"
+            "Shift-click: long press. Ctrl-click or right-click: latch / release.\n"
+            "Browse knob: drag or scroll to turn; click to push.\n"
+            "Keyboard: Tab to the deck, arrows to navigate; hold Enter / Space to hold a key.\n"
+            "Escape leaves full screen.\n\n"
+            "Inspector contains every unassigned input and the channel controls.\n"
+            "Lights show host input feedback, not measured hardware LEDs.\n"
+            "The jog center is not an emulated jog display. Jog rotation and tempo "
+            "are not yet mapped to verified hardware controls.\n\n"
+            "Firmware responses can take several seconds. Ordinary button holds "
+            "do not queue pulses. Shift-click and UTILITY use timed long presses.",
+            parent=self.root)
 
     def build_rack(self, parent: tk.Misc, built: list[Control]) -> None:
         """Every input the deck does not draw, and the channel's own verbs.
@@ -546,44 +749,46 @@ class UiViewer:
         an input can never be in neither.  `coverage()` still counts controls,
         not positions, so 48 of 48 means the same thing it did before.
         """
-        board = panel_control.input_ids()
-        leftover = faceplate.unplaced(board)
+        nxs = self.args.nxs_panel
+        board = nxs_panel.input_ids() if nxs else panel_control.input_ids()
+        placed = {nxs_panel.deck_input(key) if nxs else key
+                  for key in faceplate.PLACEMENTS}
+        placed.add("field7")  # the rotary gesture shares the encoder-push knob
+        leftover = [key for key in board if key not in placed]
         by_id = {control.input_id: control for control in built
                  if control.input_id}
 
         bits = [name for name in leftover if "." in name]
         if bits:
-            box = ttk.LabelFrame(parent, padding=4, text=(
-                "payload bits MAIN's SERVICE MODE table does not name — "
-                "decoded by 0x28e1ae, but nothing says what they are"))
+            box = ttk.LabelFrame(parent, padding=7, text="Unassigned digital inputs")
             box.grid(row=0, column=0, sticky="w", padx=(0, 10))
             for column, name in enumerate(bits):
-                ttk.Button(box, text=name, width=6,
+                label = nxs_panel.KEY_NAMES.get(tuple(map(int, name.split('.'))), name) if nxs else name
+                ttk.Button(box, text=label, width=max(6, len(label)),
                            command=lambda n=name: self.click(by_id[n])).grid(
                                row=0, column=column, padx=2)
 
         fields = [name for name in leftover if name.startswith("field")]
         if fields:
-            box = ttk.LabelFrame(parent, padding=4, text=(
-                "analogue fields with no attributed control — a fader drawn "
-                "on the deck for one of these would be inventing it"))
-            box.grid(row=0, column=1, sticky="w")
+            box = ttk.LabelFrame(parent, padding=7, text="Unassigned analogue inputs · hardware mapping unverified")
+            box.grid(row=1, column=0, sticky="w", pady=12)
             wanted = {int(name[5:]) for name in fields}
             self.build_analog(box, only=wanted)
 
-        box = ttk.LabelFrame(parent, padding=4, text="channel")
-        box.grid(row=0, column=2, sticky="nw", padx=(10, 0))
+        box = ttk.LabelFrame(parent, padding=7, text="CONTROL CHANNEL")
+        box.grid(row=2, column=0, sticky="nw")
         for column, control in enumerate(channel_controls()):
-            ttk.Button(box, text=control.label, width=11,
+            ttk.Button(box, text=control.label.upper(), width=11,
+                       style="Quiet.TButton",
                        command=lambda c=control: self.send(c, c.lines[0])
-                       ).grid(row=column, column=0, pady=1)
+                       ).grid(row=0, column=column, padx=4)
 
     def announce_channel(self, built: list[Control]) -> None:
         channel_note = ("control channel on 127.0.0.1:%d"
                         % self.args.control_port if self.args.control_port
                         else "no control channel: every control will refuse "
                              "(start with --control-port)")
-        self.control_note.set("%s | %s" % (coverage_line(built), channel_note))
+        self.control_note.set("%s | %s" % (coverage_line(built, self.args.nxs_panel), channel_note))
 
     # -------------------------------------------------------------- lab --
     def build_lab(self) -> None:
@@ -591,12 +796,7 @@ class UiViewer:
         outer = ttk.Frame(self.root, padding=10)
         outer.grid(row=0, column=0, sticky="nsew")
 
-        # An unbound key has to *look* different as well as answer differently,
-        # or the only way to find out is to click it.
-        style = ttk.Style(self.root)
-        style.configure("Unbound.TButton", foreground="#8a3a3a")
-
-        built = controls()
+        built = controls(self.args.nxs_panel)
         by_group: dict[str, list[Control]] = {}
         for control in built:
             by_group.setdefault(control.group, []).append(control)
@@ -656,7 +856,7 @@ class UiViewer:
                         % self.args.control_port if self.args.control_port
                         else "no control channel: every control will refuse "
                              "(start with --control-port)")
-        self.control_note.set("%s | %s" % (coverage_line(built), channel_note))
+        self.control_note.set("%s | %s" % (coverage_line(built, self.args.nxs_panel), channel_note))
 
     def hardware_button(self, parent: tk.Misc, control: Control) -> ttk.Button:
         """A front-panel key.
@@ -667,6 +867,7 @@ class UiViewer:
         """
         button = ttk.Button(parent, text=button_text(control), width=11,
                             command=lambda: self.click(control))
+        self.bind_hardware_contact(button, control)
         # Shift-click holds the key long enough to count as held (UTILITY on
         # MENU); "break" keeps the plain click from firing on top of it.
         button.bind("<Shift-Button-1>",
@@ -674,6 +875,54 @@ class UiViewer:
         if control.input_id is None:
             button.configure(style="Unbound.TButton")
         return button
+
+    def bind_hardware_contact(self, button: ttk.Button, control: Control) -> None:
+        """Inspector/lab buttons use the same contact contract as the deck."""
+        if control.input_id is None or control.kind != "button":
+            return
+        active: set[str] = set()
+        releases: dict[str, str] = {}
+
+        def paint():
+            if button.winfo_exists():
+                button.state(["pressed" if active else "!pressed"])
+
+        def release(token):
+            timer = releases.pop(token, None)
+            if timer is not None:
+                button.after_cancel(timer)
+            if token in active:
+                self.contact(control, False, source=(str(button), token))
+                active.discard(token)
+            paint()
+            return "break"
+
+        def down(token):
+            timer = releases.pop(token, None)
+            if timer is not None:
+                button.after_cancel(timer)
+            if token not in active and self.contact(control, True, source=(str(button), token)):
+                active.add(token)
+                button.focus_set()
+            paint()
+            return "break"
+
+        def key_up(token):
+            if token in active and token not in releases:
+                releases[token] = button.after_idle(lambda: release(token))
+            return "break"
+
+        def cancel(_event):
+            for token in tuple(active):
+                release(token)
+
+        button.bind("<ButtonPress-1>", lambda _e: down("pointer"))
+        button.bind("<ButtonRelease-1>", lambda _e: release("pointer"))
+        for key in ("Return", "space"):
+            button.bind(f"<KeyPress-{key}>", lambda _e, k=key: down(k))
+            button.bind(f"<KeyRelease-{key}>", lambda _e, k=key: key_up(k))
+        button.bind("<FocusOut>", cancel, add="+")
+        button.bind("<Destroy>", cancel, add="+")
 
     def build_bit_grid(self, parent: tk.Misc, bits: list[Control]) -> None:
         """Every decoded payload bit, with MAIN's name and the last verdict.
@@ -700,10 +949,7 @@ class UiViewer:
             column = 2 * (index // per_column)
             button = ttk.Button(box, text=control.label, width=6,
                                 command=lambda c=control: self.click(c))
-            # A pulse is what the edge detector at 0x28ddc8 wants, so the plain
-            # click stays a pulse.  Some things the firmware times need a level,
-            # and the channel has `down`/`up` for it; without a way to reach
-            # them from here those two verbs existed and nobody could use them.
+            self.bind_hardware_contact(button, control)
             button.bind("<Button-3>",
                         lambda _event, c=control: self.toggle_hold(c))
             button.bind("<Shift-Button-1>",
@@ -713,7 +959,11 @@ class UiViewer:
             # The run name is part of the finding, not decoration: 18.1 is
             # "changes the display" in r026 and 0 in r096, on different screens.
             byte, bit = (int(part) for part in control.input_id.split("."))
-            name = firmware_name(byte, bit)
+            if self.args.nxs_panel:
+                name = nxs_panel.KEY_NAMES.get((byte, bit), "")
+                verdict, world = "", ""  # legacy run annotations are not NXS evidence
+            else:
+                name = firmware_name(byte, bit)
             shown = "%s  [%s]" % (verdict[:30], world) if world else verdict[:30]
             ttk.Label(box, text="%-13s %s" % (name, shown),
                       foreground="#555555").grid(
@@ -838,9 +1088,64 @@ class UiViewer:
             return None
         self.control_note.set("%s: %s -> %s"
                               % (control.label, line.strip(), reply))
-        return reply
+        if line.strip() == "clear" and not reply.startswith("err"):
+            self.held.clear()
+            self.momentary.clear()
+            self.contact_sources.clear()
+            self.in_flight.clear()
+            if self.deck is not None:
+                for name in list(self.deck.latched):
+                    self.deck.set_latched(name, False)
+        return None if reply.startswith("err") else reply
+
+    def contact(self, control: Control, down: bool, *, source: object = "deck-pointer") -> bool:
+        """Combine pointer/keyboard/widget ownership, independently of latches."""
+        if self.is_sd_lid(control):
+            sources = getattr(self, "sd_lid_sources", set())
+            if down and source not in sources:
+                if not self.sd_lid_command("toggle"):
+                    return False
+                sources.add(source)
+            elif not down:
+                sources.discard(source)
+            self.sd_lid_sources = sources
+            return True
+        if control.input_id is None or control.kind not in ("button", "hold"):
+            self.click(control)
+            return False
+        bit_id = control.input_id.split("-")[0]
+        byte, mask = panel_control.button_mask(bit_id)
+        key = (byte, mask)
+        owners = self.contact_sources.get(key, set())
+        if down == (source in owners):
+            return True
+        next_owners = owners | {source} if down else owners - {source}
+        # A release must not undo another active contact or an explicit latch.
+        if key not in self.held and bool(owners) != bool(next_owners):
+            if self.send(control, panel_control.encode_hold(byte, mask, down)) is None:
+                return False
+        if next_owners:
+            self.contact_sources[key] = next_owners
+            self.momentary[key] = control
+        else:
+            self.contact_sources.pop(key, None)
+            self.momentary.pop(key, None)
+        self.show_contact(bit_id, key in self.held or bool(next_owners))
+        return True
+
+    def show_contact(self, bit_id: str, down: bool) -> None:
+        if getattr(getattr(self, "args", None), "nxs_panel", False):
+            bit_id = next((key for key in faceplate.PLACEMENTS
+                           if nxs_panel.deck_input(key) == bit_id), None)
+        if self.deck is not None and bit_id in faceplate.PLACEMENTS:
+            self.deck.set_latched(bit_id, down)
+            if bit_id == "20.3":
+                self.deck.set_latched("20.3-hold", down)
 
     def click(self, control: Control) -> None:
+        if self.is_sd_lid(control):
+            self.sd_lid_command("toggle")
+            return
         if control.kind == "hold" and control.input_id is not None:
             self.long_press(control)
             return
@@ -855,6 +1160,9 @@ class UiViewer:
 
     def long_press(self, control: Control) -> None:
         """Shift-click, or the UTILITY key: down across two status records."""
+        if self.is_sd_lid(control):
+            self.sd_lid_command("toggle")
+            return
         if control.kind not in ("button", "hold") or control.input_id is None:
             self.click(control)
             return
@@ -887,23 +1195,58 @@ class UiViewer:
 
     def toggle_hold(self, control: Control) -> None:
         """Right-click: hold the bit down, right-click again to release it."""
+        if self.is_sd_lid(control):
+            self.sd_lid_command("toggle")
+            return
         if control.input_id is None:
             self.click(control)
             return
-        byte, mask = panel_control.button_mask(control.input_id)
+        bit_id = control.input_id.split("-")[0]
+        byte, mask = panel_control.button_mask(bit_id)
         key = (byte, mask)
         down = key not in self.held
-        if self.send(control, panel_control.encode_hold(byte, mask, down)):
+        if (key in self.momentary or
+                self.send(control, panel_control.encode_hold(byte, mask, down)) is not None):
             if down:
                 self.held[key] = control
             else:
                 self.held.pop(key, None)
+            self.show_contact(bit_id, down or key in self.momentary)
             self.control_note.set("%s %s (held: %s)"
                                   % (control.label, "held down" if down
                                      else "released",
                                      ", ".join(sorted(c.label for c
                                                       in self.held.values()))
                                      or "none"))
+
+    def is_sd_lid(self, control: Control) -> bool:
+        return (getattr(getattr(self, "args", None), "nxs_panel", False) and
+                control.input_id == "17.2")
+
+    def sd_lid_command(self, action: str) -> bool:
+        control = Control("SD lid", "17.2", "switch", "bits", (),
+                          "Persistent physical SD lid contact; click to toggle")
+        if action == "state":
+            panel = self.control()
+            try:
+                reply = panel.send("sd-lid state\n") if panel else None
+            except (OSError, ValueError) as error:
+                self.forget_control(error)
+                reply = None
+        else:
+            reply = self.send(control, "sd-lid " + action + "\n")
+        state = reply.strip().removeprefix("ok sd-lid ") if reply else "unknown"
+        if state not in ("open", "closed"):
+            state = "unknown"
+        if hasattr(self, "sd_lid_text"):
+            self.sd_lid_text.set("SD lid: " + state)
+        if reply and action != "state":
+            self.control_note.set("SD lid: " + state + " (persistent physical switch)")
+        return state in ("open", "closed")
+
+    def poll_sd_lid(self) -> None:
+        self.sd_lid_command("state")
+        self.root.after(2000, self.poll_sd_lid)
 
     def field_value(self, entry: panel_control.AnalogControl) -> int | None:
         """The number in the row's box, or None with the reason said out loud.
@@ -995,6 +1338,9 @@ class UiViewer:
         self.show_panel(frame)
 
     def start_simulator(self) -> None:
+        if self.args.attach:
+            self.status.set("Attached viewer · waiting for a firmware frame")
+            return
         output = self.args.output.resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.unlink(missing_ok=True)
@@ -1012,6 +1358,8 @@ class UiViewer:
             {
                 "BFIN_GUI_OUTPUT": str(output),
                 "BFIN_GUI_HEIGHT": str(self.args.height),
+                "BFIN_GUI_COLOR": "rgb555le",
+                "BFIN_PARALLEL_WRITEBACK": "1",
                 "BFIN_FAST_LZSS": str(
                     (FIRMWARE / "gui-flash-image.bin").resolve()
                 ),
@@ -1026,7 +1374,10 @@ class UiViewer:
         # replayed record stream with a live link to the MAIN board.
         for setting in self.args.env:
             name, _, value = setting.partition("=")
-            env[name] = value
+            if value == "":
+                env.pop(name, None)
+            else:
+                env[name] = value
         command = [
             simulator_path(self.args.simulator),
             "--model",
@@ -1072,7 +1423,7 @@ class UiViewer:
         the status line says so instead of leaving "it feels slow" to be blamed
         on the emulator again.
         """
-        if self.process is None:
+        if self.process is None and not self.args.attach:
             return
         # Schedule first, so a slow pass shortens the next gap instead of
         # adding to it.  The old code re-armed only after the work and after
@@ -1080,7 +1431,7 @@ class UiViewer:
         # under exactly the load that matters.
         self.root.after(self.args.refresh_ms, self.refresh)
 
-        return_code = self.process.poll()
+        return_code = self.process.poll() if self.process is not None else None
         if return_code is not None:
             self.status.set(f"Simulator exited with code {return_code}; "
                             f"see {self.args.log}")
@@ -1089,7 +1440,13 @@ class UiViewer:
 
         try:
             mtime_ns = self.args.output.stat().st_mtime_ns
+            age_note = publication_age_note(mtime_ns, time.time())
             if mtime_ns == self.last_mtime_ns:
+                if age_note:
+                    self.status.set(age_note)
+                    self.fps = 0.0
+                    self.shown = self.published = 0
+                    self.rate_since = time.monotonic()
                 return
             with Image.open(self.args.output) as source:
                 frame = source.convert("RGB")
@@ -1108,6 +1465,9 @@ class UiViewer:
         except (FileNotFoundError, OSError):
             # A frame caught mid-publish, or the rename losing a race with this
             # read.  Both are single dropped frames at 30 fps, not errors.
+            if time.monotonic() - self.boot_started >= 5:
+                self.status.set("Waiting for a complete framebuffer — "
+                                "emulator liveness unverified")
             return
 
         now = time.monotonic()
@@ -1115,12 +1475,21 @@ class UiViewer:
             self.fps = self.shown / (now - self.rate_since)
             self.shown = self.published = 0
             self.rate_since = now
-        self.status.set(
+        self.status.set(age_note or
             f"{self.fps:4.1f} fps — {source_size[0]}×{source_size[1]} captured, "
-            f"shown as {PANEL_WIDTH}×{PANEL_HEIGHT} at {self.args.scale}x "
+            f"shown as {PANEL_WIDTH}×{PANEL_HEIGHT} at "
+            f"{self.deck.scale if self.deck is not None else self.args.scale:.2f}x "
             f"(polling every {self.args.refresh_ms} ms)")
 
     def close(self) -> None:
+        # In attach mode the machine outlives this window. Release only our
+        # contacts, not analog values or queued input from another controller.
+        for (byte, mask), control in (self.held | self.momentary).items():
+            self.send(control, panel_control.encode_hold(byte, mask, False))
+        # Destroy/FocusOut callbacks must not reconnect after transport close.
+        self.held.clear()
+        self.momentary.clear()
+        self.contact_sources.clear()
         if self.panel is not None:
             self.panel.close()
             self.panel = None
@@ -1162,7 +1531,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="lines to capture; the PPI emits 255 and the frame "
                              "is cropped to 234, because capturing 234 wraps at "
                              "the wrong point")
-    parser.add_argument("--scale", type=int, default=2)
+    parser.add_argument("--scale", type=int, default=2,
+                        help="integer LCD scale in lab view; device view fits the window")
+    parser.add_argument("--attach", action="store_true",
+                        help="watch --output without starting or stopping a simulator")
+    parser.add_argument("--device-name", default="CDJ-2000",
+                        help="device label in the window header")
+    parser.add_argument("--nxs-panel", action="store_true",
+                        help="use verified NXS persistent SD-lid contact semantics")
     parser.add_argument("--skin", choices=("device", "lab"), default="device",
                         help="'device' draws the CDJ-2000 front panel around "
                              "the picture; 'lab' is the bit-level window, "
@@ -1194,7 +1570,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if args.coverage:
         return args
-    for name in ("simulator", "elf", "board", "packet"):
+    for name in (() if args.attach else ("simulator", "elf", "board", "packet")):
         path = getattr(args, name)
         if not path.exists():
             parser.error(f"{name} does not exist: {path}")
